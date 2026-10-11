@@ -32,6 +32,9 @@
 --   ffi_repair.h    kimix::repair() (src/core/json_repair.h), returning the
 --                   repaired bytes into a kimix_vec placeholder
 --                                                        -> ffi_repair.cpp
+--   ffi_canonical.h deterministic canonical JSON: strict yyjson parse (raw
+--                   numbers) + key-sorted, minified re-emit into a kimix_vec
+--                                                        -> ffi_canonical.cpp
 --
 -- Dependency rule: kimix_api depends on kimix-core only — never on a src/ext
 -- target directly (mimalloc/yyjson, and the marl objects that ffi_parallel.h

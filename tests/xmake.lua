@@ -123,6 +123,9 @@ if has_config("kimix_enable_api") then
     test_proj("test_kimix_api", "unit/api/test_kimix_api.cpp", function()
         add_deps("kimix_api")
     end)
+    test_proj("test_kimix_canonical", "unit/api/test_kimix_canonical.cpp", function()
+        add_deps("kimix_api")
+    end)
 end
 
 -- unit/openai (SSE stream parser for OpenAI-compatible chat completions)

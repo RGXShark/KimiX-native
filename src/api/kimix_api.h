@@ -33,6 +33,9 @@
  *                                                      -> ffi_yyjson.cpp
  *   <api/ffi_repair.h>   kimix::repair(): fix malformed LLM JSON, results
  *                        delivered into a kimix_vec     -> ffi_repair.cpp
+ *   <api/ffi_canonical.h> deterministic canonical JSON (yyjson strict parse +
+ *                        raw numbers, key-sorted, minified, verbatim numbers),
+ *                        bytes delivered into a kimix_vec -> ffi_canonical.cpp
  *
  * Rules that apply to the whole surface (see the file headers for the details):
  *   - One heap.  Anything the library allocates is mimalloc memory owned by
@@ -65,6 +68,7 @@
 #include <api/ffi_map.h>
 #include <api/ffi_parallel.h>
 #include <api/ffi_repair.h>
+#include <api/ffi_canonical.h>
 #include <api/ffi_yyjson.h>
 
 #endif /* KIMIX_API_KIMIX_API_H */
