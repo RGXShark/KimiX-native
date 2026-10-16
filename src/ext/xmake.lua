@@ -162,6 +162,11 @@ target("kimix-marl")
     -- Linked into the runtime_py shared module: Linux requires -fPIC objects.
     if is_plat("linux") then
         add_cxflags("-fPIC", {public = true})
+        -- osfiber_asm_<arch>.S carries no .note.GNU-stack section, so without
+        -- this the linker marks every consumer (kimix_api.so) as needing an
+        -- executable stack, and glibc >= 2.41 refuses to dlopen it ("cannot
+        -- enable executable stack as shared object requires").
+        add_asflags("-Wa,--noexecstack")
     end
     add_headerfiles(path.join(marl_dir, "include/**.h"))
     add_includedirs(path.join(marl_dir, "include"), {
