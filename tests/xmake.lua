@@ -179,6 +179,22 @@ end)
 test_proj("test_env_overrides", "unit/llm/test_env_overrides.cpp", function()
     add_deps("kimix-llm")
 end)
+-- unit/llm (lossless shell lexer: token/part tiling, quote/escape/substitution
+-- regions, operator tables, comments, heredoc markers, oracle equivalence)
+test_proj("test_bash_parser_lexer", "unit/llm/test_bash_parser_lexer.cpp", function() add_deps("kimix-llm") end)
+-- unit/llm (lossless shell IR: models/parser round-trip, command-position
+-- classification, heredoc semantics, nested contexts, wrapper hints, embedded
+-- scripts, iterative-depth lossless reconstruction)
+test_proj("test_bash_parser_shell_ir", "unit/llm/test_bash_parser_shell_ir.cpp", function() add_deps("kimix-llm") end)
+-- unit/llm (native Git Bash kernel public API: fix_bash_command /
+-- process_unquoted differential goldens vs. the Python reference)
+test_proj("test_bash_parser", "unit/llm/test_bash_parser.cpp", function() add_deps("kimix-llm") end)
+-- unit/llm (native Git Bash kernel: pure path/null-device primitive goldens)
+test_proj("test_bash_parser_paths", "unit/llm/test_bash_parser_paths.cpp", function() add_deps("kimix-llm") end)
+-- unit/llm (native Git Bash kernel: pure wrapper/cmd rule-function goldens)
+test_proj("test_bash_parser_rules", "unit/llm/test_bash_parser_rules.cpp", function() add_deps("kimix-llm") end)
+-- unit/llm (native Git Bash kernel: host-gated real Git Bash execution e2e)
+test_proj("test_bash_parser_e2e", "unit/llm/test_bash_parser_e2e.cpp", function() add_deps("kimix-llm") end)
 -- unit/kimi (Kimi/Moonshot provider wire: message conversion, reasoning
 -- round-trip + preserved-thinking backfill, thinking/keep shapes, tool
 -- schema normalization, token caps, prompt_cache_key, cached_tokens usage)

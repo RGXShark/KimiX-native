@@ -3,7 +3,7 @@
 `kimix_api` is a shared library (`src/api`) that puts a **plain C ABI** on top of
 `kimix-core`, so a caller in C, C#, Zig, Rust, Python (ctypes/cffi), Julia,
 Node `ffi-napi` or any other FFI host can use the kimix base facilities without
-C++ or pybind11 in the picture. It exports six feature areas plus a small common
+C++ or pybind11 in the picture. It exports eight feature areas plus a small common
 header: the version/ABI/status/layout queries of
 `kimix_api_*` / `kimix_status_name`, the mimalloc allocator vocabulary
 (`kimix_mem_*`), the byte-buffer container `kimix::vector<std::byte>` as an inline
@@ -11,8 +11,10 @@ caller-owned object (`kimix_vec_*`, including its strict UTF-16 -> UTF-8 append)
 the opaque `uint64 -> uint64` hash map over `kimix::unordered_map` behind a handle
 (`kimix_map_*`), the `kimix::fiber` job fan-out that runs N C-callable jobs over the
 worker pool (`kimix_fiber_*`), the yyjson JSON read/build/write surface with
-the mimalloc allocator baked in (`kimix_yyjson_*`), and `kimix::repair()` for
-malformed LLM tool-call JSON (`kimix_repair*` / `kimix_json_*`). Every entry point
+the mimalloc allocator baked in (`kimix_yyjson_*`), `kimix::repair()` for
+malformed LLM tool-call JSON (`kimix_repair*` / `kimix_json_*`), deterministic
+canonical JSON (`kimix_canonical_json*`), and the SQLite3 database C API re-exported
+over the vendored amalgamation (`kimix_sqlite_*`). Every entry point
 is declared in a pure-C header under `src/api`; this document is the searchable
 index of all of them.
 
@@ -24,8 +26,8 @@ index of all of them.
 | Build command | `xmake build kimix_api` (or `python bootstrap.py`) |
 | Output | `bin/<mode>/kimix_api.dll` + `kimix_api.lib` on Windows, `bin/<mode>/libkimix_api.so` on Linux (`<mode>` = `debug` / `release`) |
 | Umbrella header | `#include <api/kimix_api.h>` — include dir is `src/` |
-| Area headers | `<api/ffi_common.h>`, `<api/ffi_mem.h>`, `<api/ffi_vec.h>`, `<api/ffi_map.h>`, `<api/ffi_parallel.h>`, `<api/ffi_yyjson.h>`, `<api/ffi_repair.h>` |
-| Dependencies | `kimix-core` only; mimalloc and yyjson arrive through it and are compiled **into** this image |
+| Area headers | `<api/ffi_common.h>`, `<api/ffi_mem.h>`, `<api/ffi_vec.h>`, `<api/ffi_map.h>`, `<api/ffi_parallel.h>`, `<api/ffi_yyjson.h>`, `<api/ffi_repair.h>`, `<api/ffi_canonical.h>`, `<api/ffi_sqlite.h>` |
+| Dependencies | `kimix-core` carries mimalloc / yyjson / marl (compiled **into** this image); `kimix-sqlite3` is declared on this target directly, the same way `kimix-llm` declares its extra third-party deps |
 
 The headers are valid for a **C99/C11 compiler and for C++17 or newer**: opaque
 pointer typedefs, fixed-size POD structs, `size_t`, `<stdint.h>` scalars, `bool`
@@ -177,8 +179,10 @@ The ABI version this build of the library was compiled with — the value of `KI
 - Ownership: nothing to free.
 - Errors: never fails.
 
-#### `const char *kimix_api_version_string(void)`
-The `kimix-core` version string this library was built against, e.g. `"kimix 1.2.3"`. NUL-terminated UTF-8.
+| `kimix_api_version_string` | ABI | The `kimix-core` version string this library was built against, e.g. `"kimix 1.2.3"`. NUL-terminated UTF-8. |
+| `kimix_canonical_json` | canonical | Deterministic canonical JSON: strict yyjson parse (raw numbers) + key-sorted, minified re-emit into a `kimix_vec`. |
+| `kimix_canonical_json_str` | canonical | The NUL-terminated spelling of the same canonicalisation. |
+| `kimix_fiber_run` | parallel |
 - Ownership: static storage owned by the library — never free it; valid for the process lifetime.
 - Errors: never fails.
 
@@ -2035,9 +2039,204 @@ The repaired text WITHOUT its trailing `'\0'` — the first `size() - 1` bytes o
 The same text as a NUL-terminated C string — a non-empty result already ends with `'\0'` inside its buffer, so this simply returns `data()`: no copy, no allocation.
 - Wraps: the vector's `data()` under core's trailing-NUL convention.
 - Ownership: BORROWED from `result` — invalid after any mutation of the vector (resize / reserve / assign / append / swap / move-from) and after `kimix_vec_destroy()` / `kimix_vec_free()`. Never free it.
-- Errors: `NULL` for an empty result (the input was already valid: there is no text to point at), for a dead placeholder and for a NULL `result`.
-
+  - Errors: `NULL` for an empty result (the input was already valid: there is no text to point at), for a dead placeholder and for a NULL `result`.
 ---
+## SQLite — `<api/ffi_sqlite.h>` (`kimix_sqlite_*`)
+
+The SQLite3 C API re-exported over the vendored amalgamation (`src/ext/sqlite_amalgamation`,
+built as the `kimix-sqlite3` target with FTS5 and `SQLITE_THREADSAFE=1`). The handles
+(`kimix_sqlite_db *`, `kimix_sqlite_stmt *`) are the real `sqlite3` / `sqlite3_stmt`
+behind opaque typedefs — this area adds no bookkeeping, so every SQLite semantic
+(lazy open, error latching, busy handling, statement ownership) carries over
+untouched. What it does add is the contract of the whole surface: NULL handles are
+answered with `KIMIX_ERR_INVALID_ARG` (or the documented neutral value) instead of
+being passed to SQLite, and a SQLite failure maps to `KIMIX_ERR_FAILED` — except
+`SQLITE_RANGE`, which maps to `KIMIX_ERR_OUT_OF_RANGE` (the caller's parameter index,
+not the data, is wrong). `kimix_sqlite_step()` returns the raw `int` result code:
+the `KIMIX_SQLITE_ROW` / `KIMIX_SQLITE_DONE` / extended-code vocabulary IS its API.
+The constants in `kimix_sqlite_rc` / `kimix_sqlite_type` / `kimix_sqlite_open_flags`
+are SQLite's own published values, frozen across releases — a binding may hard-code
+them. `kimix_sqlite_open` forces `SQLITE_OPEN_FULLMUTEX`, so a connection is
+serialized and may cross threads.
+
+**One heap, one owned buffer.** The ONLY buffer this area hands ownership of is the
+`kimix_sqlite_exec()` error message — a NUL-terminated UTF-8 string on this library's
+mimalloc heap (the wrapper copies the SQLite text), released with `kimix_mem_free()`,
+never with `sqlite3_free()` or the caller's own `free()`. Everything else returned
+here (`errmsg`, `libversion`, `column_text`, `column_blob`, `column_name`) is
+BORROWED with the lifetime the entries below state; never free it.
+
+### Library
+#### `const char *kimix_sqlite_libversion(void)`
+The SQLite library version string, e.g. `"3.46.1"`.
+- Wraps: `sqlite3_libversion()`.
+- Ownership: static library storage; never free it.
+- Errors: never fails.
+#### `int kimix_sqlite_libversion_number(void)`
+The SQLite version as `(major * 1 000 000) + (minor * 1 000) + patch`, e.g. `3046001`.
+- Wraps: `sqlite3_libversion_number()`.
+- Ownership: nothing.
+- Errors: never fails.
+#### `bool kimix_sqlite_threadsafe(void)`
+True when SQLite was compiled serialized or multi-threaded (this build: always true).
+- Wraps: `sqlite3_threadsafe()`.
+- Ownership: nothing.
+- Errors: never fails.
+### Connection lifetime
+#### `kimix_status kimix_sqlite_open(KIMIX_IN const char *filename, KIMIX_OUT kimix_sqlite_db **out_db)`
+Opens (or creates) `filename` READWRITE | CREATE | FULLMUTEX — `":memory:"` for a private in-memory database, `""` for a private temporary on-disk one.
+- Wraps: `sqlite3_open_v2()`.
+- Ownership: on success the caller owns `*out_db` and releases it with exactly one `kimix_sqlite_close()`; `*out_db` is written only on success.
+- Errors: `KIMIX_ERR_INVALID_ARG` for a NULL `filename` or `out_db`; `KIMIX_ERR_FAILED` when the open itself failed (no connection exists afterwards, so nothing to read the message from). A SUCCESSFUL open does NOT prove the file is usable — SQLite opens lazily; the first real operation reports a missing/corrupt file.
+#### `kimix_status kimix_sqlite_open_v2(KIMIX_IN const char *filename, KIMIX_OUT kimix_sqlite_db **out_db, KIMIX_IN int flags)`
+`kimix_sqlite_open()` with the caller choosing the mode; `flags` is an OR of `kimix_sqlite_open_flags` (0 behaves like READONLY). FULLMUTEX is forced on regardless.
+- Wraps: `sqlite3_open_v2()`.
+- Ownership: same as `kimix_sqlite_open()`.
+- Errors: same as `kimix_sqlite_open()`.
+#### `kimix_status kimix_sqlite_close(KIMIX_TRANSFER kimix_sqlite_db *db)`
+Closes the connection, silently finalizing every statement still attached to it (a forgotten `kimix_sqlite_finalize()` is cleaned up here, exactly like `sqlite3_close()`).
+- Wraps: `sqlite3_close()`.
+- Ownership: the handle dangles after the call; closing twice is undefined behaviour, like `sqlite3_close()` twice.
+- Errors: `KIMIX_ERR_INVALID_ARG` for a NULL `db`; `KIMIX_OK` on a clean close.
+### Error reporting
+#### `const char *kimix_sqlite_errmsg(KIMIX_IN const kimix_sqlite_db *db)`
+The English message of the most recent failed call on this connection (SQLite's own `"not an error"` text when nothing failed yet).
+- Wraps: `sqlite3_errmsg()`.
+- Ownership: BORROWED from the connection — valid until the next SQLite call on the same connection or `kimix_sqlite_close()`; never free it.
+- Errors: `NULL db` yields `""` (the neutral string). Never fails.
+#### `int kimix_sqlite_errcode(KIMIX_IN const kimix_sqlite_db *db)`
+The primary result code of the most recent failed call (`KIMIX_SQLITE_OK` when nothing failed yet).
+- Wraps: `sqlite3_errcode()`.
+- Ownership: nothing.
+- Errors: `NULL db` yields `KIMIX_SQLITE_MISUSE`. Never fails.
+#### `int kimix_sqlite_extended_errcode(KIMIX_IN const kimix_sqlite_db *db)`
+The extended result code of the most recent failed call (primary code ORed with the sub-code, e.g. `2067` for `SQLITE_CONSTRAINT_UNIQUE`; equal to the primary code when there is no sub-code).
+- Wraps: `sqlite3_extended_errcode()`.
+- Ownership: nothing.
+- Errors: `NULL db` yields `KIMIX_SQLITE_MISUSE`. Never fails.
+### One-shot execution
+#### `kimix_status kimix_sqlite_exec(KIMIX_IN_OUT kimix_sqlite_db *db, KIMIX_IN const char *sql, KIMIX_OUT KIMIX_NULLABLE char **out_errmsg)`
+Runs one or more `;`-separated SQL statements (no parameters, no result rows — DDL/DML/PRAGMA; SELECT goes through a prepared statement).
+- Wraps: `sqlite3_exec()` (without a row callback).
+- Ownership: on failure, when `out_errmsg` is not NULL, `*out_errmsg` receives a NUL-terminated UTF-8 message on THIS library's mimalloc heap — release with `kimix_mem_free()` (never `sqlite3_free()` / the caller's `free()`). On success `*out_errmsg` is untouched. The same message stays readable through `kimix_sqlite_errmsg()` without any heap involvement.
+- Errors: `KIMIX_OK` when every statement ran; `KIMIX_ERR_INVALID_ARG` for a NULL `db` or `sql`; `KIMIX_ERR_FAILED` when a statement failed.
+### Changes
+#### `int64_t kimix_sqlite_last_insert_rowid(KIMIX_IN const kimix_sqlite_db *db)`
+The rowid of the most recent successful INSERT (0 when none).
+- Wraps: `sqlite3_last_insert_rowid()`.
+- Ownership: nothing.
+- Errors: 0 for a NULL `db`. Never fails. SQLite resets it on every new INSERT — read it right after the step that inserted.
+#### `int64_t kimix_sqlite_changes(KIMIX_IN const kimix_sqlite_db *db)`
+The rows modified by the most recent completed INSERT/UPDATE/DELETE.
+- Wraps: `sqlite3_changes64()`.
+- Ownership: nothing.
+- Errors: 0 for a NULL `db`. Never fails. Reset by SQLite on every new data-changing statement — read it right after the step.
+#### `kimix_status kimix_sqlite_busy_timeout(KIMIX_IN_OUT kimix_sqlite_db *db, KIMIX_IN int milliseconds)`
+How long SQLite waits for a locked database file before returning `KIMIX_SQLITE_BUSY` (0 = no wait, the SQLite default).
+- Wraps: `sqlite3_busy_timeout()`.
+- Ownership: nothing.
+- Errors: `KIMIX_ERR_INVALID_ARG` for a NULL `db`; `KIMIX_OK` otherwise.
+### Prepared statements: lifetime
+#### `kimix_status kimix_sqlite_prepare(KIMIX_IN kimix_sqlite_db *db, KIMIX_IN const char *sql, KIMIX_OUT kimix_sqlite_stmt **out_stmt)`
+Compiles the ONE statement `sql` into a statement owned by `db` (trailing SQL after the first complete statement is ignored).
+- Wraps: `sqlite3_prepare_v2()`.
+- Ownership: on success the caller owns `*out_stmt` and releases it with exactly one `kimix_sqlite_finalize()`; the statement borrows its connection and dangles with it. `*out_stmt` is written only on success.
+- Errors: `KIMIX_ERR_INVALID_ARG` for a NULL `db`, `sql` or `out_stmt`; `KIMIX_ERR_FAILED` for a compile error — `kimix_sqlite_errmsg(db)` describes it.
+#### `int kimix_sqlite_step(KIMIX_IN_OUT kimix_sqlite_stmt *stmt)`
+Advances the statement: `KIMIX_SQLITE_ROW` when a row is ready (read it with the `kimix_sqlite_column_*` family, then step again), `KIMIX_SQLITE_DONE` when the statement finished; any other value is an error (`kimix_sqlite_errmsg()` on the owning connection). A fresh statement starts before the first row.
+- Wraps: `sqlite3_step()`.
+- Ownership: nothing (the row the `KIMIX_SQLITE_ROW` exposes is borrowed — valid until the next step/reset/finalize).
+- Errors: `KIMIX_SQLITE_MISUSE` for a NULL `stmt`.
+#### `kimix_status kimix_sqlite_finalize(KIMIX_TRANSFER kimix_sqlite_stmt *stmt)`
+Releases the statement; reports what the last step could not.
+- Wraps: `sqlite3_finalize()`.
+- Ownership: the handle dangles after the call.
+- Errors: `KIMIX_ERR_INVALID_ARG` for a NULL `stmt`; `KIMIX_OK` when the statement ran cleanly; `KIMIX_ERR_FAILED` when its last step itself failed (the error the statement died with).
+#### `kimix_status kimix_sqlite_reset(KIMIX_IN_OUT kimix_sqlite_stmt *stmt)`
+Back to the starting state WITHOUT clearing the parameter bindings — the cheap way to re-run an INSERT in a loop (the same bound values apply).
+- Wraps: `sqlite3_reset()`.
+- Ownership: nothing.
+- Errors: `KIMIX_ERR_INVALID_ARG` for a NULL `stmt`; `KIMIX_ERR_FAILED` when the most recent step failed.
+#### `kimix_status kimix_sqlite_clear_bindings(KIMIX_IN_OUT kimix_sqlite_stmt *stmt)`
+Clears every parameter binding back to SQL NULL (the values, not the parameter count).
+- Wraps: `sqlite3_clear_bindings()`.
+- Ownership: nothing.
+- Errors: `KIMIX_ERR_INVALID_ARG` for a NULL `stmt`; `KIMIX_OK` otherwise.
+### Prepared statements: parameter binding
+#### `int kimix_sqlite_bind_parameter_count(KIMIX_IN const kimix_sqlite_stmt *stmt)`
+The number of parameters (`?`, `?NNN`, `:name`, `@name`, `$name`).
+- Wraps: `sqlite3_bind_parameter_count()`.
+- Ownership: nothing.
+- Errors: 0 for a NULL `stmt`. Never fails.
+#### `int kimix_sqlite_bind_parameter_index(KIMIX_IN const kimix_sqlite_stmt *stmt, KIMIX_IN const char *name)`
+The 1-based index of the parameter called `name` (leading `:`/`@`/`$` INCLUDED in the lookup).
+- Wraps: `sqlite3_bind_parameter_index()`.
+- Ownership: nothing.
+- Errors: 0 when the name is not a parameter, and for a NULL `stmt` or `name` (the neutral value doubles as the error). Never fails.
+#### `kimix_status kimix_sqlite_bind_int64(KIMIX_IN_OUT kimix_sqlite_stmt *stmt, KIMIX_IN int index, KIMIX_IN int64_t value)`
+Binds a signed 64-bit integer to 1-based `index`.
+- Wraps: `sqlite3_bind_int64()`.
+- Ownership: the value is copied into the statement; a binding survives step/reset and is cleared by `kimix_sqlite_clear_bindings()` or the next bind on the same index.
+- Errors: `KIMIX_ERR_INVALID_ARG` for a NULL `stmt`; `KIMIX_ERR_OUT_OF_RANGE` for an `index` outside `[1, bind_parameter_count()]`.
+#### `kimix_status kimix_sqlite_bind_double(KIMIX_IN_OUT kimix_sqlite_stmt *stmt, KIMIX_IN int index, KIMIX_IN double value)`
+Binds an IEEE-754 double.
+- Wraps: `sqlite3_bind_double()`.
+- Ownership / Errors: same as `kimix_sqlite_bind_int64()`.
+#### `kimix_status kimix_sqlite_bind_null(KIMIX_IN_OUT kimix_sqlite_stmt *stmt, KIMIX_IN int index)`
+Binds the SQL NULL value.
+- Wraps: `sqlite3_bind_null()`.
+- Ownership / Errors: same as `kimix_sqlite_bind_int64()`.
+#### `kimix_status kimix_sqlite_bind_text(KIMIX_IN_OUT kimix_sqlite_stmt *stmt, KIMIX_IN int index, KIMIX_IN KIMIX_NULLABLE const char *text, KIMIX_IN int length)`
+Binds UTF-8 text, `length` BYTES (not code points). `length == 0` or `text == NULL` binds SQL NULL — pass `1` with a pointer to `""` for an empty string.
+- Wraps: `sqlite3_bind_text()` with `SQLITE_TRANSIENT` (the statement copies the bytes at bind time, so the caller's buffer may die immediately).
+- Ownership / Errors: same as `kimix_sqlite_bind_int64()`, plus `KIMIX_ERR_INVALID_ARG` for `length < 0`.
+#### `kimix_status kimix_sqlite_bind_blob(KIMIX_IN_OUT kimix_sqlite_stmt *stmt, KIMIX_IN int index, KIMIX_IN KIMIX_NULLABLE const void *data, KIMIX_IN int length)`
+Binds an opaque blob, `length` BYTES. `length == 0` or `data == NULL` binds SQL NULL — pass `1` with any pointer for a zero-length blob.
+- Wraps: `sqlite3_bind_blob()` with `SQLITE_TRANSIENT`.
+- Ownership / Errors: same as `kimix_sqlite_bind_text()`.
+### Result columns
+#### `int kimix_sqlite_column_count(KIMIX_IN const kimix_sqlite_stmt *stmt)`
+The number of columns of the current (or next) result row — the SELECT-list width, also for PRAGMA results.
+- Wraps: `sqlite3_column_count()`.
+- Ownership: nothing.
+- Errors: 0 for a NULL `stmt`. Never fails.
+#### `int kimix_sqlite_column_type(KIMIX_IN const kimix_sqlite_stmt *stmt, KIMIX_IN int col)`
+The storage class of column `col` in the CURRENT row (a `kimix_sqlite_type` value) — read it before choosing which typed accessor to call.
+- Wraps: `sqlite3_column_type()`.
+- Ownership: nothing.
+- Errors: `KIMIX_SQLITE_NULL` for a NULL `stmt` or an out-of-range `col`. Never fails.
+#### `int64_t kimix_sqlite_column_int64(KIMIX_IN const kimix_sqlite_stmt *stmt, KIMIX_IN int col)`
+The value of column `col` as a signed 64-bit integer (SQLite converts; unparsing text becomes 0, a REAL truncates toward zero).
+- Wraps: `sqlite3_column_int64()`.
+- Ownership: nothing.
+- Errors: 0 for a NULL `stmt` or an out-of-range `col`. Never fails.
+#### `double kimix_sqlite_column_double(KIMIX_IN const kimix_sqlite_stmt *stmt, KIMIX_IN int col)`
+The value of column `col` as a double (integers widen exactly).
+- Wraps: `sqlite3_column_double()`.
+- Ownership: nothing.
+- Errors: 0.0 for a NULL `stmt` or an out-of-range `col`. Never fails.
+#### `int kimix_sqlite_column_bytes(KIMIX_IN const kimix_sqlite_stmt *stmt, KIMIX_IN int col)`
+The byte length of the column's text/blob value (call AFTER the matching `column_text()`/`column_blob()` when the length matters — the accessor that produced the value defines the encoding width).
+- Wraps: `sqlite3_column_bytes()`.
+- Ownership: nothing.
+- Errors: 0 for a NULL `stmt`, an out-of-range `col`, or a SQL NULL value. Never fails.
+#### `const char *kimix_sqlite_column_text(KIMIX_IN const kimix_sqlite_stmt *stmt, KIMIX_IN int col)`
+The text value of column `col` as NUL-terminated UTF-8.
+- Wraps: `sqlite3_column_text()` (its historical `unsigned char *` spelling is cast back to `char *`).
+- Ownership: BORROWED — valid until the next step/reset/finalize on this statement; never free it.
+- Errors: `NULL` for a SQL NULL value (test `kimix_sqlite_column_type()` first), a NULL `stmt` or an out-of-range `col`.
+#### `const void *kimix_sqlite_column_blob(KIMIX_IN const kimix_sqlite_stmt *stmt, KIMIX_IN int col)`
+The blob value of column `col` as raw bytes, `kimix_sqlite_column_bytes()` long.
+- Wraps: `sqlite3_column_blob()`.
+- Ownership: BORROWED with the same lifetime as `column_text()`; never free it.
+- Errors: `NULL` for a SQL NULL value, an empty blob, a NULL `stmt` or an out-of-range `col` — treat 0 bytes as empty whether the pointer is NULL or not.
+#### `const char *kimix_sqlite_column_name(KIMIX_IN const kimix_sqlite_stmt *stmt, KIMIX_IN int col)`
+The name of column `col` as declared in the SELECT list (the `AS` alias when present), NUL-terminated UTF-8.
+- Wraps: `sqlite3_column_name()`.
+- Ownership: BORROWED with the same lifetime as `column_text()`; never free it.
+- Errors: `NULL` for a NULL `stmt` or an out-of-range `col`; SQLite synthesizes names like `"column"` when the query names nothing.
+---
+## Quick start
 
 ## Quick start
 
@@ -2514,4 +2713,4 @@ sub-section) the declaration lives in.
 | `kimix_yyjson_write`                     | json §6  | Serialises a whole document into a freshly allocated, NUL-terminated UTF-8 string. |
 | `kimix_yyjson_write_buf`                 | json §6  | Serialises a document into the caller's own buffer: no allocation at all, nothing to free. |
 
-Total: **237 functions** — ABI 5, `kimix_mem_*` 35, `kimix_vec_*` 36, `kimix_map_*` 11, `kimix_fiber_*` 2, `kimix_yyjson_*` 140, repair 8. Any of these is a valid Ctrl-F target for the section above.
+Total: **272 functions** — ABI 5, `kimix_mem_*` 35, `kimix_vec_*` 36, `kimix_map_*` 11, `kimix_fiber_*` 2, `kimix_yyjson_*` 140, repair 8, canonical 2, sqlite 33. Any of these is a valid Ctrl-F target for the section above.

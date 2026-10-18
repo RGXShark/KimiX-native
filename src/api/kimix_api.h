@@ -36,6 +36,11 @@
  *   <api/ffi_canonical.h> deterministic canonical JSON (yyjson strict parse +
  *                        raw numbers, key-sorted, minified, verbatim numbers),
  *                        bytes delivered into a kimix_vec -> ffi_canonical.cpp
+ *   <api/ffi_sqlite.h>   the SQLite3 database C API over the vendored
+ *                        amalgamation (open/exec/prepare/bind/step/columns);
+ *                        only the exec error message crosses the heap,
+ *                        owned by the caller (kimix_mem_free)
+ *                                                      -> ffi_sqlite.cpp
  *
  * Rules that apply to the whole surface (see the file headers for the details):
  *   - One heap.  Anything the library allocates is mimalloc memory owned by
@@ -69,6 +74,7 @@
 #include <api/ffi_parallel.h>
 #include <api/ffi_repair.h>
 #include <api/ffi_canonical.h>
+#include <api/ffi_sqlite.h>
 #include <api/ffi_yyjson.h>
 
 #endif /* KIMIX_API_KIMIX_API_H */

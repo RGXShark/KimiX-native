@@ -122,6 +122,9 @@ end
         end
       add_files("llm/*.cpp")
               add_files("llm/openai/*.cpp", "llm/openai_responses/*.cpp", "llm/anthropic/*.cpp", "llm/kimi/*.cpp")
+    -- Native Git Bash compatibility kernel (src/llm/bash_parser): the
+    -- kimi-agent shell_compat fix_bash_command port; see its README.md.
+    add_files("llm/bash_parser/*.cpp")
       add_headerfiles("llm/**/*.h")
         -- Built-in tools: one header/source pair per tool plus the shared kernels.
                 add_files("builtin_tools/*.cpp")

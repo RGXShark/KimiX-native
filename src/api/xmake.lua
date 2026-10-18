@@ -32,14 +32,25 @@
 --   ffi_repair.h    kimix::repair() (src/core/json_repair.h), returning the
 --                   repaired bytes into a kimix_vec placeholder
 --                                                        -> ffi_repair.cpp
---   ffi_canonical.h deterministic canonical JSON: strict yyjson parse (raw
+-- ffi_canonical.h deterministic canonical JSON: strict yyjson parse (raw
 --                   numbers) + key-sorted, minified re-emit into a kimix_vec
 --                                                        -> ffi_canonical.cpp
+--   ffi_sqlite.h     the SQLite3 database C API re-exported over the vendored
+--                   amalgamation (kimix-sqlite3): open/close, one-shot exec,
+--                   prepare/step/finalize with parameter binding and typed
+--                   column access; the only caller-owned buffer is the exec
+--                   error message (mimalloc, freed with kimix_mem_free)
+--                                                        -> ffi_sqlite.cpp
 --
--- Dependency rule: kimix_api depends on kimix-core only — never on a src/ext
--- target directly (mimalloc/yyjson, and the marl objects that ffi_parallel.h
--- fans jobs over, arrive through core, exactly like every other kimix library;
--- see the note at the top of the kimix-core target).
+-- Dependency rule: kimix_api depends on kimix-core for everything core-ish —
+-- never on a src/ext target directly for those (mimalloc/yyjson, and the marl
+-- objects that ffi_parallel.h fans jobs over, arrive through core, exactly
+-- like every other kimix library; see the note at the top of the kimix-core
+-- target).  The one exception is kimix-sqlite3: ffi_sqlite.h wraps the
+-- amalgamation itself, so the target is declared here the same way kimix-llm
+-- declares its own extra third-party deps (kimix-mbedtls / kimix-reproc /
+-- kimix-sqlite3).  The sqlite3 include directory arrives through the
+-- kimix-sqlite3 target's public includedirs.
 --
 -- Heap ownership: the mimalloc objects live INSIDE this DLL (MI_SHARED_LIB /
 -- MI_SHARED_LIB_EXPORT are propagated by the mimalloc target, so the mi_*
@@ -71,6 +82,11 @@ target("kimix_api")
         add_cxflags("-fPIC", {public = true})
     end
     add_deps("kimix-core")
+    -- The SQLite FFI wraps the amalgamation directly (see the header comment
+    -- above); kimix-sqlite3 is always built (it is an input, like
+    -- kimix-core), so this dep gates nothing and costs nothing when the
+    -- option that disables this target is off.
+    add_deps("kimix-sqlite3")
     on_load(function(target)
         -- Our own symbols are dllexport'd from this image; a consumer without
         -- either macro sees dllimport (src/core/dll_export.h, KIMIX_API_API).

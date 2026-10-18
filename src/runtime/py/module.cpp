@@ -132,6 +132,7 @@ void py_register_builtin_shell(py::module_& m);
 void py_register_builtin_file(py::module_& m);
 void py_register_builtin_web(py::module_& m);
 void py_register_builtin_python(py::module_& m);
+void py_register_bash_fix(py::module_& m);
 
 PYBIND11_MODULE(runtime_py, m) {
     // The extension's "root main": binds the importing thread to the
@@ -218,6 +219,18 @@ PYBIND11_MODULE(runtime_py, m) {
     py_register_builtin_file(builtin_tools);
     py_register_builtin_web(builtin_tools);
     py_register_builtin_python(builtin_tools);
+    }
+
+    // ------------------------------------------------------------------
+    // bash_fix -- Windows Git Bash compatibility kernel (src/llm/bash_parser).
+    // ------------------------------------------------------------------
+    {
+        auto bash_fix = m.def_submodule(
+            "bash_fix",
+            "Windows Git Bash compatibility kernel (fix_bash_command, "
+            "bash_compatibility_prelude, process_unquoted) -- the native port "
+            "of the kimi-agent shell_compat reference.");
+        py_register_bash_fix(bash_fix);
     }
 
     // ------------------------------------------------------------------

@@ -25,6 +25,12 @@
  *   NULL-fn edges, the context pointer passed verbatim, and the pool being
  *   unbound again on return
  *
+ * - the SQLite FFI: library queries, :memory: open/close, exec DDL/DML, the
+ * prepare/bind/step/column round trip over every storage class (int, float,
+ * text incl. UTF-8, blob, NULL), changes/last_insert_rowid, reset-reuse,
+ * named parameters, the exec error message owned by the caller (kimix_mem_free),
+ * extended errcodes, and every documented NULL/neutral-value edge
+ *
  * Registered in tests/xmake.lua behind has_config("kimix_enable_api"): with the
  * option off neither kimix_api nor this test is part of the configuration.
  */
@@ -1260,5 +1266,179 @@ int main() {
         uint64_t ones = 0u;
         for (uint64_t i = 0; i < ffi_id_range_state::k_jobs; ++i) { ones += ids.seen[i]; }
         expect(ones == ffi_id_range_state::k_jobs) << "no id skipped, no id delivered twice";
+    };
+
+    // ------------------------------------------------------------------ sqlite
+    "sqlite: library queries and NULL edges"_test = [] {
+        expect(kimix_sqlite_libversion() != nullptr);
+        expect(std::strlen(kimix_sqlite_libversion()) > 0);
+        expect(kimix_sqlite_libversion_number() >= 3000000);
+        expect(kimix_sqlite_threadsafe());
+        // Every value entry point answers the documented neutral value on NULL.
+        expect(kimix_sqlite_errmsg(nullptr)[0] == '\0');
+        expect(kimix_sqlite_errcode(nullptr) == KIMIX_SQLITE_MISUSE);
+        expect(kimix_sqlite_extended_errcode(nullptr) == KIMIX_SQLITE_MISUSE);
+        expect(kimix_sqlite_last_insert_rowid(nullptr) == 0);
+        expect(kimix_sqlite_changes(nullptr) == 0);
+        expect(kimix_sqlite_bind_parameter_count(nullptr) == 0);
+        expect(kimix_sqlite_bind_parameter_index(nullptr, ":x") == 0);
+        expect(kimix_sqlite_bind_parameter_index(nullptr, nullptr) == 0);
+        expect(kimix_sqlite_column_count(nullptr) == 0);
+        expect(kimix_sqlite_column_type(nullptr, 0) == KIMIX_SQLITE_NULL);
+        expect(kimix_sqlite_column_int64(nullptr, 0) == 0);
+        expect(kimix_sqlite_column_double(nullptr, 0) == 0.0);
+        expect(kimix_sqlite_column_bytes(nullptr, 0) == 0);
+        expect(kimix_sqlite_column_text(nullptr, 0) == nullptr);
+        expect(kimix_sqlite_column_blob(nullptr, 0) == nullptr);
+        expect(kimix_sqlite_column_name(nullptr, 0) == nullptr);
+        expect(kimix_sqlite_step(nullptr) == KIMIX_SQLITE_MISUSE);
+        // The status entry points reject NULL before touching SQLite.
+        expect(kimix_sqlite_close(nullptr) == KIMIX_ERR_INVALID_ARG);
+        expect(kimix_sqlite_busy_timeout(nullptr, 100) == KIMIX_ERR_INVALID_ARG);
+        expect(kimix_sqlite_finalize(nullptr) == KIMIX_ERR_INVALID_ARG);
+        expect(kimix_sqlite_reset(nullptr) == KIMIX_ERR_INVALID_ARG);
+        expect(kimix_sqlite_clear_bindings(nullptr) == KIMIX_ERR_INVALID_ARG);
+        expect(kimix_sqlite_exec(nullptr, "SELECT 1", nullptr) == KIMIX_ERR_INVALID_ARG);
+        kimix_sqlite_db *leak = reinterpret_cast<kimix_sqlite_db *>(0x1);
+        expect(kimix_sqlite_open(nullptr, &leak) == KIMIX_ERR_INVALID_ARG);
+        expect(leak == reinterpret_cast<kimix_sqlite_db *>(0x1)) << "out_db untouched on error";
+        expect(kimix_sqlite_open_v2(":memory:", nullptr, 0) == KIMIX_ERR_INVALID_ARG);
+        kimix_sqlite_stmt *stmt = reinterpret_cast<kimix_sqlite_stmt *>(0x1);
+        expect(kimix_sqlite_prepare(nullptr, "SELECT 1", &stmt) == KIMIX_ERR_INVALID_ARG);
+        expect(stmt == reinterpret_cast<kimix_sqlite_stmt *>(0x1)) << "out_stmt untouched on error";
+    };
+
+    "sqlite: exec, prepare/bind/step/column round trip, changes"_test = [] {
+        kimix_sqlite_db *db = nullptr;
+        expect(kimix_sqlite_open(":memory:", &db) == KIMIX_OK);
+        expect(db != nullptr);
+        expect(std::strcmp(kimix_sqlite_errmsg(db), "not an error") == 0)
+            << "a fresh connection carries SQLite's own neutral text";
+        expect(kimix_sqlite_errcode(db) == KIMIX_SQLITE_OK);
+
+        expect(kimix_sqlite_exec(db, "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, score REAL, data BLOB, note TEXT)",
+                                 nullptr) == KIMIX_OK);
+
+        // One prepared INSERT bound for every storage class, stepped to DONE.
+        kimix_sqlite_stmt *ins = nullptr;
+        expect(kimix_sqlite_prepare(db, "INSERT INTO t(name, score, data, note) VALUES(:name, ?2, ?3, ?4)", &ins) == KIMIX_OK);
+        expect(kimix_sqlite_bind_parameter_count(ins) == 4);
+        expect(kimix_sqlite_bind_parameter_index(ins, ":name") == 1);
+        expect(kimix_sqlite_bind_parameter_index(ins, ":missing") == 0);
+        const char k_name[] = "h\xC3\xA9llo"; // "héllo" in UTF-8
+        expect(kimix_sqlite_bind_text(ins, 1, k_name, static_cast<int>(sizeof(k_name) - 1)) == KIMIX_OK);
+        expect(kimix_sqlite_bind_double(ins, 2, 9.5) == KIMIX_OK);
+        const uint8_t k_blob[] = {0x00, 0x01, 0xFE, 0xFF};
+        expect(kimix_sqlite_bind_blob(ins, 3, k_blob, static_cast<int>(sizeof(k_blob))) == KIMIX_OK);
+        expect(kimix_sqlite_bind_null(ins, 4) == KIMIX_OK);
+        // A parameter index outside [1, count] is OUT_OF_RANGE, not FAILED.
+        expect(kimix_sqlite_bind_int64(ins, 0, 1) == KIMIX_ERR_OUT_OF_RANGE);
+        expect(kimix_sqlite_bind_int64(ins, 5, 1) == KIMIX_ERR_OUT_OF_RANGE);
+        expect(kimix_sqlite_bind_text(ins, 1, "x", -1) == KIMIX_ERR_INVALID_ARG);
+        expect(kimix_sqlite_step(ins) == KIMIX_SQLITE_DONE);
+        expect(kimix_sqlite_changes(db) == 1);
+        expect(kimix_sqlite_last_insert_rowid(db) == 1);
+        expect(kimix_sqlite_finalize(ins) == KIMIX_OK);
+
+        // reset() keeps the bindings: the same values insert again as row 2.
+        expect(kimix_sqlite_prepare(db, "INSERT INTO t(name, score, data, note) VALUES(?1, ?2, ?3, ?4)", &ins) == KIMIX_OK);
+        const char k_second[] = "second";
+        expect(kimix_sqlite_bind_text(ins, 1, k_second, static_cast<int>(sizeof(k_second) - 1)) == KIMIX_OK);
+        expect(kimix_sqlite_bind_int64(ins, 2, 7) == KIMIX_OK);
+        expect(kimix_sqlite_bind_text(ins, 3, "ab", 2) == KIMIX_OK);
+        expect(kimix_sqlite_bind_text(ins, 4, "", 0) == KIMIX_OK); // non-NULL + 0 = the EMPTY string
+        expect(kimix_sqlite_step(ins) == KIMIX_SQLITE_DONE);
+        expect(kimix_sqlite_reset(ins) == KIMIX_OK);
+        expect(kimix_sqlite_step(ins) == KIMIX_SQLITE_DONE) << "reset re-runs with the same bindings";
+        expect(kimix_sqlite_changes(db) == 1) << "one row per run";
+        expect(kimix_sqlite_last_insert_rowid(db) == 3);
+        expect(kimix_sqlite_clear_bindings(ins) == KIMIX_OK);
+        expect(kimix_sqlite_step(ins) == KIMIX_SQLITE_DONE);
+        expect(kimix_sqlite_finalize(ins) == KIMIX_OK);
+
+        // The full SELECT walk: types, values, names, bytes.
+        kimix_sqlite_stmt *sel = nullptr;
+        expect(kimix_sqlite_prepare(db, "SELECT id, name, score, data, note FROM t ORDER BY id", &sel) == KIMIX_OK);
+        expect(kimix_sqlite_column_count(sel) == 5);
+        expect(std::strcmp(kimix_sqlite_column_name(sel, 1), "name") == 0);
+        expect(kimix_sqlite_step(sel) == KIMIX_SQLITE_ROW);
+        expect(kimix_sqlite_column_type(sel, 0) == KIMIX_SQLITE_INTEGER);
+        expect(kimix_sqlite_column_int64(sel, 0) == 1);
+        expect(kimix_sqlite_column_type(sel, 1) == KIMIX_SQLITE_TEXT);
+        expect(std::strcmp(kimix_sqlite_column_text(sel, 1), "h\xC3\xA9llo") == 0);
+        expect(kimix_sqlite_column_bytes(sel, 1) == 6); // 1 ASCII + 2x2-byte UTF-8
+        expect(kimix_sqlite_column_type(sel, 2) == KIMIX_SQLITE_FLOAT);
+        expect(kimix_sqlite_column_double(sel, 2) == 9.5);
+        expect(kimix_sqlite_column_type(sel, 3) == KIMIX_SQLITE_BLOB);
+        expect(kimix_sqlite_column_bytes(sel, 3) == 4);
+        expect(std::memcmp(kimix_sqlite_column_blob(sel, 3), k_blob, sizeof(k_blob)) == 0);
+        expect(kimix_sqlite_column_type(sel, 4) == KIMIX_SQLITE_NULL);
+        expect(kimix_sqlite_column_text(sel, 4) == nullptr);
+        expect(kimix_sqlite_step(sel) == KIMIX_SQLITE_ROW);
+        expect(kimix_sqlite_column_text(sel, 4) != nullptr);
+        expect(kimix_sqlite_column_bytes(sel, 4) == 0) << "empty string round trips as 0 bytes, not NULL";
+        expect(std::strcmp(kimix_sqlite_column_text(sel, 4), "") == 0);
+        expect(kimix_sqlite_step(sel) == KIMIX_SQLITE_ROW);
+        expect(kimix_sqlite_column_type(sel, 1) == KIMIX_SQLITE_TEXT);
+        expect(kimix_sqlite_step(sel) == KIMIX_SQLITE_ROW);
+        expect(kimix_sqlite_column_type(sel, 1) == KIMIX_SQLITE_NULL)
+            << "clear_bindings left the re-run with SQL NULLs";
+        expect(kimix_sqlite_step(sel) == KIMIX_SQLITE_DONE);
+        expect(kimix_sqlite_finalize(sel) == KIMIX_OK);
+
+        // FTS5 (the amalgamation is compiled with SQLITE_ENABLE_FTS5) is plain SQL.
+        expect(kimix_sqlite_exec(db, "CREATE VIRTUAL TABLE ft USING fts5(body)", nullptr) == KIMIX_OK);
+        expect(kimix_sqlite_exec(db, "INSERT INTO ft(body) VALUES('the quick brown fox')", nullptr) == KIMIX_OK);
+        kimix_sqlite_stmt *fts = nullptr;
+        expect(kimix_sqlite_prepare(db, "SELECT count(*) FROM ft WHERE ft MATCH 'quick'", &fts) == KIMIX_OK);
+        expect(kimix_sqlite_step(fts) == KIMIX_SQLITE_ROW);
+        expect(kimix_sqlite_column_int64(fts, 0) == 1);
+        expect(kimix_sqlite_finalize(fts) == KIMIX_OK);
+
+        expect(kimix_sqlite_close(db) == KIMIX_OK);
+    };
+
+    "sqlite: error paths - bad SQL, owned message, extended errcode"_test = [] {
+        kimix_sqlite_db *db = nullptr;
+        expect(kimix_sqlite_open(":memory:", &db) == KIMIX_OK);
+
+        // A failing exec: KIMIX_ERR_FAILED, the message is OWNED by the caller.
+        char *msg = nullptr;
+        expect(kimix_sqlite_exec(db, "INSERT INTO no_such_table VALUES(1)", &msg) == KIMIX_ERR_FAILED);
+        expect(msg != nullptr);
+        expect(std::strstr(msg, "no_such_table") != nullptr);
+        kimix_mem_free(msg);
+        // The borrowed twin stays on the connection.
+        expect(std::strstr(kimix_sqlite_errmsg(db), "no_such_table") != nullptr);
+        expect(kimix_sqlite_errcode(db) == KIMIX_SQLITE_ERROR);
+
+        // A compile failure through prepare(): out stays untouched, message on the db.
+        kimix_sqlite_stmt *stmt = nullptr;
+        expect(kimix_sqlite_prepare(db, "SELEC nonsense", &stmt) == KIMIX_ERR_FAILED);
+        expect(stmt == nullptr);
+        expect(std::strlen(kimix_sqlite_errmsg(db)) > 0);
+
+        // A UNIQUE violation surfaces the extended code through step().
+        expect(kimix_sqlite_exec(db, "CREATE TABLE u(v INTEGER UNIQUE)", nullptr) == KIMIX_OK);
+        expect(kimix_sqlite_exec(db, "INSERT INTO u VALUES(1)", nullptr) == KIMIX_OK);
+        kimix_sqlite_stmt *dup = nullptr;
+        expect(kimix_sqlite_prepare(db, "INSERT INTO u VALUES(1)", &dup) == KIMIX_OK);
+        expect(kimix_sqlite_step(dup) == KIMIX_SQLITE_CONSTRAINT) << "primary code passes through step()";
+        expect(kimix_sqlite_extended_errcode(db) != KIMIX_SQLITE_OK);
+        expect(kimix_sqlite_extended_errcode(db) != kimix_sqlite_errcode(db))
+            << "the extended code carries the sub-code";
+        expect(kimix_sqlite_finalize(dup) == KIMIX_ERR_FAILED) << "finalize reports the failed last step";
+
+        // out_errmsg NULL means "nobody asks" - still a clean failure.
+        expect(kimix_sqlite_exec(db, "INSERT INTO no_such_table VALUES(1)", nullptr) == KIMIX_ERR_FAILED);
+
+        // An unreadable path fails the OPEN itself (no lazy file here).
+        kimix_sqlite_db *gone = nullptr;
+        expect(kimix_sqlite_open_v2("/definitely/not/a/real/dir/db.sqlite", &gone,
+                                    KIMIX_SQLITE_OPEN_READONLY) == KIMIX_ERR_FAILED);
+        expect(gone == nullptr) << "out_db is untouched when the open fails";
+
+        expect(kimix_sqlite_busy_timeout(db, 250) == KIMIX_OK);
+        expect(kimix_sqlite_close(db) == KIMIX_OK);
     };
 }
