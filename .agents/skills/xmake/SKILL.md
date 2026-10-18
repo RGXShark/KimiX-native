@@ -1588,6 +1588,16 @@ python publish.py --platform linux
 
 `publish.py` reads the single source of truth version from `version.txt`, builds the `runtime_py` extension, and packages it into `bin/release/kimix_base-<platform>-<arch>-<version>.zip`.
 
+Faster, safer variants:
+
+```bash
+python publish.py                 # both platforms, build + package + verify + upload (~75 s)
+python publish.py --dry-run       # same but never touches the remote
+python publish.py --skip-build    # reuse bin/release: re-upload in seconds
+```
+
+`publish.py` builds with `bootstrap.py --target runtime_py` (only the shipped module — not the CLI and the ~60 test binaries a bare `bootstrap.py` builds), resolves the upload credential itself (`GH_TOKEN`/`GITHUB_TOKEN` → `gh auth login` → the git credential helper for github.com, exported as `GH_TOKEN` for the run), imports the packaged binary out of the archive before uploading (Linux through WSL), and after the upload compares the release asset's size + sha256 with the local ZIP. Cross-platform artifact cleanup (`runtime_py.pyd` / `.so` / `libruntime_py.so`, all sharing `bin/release`) happens automatically, so no manual `rm` + `xmake build -r` is needed when switching platforms.
+
 ## What Worked
 
 - **Windows MSVC path**: `bootstrap.py` located Visual Studio 2022 Enterprise and activated `vcvars64.bat` automatically, even though `vswhere` was not on PATH.

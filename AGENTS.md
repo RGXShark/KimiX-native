@@ -19,8 +19,9 @@ Detects toolchains, downloads/installs xmake if missing, configures, builds, and
 python bootstrap.py                          # auto-detect, release build
 python bootstrap.py --debug                  # debug build
 python bootstrap.py --toolchain clang-cl     # use a specific toolchain
-python bootstrap.py --test                   # build + run tests
-python bootstrap.py --clean --debug          # clean rebuild in debug mode
+python bootstrap.py --test # build + run tests
+python bootstrap.py --target runtime_py # build one target only
+python bootstrap.py --clean --debug # clean rebuild in debug mode
 python bootstrap.py --list-toolchains        # list detected toolchains
 python bootstrap.py --list-env               # show platform/environment info
 python bootstrap.py --xmake PATH             # use a specific xmake binary
@@ -33,7 +34,8 @@ python bootstrap.py --verbose                # verbose build output
 - Auto-detects MSVC, Clang-CL, LLVM, GCC depending on platform (Windows/Linux/macOS).
 - Downloads xmake into `.deps/` if not on PATH (can be disabled with `--no-download`).
 - On Windows with `clang-cl`/`llvm`, activates the latest MSVC vcvars environment so the linker and SDK are available.
-- `--clean` removes `.xmake/`, `build/`, and `bin/`.
+  - `--clean` removes `.xmake/`, `build/`, and `bin/`.
+  - `--target NAME` (repeatable) builds just that xmake target instead of the whole project — `publish.py` uses it to compile only the artifact it ships.
 
 ---
 
@@ -42,23 +44,24 @@ python bootstrap.py --verbose                # verbose build output
 Builds the project in **release mode, x64**, then packages the result into a ZIP archive.
 
 ```bash
-python publish.py                          # build + package all supported platforms
-python publish.py --platform windows       # Windows MSVC only
-python publish.py --platform linux         # Linux GCC only (native, or via WSL on Windows)
+python publish.py # build + package + upload all supported platforms
+python publish.py --platform windows # Windows MSVC only
+python publish.py --platform linux # Linux GCC only (native, or via WSL on Windows)
+python publish.py --dry-run # build + package + verify, never upload
+python publish.py --skip-build # reuse bin/release (re-upload in seconds)
 python publish.py --no-verify # skip post-build verification
 python publish.py --no-upload # skip the gh release upload step
 python publish.py --clean --jobs 8 # clean rebuild with 8 jobs
-python publish.py --7z PATH                # explicit 7-Zip executable
+python publish.py --7z PATH # explicit 7-Zip executable
 ```
 
 **What it does:**
-- **Build** — delegates to `bootstrap.py` (`--toolchain msvc` on Windows, `--toolchain gcc` on Linux). On a Windows host the Linux target is built through WSL (`wsl.exe bash <script>`); if WSL is unavailable, the Linux target is skipped with a clear error (use `--platform windows`).
-- **Package** — copies `bin/release/runtime_py.pyd` into a clean staging dir, then archives it with 7-Zip as `kimix_base-<platform>-<arch>-<version>.zip` (e.g. `kimix_base-windows-x64-<version>.zip`, where `<version>` comes from `version.txt`) written next to the release artifacts in `bin/release`. The archive is a plain ZIP (Deflate), not a 7z — the old `.7z` used the BCJ2 filter, which `py7zr` cannot decompress.
+- **Build** — delegates to `bootstrap.py` (`--toolchain msvc` on Windows, `--toolchain gcc` on Linux) with `--target runtime_py`, so a publish run compiles **only the artifact it ships** — never the CLI or the ~60 test binaries (a bare `bootstrap.py` run builds every target). On a Windows host the Linux target is built through WSL (`wsl.exe bash <script>`) after a preflight that checks the inner `python3`/`xmake` in seconds; if WSL is unavailable, the Linux target is skipped with a clear error (use `--platform windows`). `--skip-build` reuses `bin/release` for a re-upload after an auth/network failure.
+- **Package** — copies `bin/release/runtime_py.pyd` into a clean staging dir, then archives it with 7-Zip as `kimix_base-<platform>-<arch>-<version>.zip` (e.g. `kimix_base-windows-x64-<version>.zip`, where `<version>` comes from `version.txt`) written next to the release artifacts in `bin/release`. The archive is a plain ZIP (Deflate), not a 7z — the old `.7z` used the BCJ2 filter, which `py7zr` cannot decompress. Before each build every output whose magic byte does not match the target platform (`runtime_py.pyd`, `runtime_py.so`, `libruntime_py.so` — bin/release is shared) is deleted, so xmake really relinks instead of no-op'ing onto the other platform's binary; packaging then refuses a foreign-magic artifact outright.
 - **Version** — read from `version.txt` in the project root, the **single config file** for the version (must match `X.Y.Z`); `publish.py` refuses to run if it is missing or malformed. The version literal never appears anywhere else: xmake generates the C++ `version_string` headers (`kimix_core.h` / `runtime.h`) from it at build time, and the Python shim (`kimix_native`) plus its tests read it directly. Bumping the version = editing `version.txt` only.
-- **Verify** — lists the archive to confirm the artifact is present, and on Windows imports `runtime_py.pyd` checking that the reported version contains the configured version. Disable with `--no-verify`.
-- **Upload** — after a platform builds, packages and verifies clean, its archive is uploaded with `gh release upload <tag> <zip> --repo Sikao-Engine/KimiX-native --clobber` to the standing release tag `Release` (https://github.com/Sikao-Engine/KimiX-native/releases/tag/Release). `--clobber` makes re-running the same version replace the same-name asset. The run fails fast (before building) when `gh` is missing or unauthenticated; skip the step with `--no-upload`.
-
-**Exit codes:** `0` = all platforms built/packaged/verified/uploaded, `1` = any platform failed or bad input (incl. missing gh), `2` (per-platform result) = verification failed, `3` (per-platform result) = gh upload failed.
+- **Verify** — checks the archive listing, imports the freshly built `runtime_py.pyd` (Windows), then **extracts the packaged binary out of the archive and imports that** (Windows on the host, Linux through WSL / on a native Linux host) and requires the version from `version.txt`, so a broken or stale shipped file fails the run. Prints the archive size + sha256. Disable with `--no-verify`.
+- **Upload** — after a platform builds, packages and verifies clean, its archive is uploaded with `gh release upload <tag> <zip> --repo Sikao-Engine/KimiX-native --clobber` to the standing release tag `Release` (https://github.com/Sikao-Engine/KimiX-native/releases/tag/Release), with retries on transient failures. `--clobber` makes re-running the same version replace the same-name asset. Credentials resolve automatically, first hit wins: `GH_TOKEN`/`GITHUB_TOKEN`, then an existing `gh auth login`, then the git credential helper for github.com (GitHub Desktop / GCM store a token there) exported to gh as `GH_TOKEN` for the run — so a machine that can push but never ran `gh auth login` still publishes. After the upload the release asset is read back with `gh api` and its size + sha256 digest must match the local archive, so a truncated upload fails the run. Skip the step with `--no-upload` / `--dry-run`.
+  **Exit codes:** `0` = all platforms built/packaged/verified/uploaded, `1` = any platform failed or bad input (incl. missing gh), `2` (per-platform result) = verification failed, `3` (per-platform result) = gh upload failed.
 
 ---
 

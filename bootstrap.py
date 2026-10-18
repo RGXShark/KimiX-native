@@ -11,6 +11,7 @@ Usage examples:
   python bootstrap.py --debug                # debug build
   python bootstrap.py --toolchain clang-cl   # use a specific toolchain
   python bootstrap.py --test                 # build + run tests
+  python bootstrap.py --target runtime_py    # build one target only
   python bootstrap.py --clean --debug        # clean rebuild in debug mode
 """
 
@@ -673,6 +674,12 @@ def config_and_build(args) -> int:
 
     # Build
     build_cmd = [xmake, "build", "-j", str(args.jobs)]
+    targets = getattr(args, "target", None)
+    if targets:
+        # `xmake build <targets...>` builds just those targets (the whole
+        # project is the default). Windows accepts a single target name per
+        # invocation, which is all publish.py needs.
+        build_cmd.extend(targets)
     if args.verbose:
         build_cmd.append("-v")
 
@@ -711,8 +718,8 @@ Examples:
   python bootstrap.py --toolchain gcc        # use GCC explicitly
   python bootstrap.py --toolchain clang-cl   # use Clang-CL on Windows
   python bootstrap.py --test                 # build + run tests
+  python bootstrap.py --target runtime_py    # build one target only
   python bootstrap.py --clean --debug --test # clean debug build + test
-
 Supported toolchains:
   Windows:  msvc (default), clang-cl, llvm
   Linux:    gcc (default), llvm
@@ -741,6 +748,13 @@ def build_parser() -> argparse.ArgumentParser:
     build_group.add_argument(
         "--jobs", "-j", type=int, default=Config.CPU_COUNT, metavar="N",
         help=f"Number of parallel build jobs (default: {Config.CPU_COUNT}).",
+    )
+    build_group.add_argument(
+        "--target", metavar="TARGET", action="append", default=None,
+        help="Build only this xmake target instead of every target (repeatable; "
+             "note that xmake on Windows accepts one target per invocation, so "
+             "pass a single --target there). publish.py uses this to build only "
+             "the artifact it ships.",
     )
     build_group.add_argument(
         "--clean", "-C", action="store_true",
