@@ -8,9 +8,16 @@ target("kimix-core")
     end
     add_files("core/*.cpp")
     add_files("core/stl/*.cpp")       -- NEW: stl implementations
+    -- Vendored LMDB C sources (third-party, byte-exact copy under core/lmdb/).
+    -- Added explicitly: the "core/*.cpp" glob above is non-recursive and only
+    -- matches C++, so these .c files are never auto-picked-up. unity_ignored keeps
+    -- them out of the c.unity_build batch that _config_project applies (mdb.c and
+    -- midl.c define their own statics/macros and must not be #include-merged).
+    add_files("core/lmdb/mdb.c", "core/lmdb/midl.c", {unity_ignored = true})
     add_headerfiles("core/*.h")
     add_headerfiles("core/stl/*.h")   -- NEW: stl headers
     add_headerfiles("core/stl/*.inl") -- if any .inl files
+    add_headerfiles("core/lmdb/lmdb.h", "core/lmdb/midl.h")
     add_includedirs(".", {public = true})
     -- Dependency rule: all third-party deps are declared HERE (on kimix-core)
     -- only; every other target depends on kimix-core and never on a third-party
@@ -77,12 +84,22 @@ target("kimix-core")
         if target:is_plat("windows") then
             target:add("defines", "NOMINMAX", "_CRT_SECURE_NO_WARNINGS", {public = true})
             target:add("defines", "KIMIX_PLATFORM_WINDOWS", {public = true})  -- NEW
+        -- Vendored LMDB (core/lmdb): its only Windows API beyond kernel32 is
+        -- InitializeSecurityDescriptor/SetSecurityDescriptorDacl, which live in
+        -- Advapi32.lib (no bcrypt/Crypto API is used). Public so consumers that
+        -- link kimix-core also resolve those imports.
+        target:add("syslinks", "Advapi32", {public = true})
+        -- core/guid.cpp: Guid::remake() calls CoCreateGuid on Windows.
+        target:add("syslinks", "Ole32", {public = true})
             if is_mode("debug") then
                 target:add("syslinks", "Dbghelp")  -- for backtrace
             end
         elseif target:is_plat("linux") then
             target:add("defines", "KIMIX_PLATFORM_UNIX", {public = true})
-            target:add("syslinks", "dl", "pthread")
+            -- Vendored LMDB (core/lmdb): on Linux it uses SysV semaphores
+            -- (semget/semop/semctl) and shared memory; -lrt carries them on older
+            -- glibc and is a harmless stub on >=2.34.
+            target:add("syslinks", "dl", "pthread", "rt")
         elseif target:is_plat("macosx") then
             target:add("defines", "KIMIX_PLATFORM_UNIX", "KIMIX_PLATFORM_APPLE", {public = true})
         end

@@ -67,6 +67,11 @@
 
 // String utilities
 #include "string_scratch.h"
+// Three-way compare, MD5, GUID, hash map
+#include "compare.h"
+#include "md5.h"
+#include "guid.h"
+#include "hash_map.h"
 
 // Version (generated at build time from the version.txt config file)
 #include "kimix_version.h"

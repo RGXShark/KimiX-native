@@ -97,6 +97,10 @@ test_proj("test_json_repair", "unit/core/test_json_repair.cpp")
 -- unit/core (kimix::fiber over the vendored marl: scheduler, events, counters,
 -- futures, parallel/async_parallel, SharedFunction)
 test_proj("test_fiber", "unit/core/test_fiber.cpp")
+-- unit/core (md5/guid ported from LuisaCompute vstl, plus kimix::HashMap)
+test_proj("test_md5", "unit/core/test_md5.cpp")
+test_proj("test_guid", "unit/core/test_guid.cpp")
+test_proj("test_hash_map", "unit/core/test_hash_map.cpp")
 
 -- unit/ext
 test_proj("test_yyjson", "unit/ext/test_yyjson.cpp")
