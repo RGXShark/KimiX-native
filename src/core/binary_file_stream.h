@@ -21,6 +21,18 @@
  *   Opening a non-existent file leaves the stream in a closed state
  *   (is_open() == false).
  *
+ *   Cross-module safety: the whole class is header-inline ON PURPOSE
+ *   (mirrors luisa-compute's binary_file_stream.h). kimix-core's objects are
+ *   archived into several modules (kimix-llm, kimix-cli, runtime_py, ...),
+ *   each linking its own CRT/mimalloc instance, so a FILE* - and any heap
+ *   block this class returns - must be created and consumed inside the same
+ *   module. Inline keeps every fopen/fread/fclose and every read_all()
+ *   allocation in the caller's own module.
+ *
+ *   When wrapping an existing FILE* (BinaryFileStream(FILE*)), the handle
+ *   must have been opened by the same module that will read and close it;
+ *   prefer the path constructor.
+ *
  * Example:
  *   kimix::BinaryFileStream bfs("data.bin");
  *   if (!bfs) { /* handle error *\/ }

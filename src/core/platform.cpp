@@ -3,6 +3,7 @@
 #include <core/stl/string.h>
 #include <core/stl/filesystem.h>
 
+#include <climits>
 #include <cstdio>
 
 static_assert(sizeof(void *) == 8 && sizeof(int) == 4 && sizeof(char) == 1,
@@ -116,6 +117,40 @@ kimix::string dynamic_module_name(kimix::string_view name) noexcept {
     s.append(".dll");
     return s;
 }
+
+namespace platform {
+
+// ANSI code page (CP_ACP) conversion primitives. See the contract documented
+// in core/platform.h. These never allocate: the caller owns the buffers,
+// which is what makes them safe to export across module boundaries even where
+// each module links its own mimalloc instance.
+size_t narrow_to_wide_acp(string_view text, wchar_t *dst, size_t capacity) noexcept {
+    if (text.size() > static_cast<size_t>(INT_MAX) || capacity > static_cast<size_t>(INT_MAX)) {
+        return 0u;
+    }
+    const int len = static_cast<int>(text.size());
+    // Query (dst == nullptr): returns the required wchar_t count, 0 for
+    // empty input or bytes the ANSI code page cannot represent
+    // (MB_ERR_INVALID_CHARS). Fill: writes up to `capacity` wchar_t. Whether
+    // the count includes the null terminator varies between Windows builds
+    // (documented as included; observed as excluded), so callers size the
+    // buffer with the query result and strip trailing nulls instead of
+    // trusting it.
+    return static_cast<size_t>(::MultiByteToWideChar(
+        CP_ACP, MB_ERR_INVALID_CHARS, text.data(), len, dst, static_cast<int>(capacity)));
+}
+
+size_t wide_to_narrow_acp(wstring_view text, char *dst, size_t capacity, bool strict) noexcept {
+    if (text.size() > static_cast<size_t>(INT_MAX) || capacity > static_cast<size_t>(INT_MAX)) {
+        return 0u;
+    }
+    const DWORD flags = strict ? (WC_ERR_INVALID_CHARS | WC_NO_BEST_FIT_CHARS) : 0u;
+    return static_cast<size_t>(::WideCharToMultiByte(
+        CP_ACP, flags, text.data(), static_cast<int>(text.size()),
+        dst, static_cast<int>(capacity), nullptr, nullptr));
+}
+
+}// namespace platform
 
 kimix::string cpu_name() noexcept {
     int32_t brand[12];

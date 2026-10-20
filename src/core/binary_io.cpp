@@ -1,5 +1,6 @@
 #include <core/binary_io.h>
 #include <core/binary_file_stream.h>
+#include <core/platform.h>
 #include <core/stl/filesystem.h>
 #include <core/stl/format.h>
 
@@ -11,15 +12,24 @@ namespace kimix {
 // Build cache_dir/name as a path without ever throwing: the narrow path
 // constructor converts via the ANSI code page and would terminate the
 // process (no exceptions in this build) on unrepresentable bytes, so route
-// through path_from_narrow() and treat failure as "does not exist".
-static bool make_cache_path(const string &dir, string_view name,
-                            kimix::filesystem::path &out) {
-    kimix::filesystem::path base;
-    if (!kimix::path_from_narrow(dir, base)) { return false; }
-    kimix::filesystem::path leaf;
-    if (!kimix::path_from_narrow(name, leaf)) { return false; }
-    out = base / leaf;
-    return true;
+// through kimix::platform::path_from_narrow() (core/platform.h) and treat an
+// undecodable name as an empty path, which the callers below already treat
+// as "no such file".
+//
+// The platform helpers are INLINE ON PURPOSE: kimix-core is a static archive
+// whose objects are linked into several modules (kimix-llm, kimix-cli,
+// runtime_py, kimix_api, the test binaries), and each module can carry its
+// own mimalloc instance. An owning path/string built by a core-exported
+// factory would hand the caller a block its module cannot free safely (the
+// crash luisa-compute fixed in commit d80d45d). The inline helpers allocate
+// and free inside whichever module calls them; only the allocation-free
+// conversion primitives cross the module boundary.
+static kimix::filesystem::path make_cache_path(const string &dir, string_view name) {
+    kimix::filesystem::path base = kimix::platform::path_from_narrow(dir);
+    if (base.empty() && !dir.empty()) { return {}; }
+    kimix::filesystem::path leaf = kimix::platform::path_from_narrow(name);
+    if (leaf.empty() && !name.empty()) { return {}; }
+    return base / leaf;
 }
 
 // ---------------------------------------------------------------------------
@@ -27,9 +37,9 @@ static bool make_cache_path(const string &dir, string_view name,
 // ---------------------------------------------------------------------------
 
 bool DefaultBinaryIO::read_shader_source(string_view name, string &source) {
-    kimix::filesystem::path file_path;
-    if (!make_cache_path(_cache_dir, name, file_path)) { return false; }
-    const auto path_str = kimix::to_string(file_path);
+    auto file_path = make_cache_path(_cache_dir, name);
+    if (file_path.empty()) { return false; }
+    const auto path_str = kimix::platform::path_to_narrow(file_path);
     BinaryFileStream stream(path_str.c_str());
     if (!stream) {
         std::fprintf(stderr, "[kimix] Failed to open shader source file: %s\n",
@@ -42,8 +52,8 @@ bool DefaultBinaryIO::read_shader_source(string_view name, string &source) {
 }
 
 bool DefaultBinaryIO::write_shader_source(string_view name, string_view source) {
-    kimix::filesystem::path dir_path;
-    if (!kimix::path_from_narrow(_cache_dir, dir_path)) { return false; }
+    auto dir_path = kimix::platform::path_from_narrow(_cache_dir);
+    if (dir_path.empty() && !_cache_dir.empty()) { return false; }
     std::error_code ec;
     kimix::filesystem::create_directories(dir_path, ec);
     if (ec) {
@@ -52,9 +62,9 @@ bool DefaultBinaryIO::write_shader_source(string_view name, string_view source) 
         return false;
     }
 
-    kimix::filesystem::path file_path;
-    if (!make_cache_path(_cache_dir, name, file_path)) { return false; }
-    const auto path_str = kimix::to_string(file_path);
+    auto file_path = make_cache_path(_cache_dir, name);
+    if (file_path.empty()) { return false; }
+    const auto path_str = kimix::platform::path_to_narrow(file_path);
     FILE *file = fopen(path_str.c_str(), "wb");
     if (!file) {
         std::fprintf(stderr, "[kimix][warning] Failed to open shader source file for writing: %s (%s:%d)\n",
@@ -68,9 +78,9 @@ bool DefaultBinaryIO::write_shader_source(string_view name, string_view source) 
 }
 
 bool DefaultBinaryIO::read_shader_cache(string_view name, vector<byte> &data) {
-    kimix::filesystem::path file_path;
-    if (!make_cache_path(_cache_dir, name, file_path)) { return false; }
-    const auto path_str = kimix::to_string(file_path);
+    auto file_path = make_cache_path(_cache_dir, name);
+    if (file_path.empty()) { return false; }
+    const auto path_str = kimix::platform::path_to_narrow(file_path);
     BinaryFileStream stream(path_str.c_str());
     if (!stream) {
         std::fprintf(stderr, "[kimix] Failed to open shader cache file: %s\n",
@@ -82,8 +92,8 @@ bool DefaultBinaryIO::read_shader_cache(string_view name, vector<byte> &data) {
 }
 
 bool DefaultBinaryIO::write_shader_cache(string_view name, std::span<const byte> data) {
-    kimix::filesystem::path dir_path;
-    if (!kimix::path_from_narrow(_cache_dir, dir_path)) { return false; }
+    auto dir_path = kimix::platform::path_from_narrow(_cache_dir);
+    if (dir_path.empty() && !_cache_dir.empty()) { return false; }
     std::error_code ec;
     kimix::filesystem::create_directories(dir_path, ec);
     if (ec) {
@@ -92,9 +102,9 @@ bool DefaultBinaryIO::write_shader_cache(string_view name, std::span<const byte>
         return false;
     }
 
-    kimix::filesystem::path file_path;
-    if (!make_cache_path(_cache_dir, name, file_path)) { return false; }
-    const auto path_str = kimix::to_string(file_path);
+    auto file_path = make_cache_path(_cache_dir, name);
+    if (file_path.empty()) { return false; }
+    const auto path_str = kimix::platform::path_to_narrow(file_path);
     FILE *file = fopen(path_str.c_str(), "wb");
     if (!file) {
         std::fprintf(stderr, "[kimix][warning] Failed to open shader cache file for writing: %s (%s:%d)\n",

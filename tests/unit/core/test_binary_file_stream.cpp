@@ -149,4 +149,40 @@ int main(int argc, char *argv[]) {
         expect(!bfs.is_open()) << "non-existent file should not open";
     };
 
+    // DefaultBinaryIO exercises the kimix::platform::path_from_narrow() /
+    // path_to_narrow() conversions (core/platform.h) on every call: cache
+    // dir + name -> path -> narrow path -> fopen. Verify the full write/read
+    // round-trip through those helpers.
+    // NOTE: names are opened directly under the cache dir (flat); the cache
+    // dir itself is created, but not sub-directories of the leaf.
+    "binary_io_shader_cache_roundtrip"_test = [] {
+        const char *cache_dir = "test_binary_io_temp_cache";
+        kimix::DefaultBinaryIO io{cache_dir};
+        const kimix::string payload{"shader-cache-payload-123"};
+        kimix::vector<kimix::byte> bytes(
+            reinterpret_cast<const kimix::byte *>(payload.data()),
+            reinterpret_cast<const kimix::byte *>(payload.data()) + payload.size());
+        expect(io.write_shader_cache("cache.bin", bytes));
+        kimix::vector<kimix::byte> read_back;
+        expect(io.read_shader_cache("cache.bin", read_back));
+        expect(eq(read_back.size(), bytes.size()));
+        if (read_back.size() == bytes.size()) {
+            expect(std::memcmp(read_back.data(), bytes.data(), bytes.size()) == 0);
+        }
+        std::error_code ec;
+        kimix::filesystem::remove_all(cache_dir, ec);
+    };
+
+    "binary_io_shader_source_roundtrip"_test = [] {
+        const char *cache_dir = "test_binary_io_temp_cache_src";
+        kimix::DefaultBinaryIO io{cache_dir};
+        const kimix::string source{"void main() { /* shader source */ }"};
+        expect(io.write_shader_source("shader.glsl", source));
+        kimix::string read_back;
+        expect(io.read_shader_source("shader.glsl", read_back));
+        expect(read_back == source);
+        std::error_code ec;
+        kimix::filesystem::remove_all(cache_dir, ec);
+    };
+
 }
