@@ -92,11 +92,20 @@ int main(int argc, char *argv[]) {
         }
     };
 
-    // Lone surrogates are invalid scalar values: even the lossy code-page
-    // pass rejects them, so the UTF-8 fallback sanitizes them to '?'.
+    // Lone surrogates are invalid scalar values: on a legacy ACP even the
+    // lossy code-page pass rejects them, so the UTF-8 fallback sanitizes them
+    // to '?'. On a UTF-8 ACP the lossy CP_ACP pass (= CP_UTF8) succeeds by
+    // itself and Windows replaces the invalid scalar with U+FFFD, so the
+    // sanitizer never runs.
     "fs_to_string_sanitizes_lone_surrogates"_test = [] {
         const kimix::filesystem::path p(std::wstring(L"sur\xD800rogate"));
-        expect(kimix::to_string(p) == "sur?rogate");
+        if (::GetACP() != CP_UTF8) {
+            expect(kimix::to_string(p) == "sur?rogate");
+        } else {
+            // "sur" + U+FFFD (EF BF BD) + "rogate": the lossy UTF-8 pass
+            // replaces the lone high surrogate, every other byte survives.
+            expect(kimix::to_string(p) == "sur\xEF\xBF\xBDrogate") << "lone surrogate must become U+FFFD on a UTF-8 ACP";
+        }
     };
 #endif
 

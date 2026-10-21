@@ -131,8 +131,12 @@ private:
     mutable int64_t _consumed = 0; // total chars consumed (zero-width guard)
     mutable uint64_t _steps = 0;      // backtracker node visits this search()
     mutable uint64_t _step_limit = 0; // budget: trip -> NFA fallback
-    mutable bool _aborted = false;    // the budget tripped
-    mutable uint32_t _depth = 0;      // run() recursion depth (stack guard)
+    mutable bool _aborted = false; // the budget tripped
+    mutable uint32_t _depth = 0; // run() recursion depth (stack guard)
+    // Address of a search() entry-frame local: the stack guard in run()
+    // measures recursion cost in BYTES against it, so the cap holds on
+    // threads, marl fibers and any stack size (fiber stacks are 1 MiB).
+    mutable intptr_t _stack_base = 0;
 
     int32_t alloc_node();
     void patch(const frag &f, int32_t target);

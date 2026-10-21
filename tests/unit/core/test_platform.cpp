@@ -89,9 +89,29 @@ int main(int argc, char *argv[]) {
 
     // Strict conversion fails on unrepresentable characters; the lossy pass
     // replaces them (WC_NO_BEST_FIT_CHARS only affects the strict flags).
+    // A UTF-8 ACP is the exception: every valid scalar is representable there,
+    // so U+F03A passes the strict flags too and strict and lossy agree.
     "platform_wide_to_narrow_acp_strict_vs_lossy"_test = [] {
         const std::wstring_view wide{L"a\xF03A" L"b"};
-        expect(kimix::platform::wide_to_narrow_acp(wide, nullptr, 0u, true) == 0u);
+        if (::GetACP() != CP_UTF8) {
+            expect(kimix::platform::wide_to_narrow_acp(wide, nullptr, 0u, true) == 0u);
+        } else {
+            // Strict query succeeds on a UTF-8 ACP: every valid scalar is
+            // representable there, so the count is the 5 encoded UTF-8 bytes
+            // (plus the null terminator on builds that include it, hence 5
+            // or 6) and the fill emits 61 EF 80 BA 62 — the exact encoding
+            // of "a" U+F03A "b".
+            const size_t q = kimix::platform::wide_to_narrow_acp(wide, nullptr, 0u, true);
+            expect(q == 5u || q == 6u);
+            kimix::string out(q + 1u, '\0');
+            const size_t filled = kimix::platform::wide_to_narrow_acp(wide, &out[0], out.size(), true);
+            expect(filled != 0u);
+            while (!out.empty() && out.back() == '\0') { out.pop_back(); }
+            expect(out == "a\xEF\x80\xBA" "b") << "strict CP_UTF8 must emit the valid UTF-8 encoding of U+F03A";
+            // The bytes decode back through the ACP to the original name.
+            auto back = kimix::platform::path_from_narrow(out);
+            expect(back.native() == std::wstring(L"a\xF03A" L"b")) << "strict UTF-8 result must round-trip";
+        }
         const size_t needed = kimix::platform::wide_to_narrow_acp(wide, nullptr, 0u, false);
         expect(needed > 1u);
         kimix::string out(needed, '\0');
@@ -100,6 +120,10 @@ int main(int argc, char *argv[]) {
         expect(!out.empty());
         if (::GetACP() != CP_UTF8) {
             expect(out == "a?b");
+        } else {
+            // On CP_UTF8 the lossy pass has nothing to replace: same bytes as
+            // the strict pass above.
+            expect(out == "a\xEF\x80\xBA" "b");
         }
     };
 #endif
