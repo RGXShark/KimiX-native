@@ -32,6 +32,7 @@
 #include <core/stl/string.h>
 #include <core/stl/vector.h>
 
+#include <algorithm>
 #include <cstring>
 #include <utility>
 
@@ -135,7 +136,9 @@ PropertyValue to_value(kimix_gdb_property const &input) {
 }
 
 // A scratch writer: one caller-owned buffer, append-only, overflow flag instead of
-// an exception. Every variable-length read uses it.
+// an exception. Every variable-length read uses it. `needed()` tallies EVERY
+// append attempt, so a call that overflowed still reports the buffer size the
+// caller must provide (the contract: ERR_BUFFER reports the required sizes).
 class ScratchWriter {
 public:
     ScratchWriter(uint8_t *buffer, size_t capacity) noexcept
@@ -143,6 +146,7 @@ public:
     }
 
     bool append(kimix::span<const std::byte> bytes, uint32_t &offset, uint32_t &length) noexcept {
+        _needed += bytes.size();
         if (_used + bytes.size() > _capacity) {
             _overflow = true;
             offset = 0;
@@ -166,11 +170,15 @@ public:
 
     [[nodiscard]] bool overflowed() const noexcept { return _overflow; }
     [[nodiscard]] size_t used() const noexcept { return _used; }
+    // The buffer size that fits every append attempt, successful or not: what a
+    // caller must allocate after an ERR_BUFFER, and what the probe phase reports.
+    [[nodiscard]] size_t needed() const noexcept { return _needed; }
 
 private:
     uint8_t *_buffer{nullptr};
     size_t _capacity{0};
     size_t _used{0};
+    size_t _needed{0};
     bool _overflow{false};
 };
 
@@ -249,17 +257,17 @@ GdiStatus write_properties(kimix::vector<std::pair<PropNameId, PropertyValue>> c
     if (out_count != nullptr) {
         *out_count = properties.size();
     }
-    if (out_scratch != nullptr) {
-        *out_scratch = scratch.used();
-    }
-    if (scratch.overflowed()) {
-        return GdiStatus::error_buffer;
-    }
-    if (properties.size() > capacity) {
-        return GdiStatus::error_buffer;
-    }
-    return GdiStatus::ok;
-}
+      if (out_scratch != nullptr) {
+          *out_scratch = scratch.needed();
+      }
+      if (scratch.overflowed()) {
+          return GdiStatus::error_buffer;
+      }
+      if (properties.size() > capacity) {
+          return GdiStatus::error_buffer;
+      }
+      return GdiStatus::ok;
+  }
 
 ConstraintSlot *find_slot(kimix_gdb_session *session, uint32_t id) {
     for (auto &slot : session->constraints) {
@@ -474,7 +482,10 @@ int32_t kimix_gdb_load(kimix_gdb_session *session) {
 
 int32_t kimix_gdb_vertex_create(kimix_gdb_session *session, const kimix_gdb_vertex_spec *spec,
                                 kimix_gdb_guid *out_uid, uint8_t *out_warning) {
-    if (session == nullptr || spec == nullptr) {
+    if (session == nullptr || spec == nullptr ||
+        (spec->labels == nullptr && spec->label_count != 0) ||
+        (spec->properties == nullptr && spec->property_count != 0) ||
+        (spec->property_names == nullptr && spec->property_count != 0)) {
         return KIMIX_GDB_ERR_ARGUMENT;
     }
     kimix::graph_db::PropertyList properties;
@@ -586,7 +597,14 @@ int32_t kimix_gdb_vertex_labels(kimix_gdb_session *session, kimix_gdb_guid verte
     }
     kimix::vector<LabelId> ids;
     record->labels(ids);
-    size_t const total = ids.size() + (record->key_label() != 0 ? 1 : 0);
+    // The fetch below writes the key label first and skips it inside `ids`, so
+    // the probe must count exactly that.  Normally _labels does NOT carry the
+    // key label (it lives in _key_label), but a create whose label list names
+    // the key label stores it there too — count it once, not twice.
+    bool const key_in_labels =
+        record->key_label() != 0 &&
+        std::find(ids.begin(), ids.end(), record->key_label()) != ids.end();
+    size_t const total = ids.size() + (record->key_label() != 0 && !key_in_labels ? 1 : 0);
     *out_count = total;
     if (labels == nullptr) {
         return KIMIX_GDB_OK; // size query
@@ -688,13 +706,27 @@ int32_t vertex_properties_read(kimix_gdb_session *session, kimix_gdb_guid vertex
             properties, static_cast<kimix_gdb_property_record *>(raw_items), capacity, scratch,
             scratch_capacity, out_count, out_scratch));
     }
-    auto *items = static_cast<kimix_gdb_property_type *>(raw_items);
-    // Property TYPES: the declaration of every property the vertex carries.
-    kimix::graph_db::PropertyTypeList types;
-    (void)session->database.get_property_types(uid, types);
-    ScratchWriter writer{scratch, scratch_capacity};
-    if (out_count != nullptr) {
-        *out_count = types.size();
+      auto *items = static_cast<kimix_gdb_property_type *>(raw_items);
+      // Property TYPES: the declaration of every property the vertex carries.
+      kimix::graph_db::PropertyTypeList types;
+      (void)session->database.get_property_types(uid, types);
+      // PHASE 1 (both buffers NULL): sizes only, success — the documented probe.
+      if (items == nullptr && scratch == nullptr) {
+          size_t needed = 0;
+          for (auto const &type : types) {
+              needed += type.name.size();
+          }
+          if (out_count != nullptr) {
+              *out_count = types.size();
+          }
+          if (out_scratch != nullptr) {
+              *out_scratch = needed;
+          }
+          return KIMIX_GDB_OK;
+      }
+      ScratchWriter writer{scratch, scratch_capacity};
+      if (out_count != nullptr) {
+          *out_count = types.size();
     }
     GdiStatus status = GdiStatus::ok;
     for (size_t i = 0; i < types.size(); ++i) {
@@ -714,7 +746,7 @@ int32_t vertex_properties_read(kimix_gdb_session *session, kimix_gdb_guid vertex
         }
     }
     if (out_scratch != nullptr) {
-        *out_scratch = writer.used();
+        *out_scratch = writer.needed();
     }
     if (status == GdiStatus::ok && raw_items != nullptr && types.size() > capacity) {
         status = GdiStatus::error_buffer;
@@ -759,6 +791,20 @@ int32_t edge_properties_read(kimix_gdb_session *session, kimix_gdb_guid edge,
     auto *items = static_cast<kimix_gdb_property_type *>(raw_items);
     kimix::graph_db::PropertyTypeList types;
     (void)session->database.get_edge_property_types(id, types);
+    // PHASE 1 (both buffers NULL): sizes only, success — the documented probe.
+    if (items == nullptr && scratch == nullptr) {
+        size_t needed = 0;
+        for (auto const &type : types) {
+            needed += type.name.size();
+        }
+        if (out_count != nullptr) {
+            *out_count = types.size();
+        }
+        if (out_scratch != nullptr) {
+            *out_scratch = needed;
+        }
+        return KIMIX_GDB_OK;
+    }
     ScratchWriter writer{scratch, scratch_capacity};
     if (out_count != nullptr) {
         *out_count = types.size();
@@ -781,7 +827,7 @@ int32_t edge_properties_read(kimix_gdb_session *session, kimix_gdb_guid edge,
         }
     }
     if (out_scratch != nullptr) {
-        *out_scratch = writer.used();
+        *out_scratch = writer.needed();
     }
     if (status == GdiStatus::ok && raw_items != nullptr && types.size() > capacity) {
         status = GdiStatus::error_buffer;
@@ -810,7 +856,7 @@ int32_t kimix_gdb_vertex_property_update(kimix_gdb_session *session, kimix_gdb_g
 
 int32_t kimix_gdb_vertex_properties_remove(kimix_gdb_session *session, kimix_gdb_guid vertex,
                                            const uint32_t *names, size_t name_count) {
-    if (session == nullptr) {
+    if (session == nullptr || (names == nullptr && name_count != 0)) {
         return KIMIX_GDB_ERR_ARGUMENT;
     }
     return code_of(session->database.remove_properties(
@@ -850,7 +896,7 @@ int32_t kimix_gdb_edge_property_update(kimix_gdb_session *session, kimix_gdb_gui
 
 int32_t kimix_gdb_edge_properties_remove(kimix_gdb_session *session, kimix_gdb_guid edge,
                                          const uint32_t *names, size_t name_count) {
-    if (session == nullptr) {
+    if (session == nullptr || (names == nullptr && name_count != 0)) {
         return KIMIX_GDB_ERR_ARGUMENT;
     }
     return code_of(session->database.remove_edge_properties(
@@ -878,10 +924,10 @@ int32_t kimix_gdb_edge_property_types(kimix_gdb_session *session, kimix_gdb_guid
 // ===========================================================================
 
 int32_t kimix_gdb_edge_create(kimix_gdb_session *session, kimix_gdb_guid origin,
-                              kimix_gdb_guid target, uint8_t direction, const uint32_t *labels,
-                              size_t label_count, const kimix_gdb_property *properties,
-                              size_t property_count, kimix_gdb_guid *out_edge) {
-    if (session == nullptr) {
+kimix_gdb_guid target, uint8_t direction, const uint32_t *labels,
+size_t label_count, const kimix_gdb_property *properties,
+size_t property_count, kimix_gdb_guid *out_edge) {
+    if (session == nullptr || (labels == nullptr && label_count != 0)) {
         return KIMIX_GDB_ERR_ARGUMENT;
     }
     kimix_gdb_edge_spec spec{};
@@ -1184,29 +1230,43 @@ int32_t kimix_gdb_label_get_all(kimix_gdb_session *session, kimix_gdb_label *ite
     if (session == nullptr) {
         return KIMIX_GDB_ERR_ARGUMENT;
     }
-    kimix::graph_db::NamedLabelList labels;
-    GdiStatus status = session->database.get_all_labels(labels);
-    if (is_error(status)) {
-        return code_of(status);
-    }
-    ScratchWriter writer{scratch, scratch_capacity};
-    if (out_count != nullptr) {
-        *out_count = labels.size();
-    }
-    for (size_t i = 0; i < labels.size(); ++i) {
-        uint32_t offset = 0;
-        uint32_t length = 0;
-        if (!writer.append_text(labels[i].name, offset, length)) {
-            status = GdiStatus::error_buffer;
-        }
-        if (items != nullptr && i < capacity) {
-            items[i].id = labels[i].id;
-            items[i].name_offset = offset;
-            items[i].name_len = length;
-        }
-    }
+      kimix::graph_db::NamedLabelList labels;
+      GdiStatus status = session->database.get_all_labels(labels);
+      if (is_error(status)) {
+          return code_of(status);
+      }
+      // PHASE 1 (both buffers NULL): sizes only, success — the documented probe.
+      if (items == nullptr && scratch == nullptr) {
+          size_t needed = 0;
+          for (auto const &label : labels) {
+              needed += label.name.size();
+          }
+          if (out_count != nullptr) {
+              *out_count = labels.size();
+          }
+          if (out_scratch_bytes != nullptr) {
+              *out_scratch_bytes = needed;
+          }
+          return KIMIX_GDB_OK;
+      }
+      ScratchWriter writer{scratch, scratch_capacity};
+      if (out_count != nullptr) {
+          *out_count = labels.size();
+      }
+      for (size_t i = 0; i < labels.size(); ++i) {
+          uint32_t offset = 0;
+          uint32_t length = 0;
+          if (!writer.append_text(labels[i].name, offset, length)) {
+              status = GdiStatus::error_buffer;
+          }
+          if (items != nullptr && i < capacity) {
+              items[i].id = labels[i].id;
+              items[i].name_offset = offset;
+              items[i].name_len = length;
+          }
+      }
     if (out_scratch_bytes != nullptr) {
-        *out_scratch_bytes = writer.used();
+        *out_scratch_bytes = writer.needed();
     }
     if (status == GdiStatus::ok && items != nullptr && labels.size() > capacity) {
         status = GdiStatus::error_buffer;
@@ -1295,39 +1355,53 @@ int32_t kimix_gdb_property_type_get_all(kimix_gdb_session *session,
     if (session == nullptr) {
         return KIMIX_GDB_ERR_ARGUMENT;
     }
-    kimix::graph_db::PropertyTypeList types;
-    GdiStatus status = session->database.get_all_property_types(types);
-    if (is_error(status)) {
-        return code_of(status);
-    }
-    ScratchWriter writer{scratch, scratch_capacity};
-    if (out_count != nullptr) {
-        *out_count = types.size();
-    }
-    for (size_t i = 0; i < types.size(); ++i) {
-        uint32_t offset = 0;
-        uint32_t length = 0;
-        if (!writer.append_text(types[i].name, offset, length)) {
-            status = GdiStatus::error_buffer;
-        }
-        if (items != nullptr && i < capacity) {
-            items[i].id = types[i].name_id;
-            items[i].container = static_cast<uint8_t>(types[i].container);
-            items[i].dtype = static_cast<uint8_t>(types[i].data);
-            items[i].reserved = 0;
-            items[i].count = types[i].count;
-            items[i].name_offset = offset;
-            items[i].name_len = length;
-        }
-    }
-    if (out_scratch_bytes != nullptr) {
-        *out_scratch_bytes = writer.used();
-    }
-    if (status == GdiStatus::ok && items != nullptr && types.size() > capacity) {
-        status = GdiStatus::error_buffer;
-    }
-    return code_of(status);
-}
+      kimix::graph_db::PropertyTypeList types;
+      GdiStatus status = session->database.get_all_property_types(types);
+      if (is_error(status)) {
+          return code_of(status);
+      }
+      // PHASE 1 (both buffers NULL): sizes only, success — the documented probe.
+      if (items == nullptr && scratch == nullptr) {
+          size_t needed = 0;
+          for (auto const &type : types) {
+              needed += type.name.size();
+          }
+          if (out_count != nullptr) {
+              *out_count = types.size();
+          }
+          if (out_scratch_bytes != nullptr) {
+              *out_scratch_bytes = needed;
+          }
+          return KIMIX_GDB_OK;
+      }
+      ScratchWriter writer{scratch, scratch_capacity};
+      if (out_count != nullptr) {
+          *out_count = types.size();
+      }
+      for (size_t i = 0; i < types.size(); ++i) {
+          uint32_t offset = 0;
+          uint32_t length = 0;
+          if (!writer.append_text(types[i].name, offset, length)) {
+              status = GdiStatus::error_buffer;
+          }
+          if (items != nullptr && i < capacity) {
+              items[i].id = types[i].name_id;
+              items[i].container = static_cast<uint8_t>(types[i].container);
+              items[i].dtype = static_cast<uint8_t>(types[i].data);
+              items[i].reserved = 0;
+              items[i].count = types[i].count;
+              items[i].name_offset = offset;
+              items[i].name_len = length;
+          }
+      }
+      if (out_scratch_bytes != nullptr) {
+          *out_scratch_bytes = writer.needed();
+      }
+      if (status == GdiStatus::ok && items != nullptr && types.size() > capacity) {
+          status = GdiStatus::error_buffer;
+      }
+      return code_of(status);
+  }
 
 int32_t kimix_gdb_property_type_update(kimix_gdb_session *session, uint32_t type,
                                        const char *name, size_t name_len, uint8_t container,

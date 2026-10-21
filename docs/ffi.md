@@ -3,7 +3,7 @@
 `kimix_api` is a shared library (`src/api`) that puts a **plain C ABI** on top of
 `kimix-core`, so a caller in C, C#, Zig, Rust, Python (ctypes/cffi), Julia,
 Node `ffi-napi` or any other FFI host can use the kimix base facilities without
-C++ or pybind11 in the picture. It exports eight feature areas plus a small common
+C++ or pybind11 in the picture. It exports nine feature areas plus a small common
 header: the version/ABI/status/layout queries of
 `kimix_api_*` / `kimix_status_name`, the mimalloc allocator vocabulary
 (`kimix_mem_*`), the byte-buffer container `kimix::vector<std::byte>` as an inline
@@ -13,8 +13,10 @@ the opaque `uint64 -> uint64` hash map over `kimix::unordered_map` behind a hand
 worker pool (`kimix_fiber_*`), the yyjson JSON read/build/write surface with
 the mimalloc allocator baked in (`kimix_yyjson_*`), `kimix::repair()` for
 malformed LLM tool-call JSON (`kimix_repair*` / `kimix_json_*`), deterministic
-canonical JSON (`kimix_canonical_json*`), and the SQLite3 database C API re-exported
-over the vendored amalgamation (`kimix_sqlite_*`). Every entry point
+canonical JSON (`kimix_canonical_json*`), the SQLite3 database C API re-exported
+over the vendored amalgamation (`kimix_sqlite_*`), and the kimix-graph-db graph
+database C ABI re-exported from `src/graph_db/graph_c_api.h` (`kimix_graphdb_*`).
+Every entry point
 is declared in a pure-C header under `src/api`; this document is the searchable
 index of all of them.
 
@@ -26,8 +28,8 @@ index of all of them.
 | Build command | `xmake build kimix_api` (or `python bootstrap.py`) |
 | Output | `bin/<mode>/kimix_api.dll` + `kimix_api.lib` on Windows, `bin/<mode>/libkimix_api.so` on Linux (`<mode>` = `debug` / `release`) |
 | Umbrella header | `#include <api/kimix_api.h>` — include dir is `src/` |
-| Area headers | `<api/ffi_common.h>`, `<api/ffi_mem.h>`, `<api/ffi_vec.h>`, `<api/ffi_map.h>`, `<api/ffi_parallel.h>`, `<api/ffi_yyjson.h>`, `<api/ffi_repair.h>`, `<api/ffi_canonical.h>`, `<api/ffi_sqlite.h>` |
-| Dependencies | `kimix-core` carries mimalloc / yyjson / marl (compiled **into** this image); `kimix-sqlite3` is declared on this target directly, the same way `kimix-llm` declares its extra third-party deps |
+| Area headers | `<api/ffi_common.h>`, `<api/ffi_mem.h>`, `<api/ffi_vec.h>`, `<api/ffi_map.h>`, `<api/ffi_parallel.h>`, `<api/ffi_yyjson.h>`, `<api/ffi_repair.h>`, `<api/ffi_canonical.h>`, `<api/ffi_sqlite.h>`, `<api/ffi_graphdb.h>` |
+| Dependencies | `kimix-core` carries mimalloc / yyjson / marl (compiled **into** this image); `kimix-sqlite3` and `kimix-graph-db` are declared on this target directly, the same way `kimix-llm` declares its extra third-party deps |
 
 The headers are valid for a **C99/C11 compiler and for C++17 or newer**: opaque
 pointer typedefs, fixed-size POD structs, `size_t`, `<stdint.h>` scalars, `bool`
@@ -72,6 +74,7 @@ this library) is undefined behaviour. The pairing is fixed:
 | a `kimix_vec` you embedded/stack-allocated | `kimix_vec_default_init` / `_init_from` / `_copy_init` / `_move_init` | `kimix_vec_destroy` |
 | a `kimix_vec *` handle | `kimix_vec_new` / `kimix_vec_new_from` / `kimix_repair_new` | `kimix_vec_free` |
 | a `kimix_map *` handle | `kimix_map_new` | `kimix_map_free` (never the caller's `free`) |
+| a graph-db session | `kimix_graphdb_open` | `kimix_graphdb_close` (the only object the graphdb family allocates; there is no other free to pair) |
 | a fiber job run | `kimix_fiber_run` — allocates nothing and leaves no scheduler bound | nothing — the callback and its context stay the caller's |
 | a JSON output string | `kimix_yyjson_write` / `_val_write` / `_mut_write` / `_mut_val_write` | `kimix_yyjson_str_free` |
 | an immutable document | `kimix_yyjson_read` / `_read_str` / `_mut_doc_imut_copy` | `kimix_yyjson_doc_free` |
@@ -2236,6 +2239,444 @@ The name of column `col` as declared in the SELECT list (the `AS` alias when pre
 - Ownership: BORROWED with the same lifetime as `column_text()`; never free it.
 - Errors: `NULL` for a NULL `stmt` or an out-of-range `col`; SQLite synthesizes names like `"column"` when the query names nothing.
 ---
+## Graph database — `<api/ffi_graphdb.h>` (`kimix_graphdb_*`)
+
+The C ABI of `kimix-graph-db` (`src/graph_db/graph_c_api.h`, built as the `kimix-graph-db` static archive) re-exported one line per entry point (see `api/ffi_graphdb.cpp`): 64 `kimix_graphdb_*` functions that forward to their `kimix_gdb_*` twins with identical signatures and types, so every graph semantic of the archive carries over untouched. The wrappers exist because `graph_c_api.cpp` has no export macro and nothing of it leaves a shared image otherwise — this family puts it behind the house `KIMIX_FFI` surface without touching `src/graph_db`. The POD structs (`kimix_gdb_*`) and the `KIMIX_GDB_*` constants are the archive's own, included through `<api/ffi_graphdb.h>`, never re-declared.
+
+**Status contract.** Every fallible entry point returns `int32_t`, one of the GDI status codes (0 ok, 1..2 warnings, 3..62 errors) — NOT `kimix_status`: the numbers are identical to `kimix::graph_db::GdiStatus` and to the managed `Semevia.Gdi.GdiError`, and `KIMIX_GDB_ERR_ARGUMENT` (4), not `KIMIX_ERR_INVALID_ARG`, is what a NULL argument answers. `kimix_graphdb_status_name()` names a code. A failed call leaves the caller's out-parameters untouched.
+
+**Two-phase, caller-owned buffers.** There is NO library allocation on read paths. Every variable-length result follows one protocol: call once with the array pointer NULL (or capacity 0) to learn `*out_count` / `*out_scratch_bytes`, then call again with caller-owned storage; too-small storage answers `KIMIX_GDB_ERR_BUFFER` and still reports the needed sizes. Variable-length payloads (property values, schema names) land in a caller-provided scratch buffer that each record indexes with (offset, length).
+
+**Ownership.** The ONLY object the family allocates is the session (`kimix_graphdb_open`); it is released by exactly one `kimix_graphdb_close`, and no other call in the family ever hands the caller a pointer to free — so there is no cross-heap free to get wrong. `version_string` / `status_name` return static library storage; never free it.
+
+**One open transaction per session.** `tx_begin` twice (or commit/abort with none open) is `KIMIX_GDB_ERR_TRANSACTION`; the collective scope is read-only and every write inside answers `KIMIX_GDB_ERR_READ_ONLY_TRANSACTION`. Threading follows the archive: one session per worker, single-threaded per session.
+
+### 1. Library / ABI queries
+
+#### `uint32_t kimix_graphdb_abi_version(void);`
+The `KIMIX_GDB_ABI_VERSION` the graph archive was compiled with. Assert it before trusting a mirrored layout.
+- Wraps: `kimix_gdb_abi_version()` — a one-line forward, nothing added.
+- Ownership: nothing to free.
+- Errors: never fails.
+
+#### `const char *kimix_graphdb_version_string(void);`
+The graph-db version string (`"graph db 1.2.3"` shape), from the archive's `KIMIX_GRAPH_DB_VERSION`.
+- Wraps: `kimix_gdb_version_string()` — a one-line forward, nothing added.
+- Ownership: static library storage; never free it.
+- Errors: never fails.
+
+#### `int32_t kimix_graphdb_layout_info(kimix_gdb_layout *out);`
+Fills the POD `kimix_gdb_layout` with the struct sizes of the running image (`sizeof_property`, `sizeof_vertex_key`, ...), so a binding can check its own mirrors before the first call.
+- Wraps: `kimix_gdb_layout_info()` — a one-line forward, nothing added.
+- Ownership: `out` is caller-owned storage, fully written on success.
+- Errors: `KIMIX_GDB_ERR_ARGUMENT` (4) for a NULL `out`.
+
+#### `const char *kimix_graphdb_status_name(int32_t status);`
+The textual name of a status code (`"ok"`, `"error_vertex"`, ...).
+- Wraps: `kimix_gdb_status_name()` — a one-line forward, nothing added.
+- Ownership: static library storage; never free it.
+- Errors: never fails; an unknown code answers `"status_unknown"` (never NULL).
+
+### 2. Session lifecycle
+
+The session is the family's ONLY allocation: nothing else here ever hands the caller a pointer to free. `directory = NULL` (or `""`) opens a purely in-memory database.
+
+#### `int32_t kimix_graphdb_open(const kimix_gdb_open_options *options, kimix_gdb_session **out);`
+Opens a session over `*options` (a NULL `options` uses the library defaults: auto-create schema on, unique keys enforced, parallel/self edges allowed, 64 MiB journal).
+- Wraps: `kimix_gdb_open()` — a one-line forward, nothing added.
+- Ownership: on `KIMIX_GDB_OK` the caller owns `*out` and releases it with exactly one `kimix_graphdb_close()`; `*out` is written only on success.
+- Errors: `KIMIX_GDB_ERR_ARGUMENT` for a NULL `out` or an unusable `directory`; the store's own open failures pass through.
+
+#### `void kimix_graphdb_close(kimix_gdb_session *session);`
+Closes and destroys the session (an open transaction is aborted first).
+- Wraps: `kimix_gdb_close()` — a one-line forward, nothing added.
+- Ownership: the handle dangles afterwards; a second close is undefined behaviour.
+- Errors: no return value; a NULL `session` is ignored.
+
+#### `int32_t kimix_graphdb_capabilities(kimix_gdb_session *session, kimix_gdb_capability *out);`
+Fills `*out` (`kimix_gdb_capability`) with the honest advertisement of this backend — read once at open and translate byte-for-byte.
+- Wraps: `kimix_gdb_capabilities()` — a one-line forward, nothing added.
+- Ownership: nothing is allocated.
+- Errors: `KIMIX_GDB_ERR_ARGUMENT` for a NULL `session` or `out`.
+
+#### `int32_t kimix_graphdb_persist(kimix_gdb_session *session, uint8_t full);`
+Saves the store. `full != 0` rewrites every record; 0 writes exactly the dirty ones.
+- Wraps: `kimix_gdb_persist()` — a one-line forward, nothing added.
+- Ownership: nothing.
+- Errors: `KIMIX_GDB_ERR_NO_SUCH_FILE` (28) for an in-memory session (no store configured) or a closed one.
+
+#### `int32_t kimix_graphdb_load(kimix_gdb_session *session);`
+Re-reads the store into the open session.
+- Wraps: `kimix_gdb_load()` — a one-line forward, nothing added.
+- Ownership: nothing.
+- Errors: `KIMIX_GDB_ERR_NO_SUCH_FILE` for an in-memory session.
+
+### 3. Vertices
+
+#### `int32_t kimix_graphdb_vertex_create(kimix_gdb_session *session, const kimix_gdb_vertex_spec *spec, kimix_gdb_guid *out_uid, uint8_t *out_warning);`
+Creates one keyed vertex from `*spec` (label + external id key, optional extra labels / named properties / opaque content).
+- Wraps: `kimix_gdb_vertex_create()` — a one-line forward, nothing added.
+- Ownership: `*out_uid` is written on `KIMIX_GDB_OK` and on the warning; `*out_warning` is 1 exactly with `KIMIX_GDB_WARNING_NON_UNIQUE_ID`.
+- Errors: `KIMIX_GDB_ERR_NON_UNIQUE_ID` (29) for a duplicate key when `key_mode` is enforce; `KIMIX_GDB_ERR_LABEL` for an unregistered key label; `KIMIX_GDB_ERR_ARGUMENT` for a NULL `spec` / `out_uid`.
+- Notes: the uid lands in a caller `kimix_gdb_guid`; the library keeps its own copy.
+
+#### `int32_t kimix_graphdb_vertex_get_or_create(kimix_gdb_session *session, const kimix_gdb_vertex_spec *spec, kimix_gdb_guid *out_uid, uint8_t *out_created);`
+The MERGE shape: an existing key is adopted, never an error.
+- Wraps: `kimix_gdb_vertex_get_or_create()` — a one-line forward, nothing added.
+- Ownership: `*out_created` is 1 when a vertex was made, 0 when an existing one matched; both written on success.
+- Errors: `KIMIX_GDB_ERR_ARGUMENT` for a NULL `spec` / `out_uid` / `out_created`.
+
+#### `int32_t kimix_graphdb_vertex_translate(kimix_gdb_session *session, const kimix_gdb_vertex_key *key, kimix_gdb_guid *out_uid, uint8_t *out_found);`
+Resolves the `(label, external_id)` key to a uid.
+- Wraps: `kimix_gdb_vertex_translate()` — a one-line forward, nothing added.
+- Ownership: `*out_found` is 1 on a hit (then `*out_uid` is written) and 0 on a miss (then `*out_uid` is untouched).
+- Errors: a miss is NOT an error — `KIMIX_GDB_OK` with `*out_found` 0.
+
+#### `int32_t kimix_graphdb_vertex_free(kimix_gdb_session *session, kimix_gdb_guid vertex);`
+Removes a vertex and cascades its edges away.
+- Wraps: `kimix_gdb_vertex_free()` — a one-line forward, nothing added.
+- Ownership: nothing.
+- Errors: `KIMIX_GDB_ERR_VERTEX` (50) for an unknown uid.
+
+#### `int32_t kimix_graphdb_vertex_free_guarded(kimix_gdb_session *session, kimix_gdb_guid vertex);`
+The guarded delete: refuses while the vertex still carries any edge.
+- Wraps: `kimix_gdb_vertex_free_guarded()` — a one-line forward, nothing added.
+- Ownership: nothing.
+- Errors: `KIMIX_GDB_ERR_EDGE` (15) when edges remain; `KIMIX_GDB_ERR_VERTEX` for an unknown uid.
+
+### 4. Labels on vertices and edges
+
+Attach / detach a registered label id, then read the set back with the two-phase protocol.
+
+#### `int32_t kimix_graphdb_vertex_label_add(kimix_gdb_session *session, kimix_gdb_guid vertex, uint32_t label);`
+Attaches one registered label to a vertex.
+- Wraps: `kimix_gdb_vertex_label_add()` — a one-line forward, nothing added.
+- Ownership: nothing.
+- Errors: `KIMIX_GDB_ERR_LABEL` for an unregistered id, `KIMIX_GDB_ERR_VERTEX` for an unknown vertex, `KIMIX_GDB_ERR_READ_ONLY_TRANSACTION` inside a collective tx.
+
+#### `int32_t kimix_graphdb_vertex_label_remove(kimix_gdb_session *session, kimix_gdb_guid vertex, uint32_t label);`
+Detaches one label (the key label is not removable through this call).
+- Wraps: `kimix_gdb_vertex_label_remove()` — a one-line forward, nothing added.
+- Ownership: nothing.
+- Errors: same codes as `kimix_graphdb_vertex_label_add`.
+
+#### `int32_t kimix_graphdb_vertex_labels(kimix_gdb_session *session, kimix_gdb_guid vertex, uint32_t *labels, size_t capacity, size_t *out_count);`
+Reads the vertex's labels. The FIRST entry is the key label (GDI's `GetLabelsOfVertex` order).
+- Wraps: `kimix_gdb_vertex_labels()` — a one-line forward, nothing added.
+- Ownership: `labels` is caller-owned output storage; `*out_count` receives the full count even for a NULL `labels`.
+- Errors: `KIMIX_GDB_ERR_BUFFER` (6) when `capacity` is smaller than the count; `KIMIX_GDB_ERR_VERTEX` for an unknown uid; `KIMIX_GDB_ERR_ARGUMENT` for a NULL `out_count`.
+
+#### `int32_t kimix_graphdb_edge_label_add(kimix_gdb_session *session, kimix_gdb_guid edge, uint32_t label);`
+Attaches one registered label to an edge.
+- Wraps: `kimix_gdb_edge_label_add()` — a one-line forward, nothing added.
+- Ownership: nothing.
+- Errors: `KIMIX_GDB_ERR_LABEL` / `KIMIX_GDB_ERR_EDGE` for an unknown id.
+
+#### `int32_t kimix_graphdb_edge_label_remove(kimix_gdb_session *session, kimix_gdb_guid edge, uint32_t label);`
+Detaches one label from an edge.
+- Wraps: `kimix_gdb_edge_label_remove()` — a one-line forward, nothing added.
+- Ownership: nothing.
+- Errors: `KIMIX_GDB_ERR_LABEL` / `KIMIX_GDB_ERR_EDGE` for an unknown id.
+
+#### `int32_t kimix_graphdb_edge_labels(kimix_gdb_session *session, kimix_gdb_guid edge, uint32_t *labels, size_t capacity, size_t *out_count);`
+Reads the edge's labels (two-phase; no key-label rule here).
+- Wraps: `kimix_gdb_edge_labels()` — a one-line forward, nothing added.
+- Ownership: `labels` is caller-owned storage; `*out_count` carries the full count.
+- Errors: `KIMIX_GDB_ERR_BUFFER` for too small a `capacity`; `KIMIX_GDB_ERR_EDGE` for an unknown uid.
+
+### 5. Properties on vertices and edges
+
+One write shape (add / set / update / remove) and one read shape (values, then declarations) per entity, driven by `KIMIX_GDB_KIND_*` property structs on input and `kimix_gdb_property_record` + scratch on output. The name is a property-type id from section 9.
+
+#### `int32_t kimix_graphdb_vertex_property_add(kimix_gdb_session *session, kimix_gdb_guid vertex, uint32_t name, const kimix_gdb_property *value);`
+Add a property to a vertex. Fails when the name is already carried.
+- Wraps: `kimix_gdb_vertex_property_add()` — a one-line forward, nothing added.
+- Ownership: the value is decoded and stored on the library side; nothing is handed back.
+- Errors: `KIMIX_GDB_ERR_PROPERTY_EXISTS` (34) when the name is present, `KIMIX_GDB_ERR_PROPERTY_TYPE` (35) for an unregistered name, `KIMIX_GDB_ERR_WRONG_TYPE` (51) / `KIMIX_GDB_ERR_COUNT` (9) when the value does not match the declaration, `KIMIX_GDB_ERR_VERTEX` (50) for an unknown uid, `KIMIX_GDB_ERR_ARGUMENT` for a NULL `value`.
+
+#### `int32_t kimix_graphdb_vertex_property_set(kimix_gdb_session *session, kimix_gdb_guid vertex, uint32_t name, const kimix_gdb_property *value);`
+Set a property on a vertex: requires the name to be present, then overwrites it.
+- Wraps: `kimix_gdb_vertex_property_set()` — a one-line forward, nothing added.
+- Ownership: the value is stored on the library side.
+- Errors: `KIMIX_GDB_ERR_NO_PROPERTY` (26) when the name is absent, plus the same type / unknown-entity codes as the `add` twin.
+
+#### `int32_t kimix_graphdb_vertex_property_update(kimix_gdb_session *session, kimix_gdb_guid vertex, uint32_t name, const kimix_gdb_property *value);`
+Update a property on a vertex: an UPSERT — insert or overwrite, never an existence error.
+- Wraps: `kimix_gdb_vertex_property_update()` — a one-line forward, nothing added.
+- Ownership: the value is stored on the library side.
+- Errors: the type / unknown-entity codes of the `add` twin, but no `PROPERTY_EXISTS` / `NO_PROPERTY`.
+
+#### `int32_t kimix_graphdb_vertex_properties_remove(kimix_gdb_session *session, kimix_gdb_guid vertex, const uint32_t *names, size_t name_count);`
+Removes the named properties from a vertex.
+- Wraps: `kimix_gdb_vertex_properties_remove()` — a one-line forward, nothing added.
+- Ownership: nothing.
+- Errors: `KIMIX_GDB_ERR_ARGUMENT` for a NULL `names` with `name_count > 0`; `KIMIX_GDB_ERR_VERTEX` for an unknown uid. Names the entity does not carry are skipped, not an error.
+
+#### `int32_t kimix_graphdb_vertex_properties(kimix_gdb_session *session, kimix_gdb_guid vertex, kimix_gdb_property_record *items, size_t capacity, uint8_t *scratch, size_t scratch_capacity, size_t *out_count, size_t *out_scratch_bytes);`
+Two-phase read of every property of a vertex: records plus a scratch buffer for the payloads.
+- Wraps: `kimix_gdb_vertex_properties()` — a one-line forward, nothing added.
+- Ownership: `items` and `scratch` are caller-owned output storage; each record's `payload_offset` / `payload_len` index into `scratch`. The probe (`items == NULL && scratch == NULL`) reports `*out_count` and `*out_scratch_bytes` and writes nothing.
+- Errors: `KIMIX_GDB_ERR_BUFFER` when the capacity is too small (the full sizes are still reported); `KIMIX_GDB_ERR_VERTEX` for an unknown uid; `KIMIX_GDB_ERR_ARGUMENT` for a NULL `out_count` / `out_scratch_bytes`.
+
+#### `int32_t kimix_graphdb_vertex_property_types(kimix_gdb_session *session, kimix_gdb_guid vertex, kimix_gdb_property_type *items, size_t capacity, uint8_t *scratch, size_t scratch_capacity, size_t *out_count, size_t *out_scratch_bytes);`
+Two-phase read of the DECLARATION (`kimix_gdb_property_type`) of every property a vertex carries; `name_offset` / `name_len` index into `scratch`.
+- Wraps: `kimix_gdb_vertex_property_types()` — a one-line forward, nothing added.
+- Ownership: `items` / `scratch` caller-owned, same probe rule as the property read.
+- Errors: `KIMIX_GDB_ERR_BUFFER` when too small; `KIMIX_GDB_ERR_VERTEX` for an unknown uid.
+
+#### `int32_t kimix_graphdb_edge_property_add(kimix_gdb_session *session, kimix_gdb_guid edge, uint32_t name, const kimix_gdb_property *value);`
+Add a property to a edge. Fails when the name is already carried.
+- Wraps: `kimix_gdb_edge_property_add()` — a one-line forward, nothing added.
+- Ownership: the value is decoded and stored on the library side; nothing is handed back.
+- Errors: `KIMIX_GDB_ERR_PROPERTY_EXISTS` (34) when the name is present, `KIMIX_GDB_ERR_PROPERTY_TYPE` (35) for an unregistered name, `KIMIX_GDB_ERR_WRONG_TYPE` (51) / `KIMIX_GDB_ERR_COUNT` (9) when the value does not match the declaration, `KIMIX_GDB_ERR_EDGE` (15) for an unknown uid, `KIMIX_GDB_ERR_ARGUMENT` for a NULL `value`.
+
+#### `int32_t kimix_graphdb_edge_property_set(kimix_gdb_session *session, kimix_gdb_guid edge, uint32_t name, const kimix_gdb_property *value);`
+Set a property on a edge: requires the name to be present, then overwrites it.
+- Wraps: `kimix_gdb_edge_property_set()` — a one-line forward, nothing added.
+- Ownership: the value is stored on the library side.
+- Errors: `KIMIX_GDB_ERR_NO_PROPERTY` (26) when the name is absent, plus the same type / unknown-entity codes as the `add` twin.
+
+#### `int32_t kimix_graphdb_edge_property_update(kimix_gdb_session *session, kimix_gdb_guid edge, uint32_t name, const kimix_gdb_property *value);`
+Update a property on an edge: an UPSERT — insert or overwrite, never an existence error.
+- Wraps: `kimix_gdb_edge_property_update()` — a one-line forward, nothing added.
+- Ownership: the value is stored on the library side.
+- Errors: the type / unknown-entity codes of the `add` twin, but no `PROPERTY_EXISTS` / `NO_PROPERTY`.
+
+#### `int32_t kimix_graphdb_edge_properties_remove(kimix_gdb_session *session, kimix_gdb_guid edge, const uint32_t *names, size_t name_count);`
+Removes the named properties from a edge.
+- Wraps: `kimix_gdb_edge_properties_remove()` — a one-line forward, nothing added.
+- Ownership: nothing.
+- Errors: `KIMIX_GDB_ERR_ARGUMENT` for a NULL `names` with `name_count > 0`; `KIMIX_GDB_ERR_EDGE` for an unknown uid. Names the entity does not carry are skipped, not an error.
+
+#### `int32_t kimix_graphdb_edge_properties(kimix_gdb_session *session, kimix_gdb_guid edge, kimix_gdb_property_record *items, size_t capacity, uint8_t *scratch, size_t scratch_capacity, size_t *out_count, size_t *out_scratch_bytes);`
+Two-phase read of every property of a edge: records plus a scratch buffer for the payloads.
+- Wraps: `kimix_gdb_edge_properties()` — a one-line forward, nothing added.
+- Ownership: `items` and `scratch` are caller-owned output storage; each record's `payload_offset` / `payload_len` index into `scratch`. The probe (`items == NULL && scratch == NULL`) reports `*out_count` and `*out_scratch_bytes` and writes nothing.
+- Errors: `KIMIX_GDB_ERR_BUFFER` when the capacity is too small (the full sizes are still reported); `KIMIX_GDB_ERR_EDGE` for an unknown uid; `KIMIX_GDB_ERR_ARGUMENT` for a NULL `out_count` / `out_scratch_bytes`.
+
+#### `int32_t kimix_graphdb_edge_property_types(kimix_gdb_session *session, kimix_gdb_guid edge, kimix_gdb_property_type *items, size_t capacity, uint8_t *scratch, size_t scratch_capacity, size_t *out_count, size_t *out_scratch_bytes);`
+Two-phase read of the DECLARATION (`kimix_gdb_property_type`) of every property a edge carries; `name_offset` / `name_len` index into `scratch`.
+- Wraps: `kimix_gdb_edge_property_types()` — a one-line forward, nothing added.
+- Ownership: `items` / `scratch` caller-owned, same probe rule as the property read.
+- Errors: `KIMIX_GDB_ERR_BUFFER` when too small; `KIMIX_GDB_ERR_EDGE` for an unknown uid.
+
+### 6. Edges
+
+First-class edges with a uid, two endpoints and a direction. `edge_create` takes the endpoints as uids (both must be live vertices).
+
+#### `int32_t kimix_graphdb_edge_create(kimix_gdb_session *session, kimix_gdb_guid origin, kimix_gdb_guid target, uint8_t direction, const uint32_t *labels, size_t label_count, const kimix_gdb_property *properties, size_t property_count, kimix_gdb_guid *out_edge);`
+Connects `origin` to `target` (direction `KIMIX_GDB_EDGE_DIRECTED` / `_UNDIRECTED`) with optional labels and properties, and returns the new edge uid.
+- Wraps: `kimix_gdb_edge_create()` — a one-line forward, nothing added.
+- Ownership: `*out_edge` is written on success only.
+- Errors: `KIMIX_GDB_ERR_VERTEX` for an unknown endpoint, `KIMIX_GDB_ERR_LABEL` for an unregistered label, `KIMIX_GDB_ERR_ARGUMENT` for a NULL `out_edge`; parallel/self edges follow the open options.
+
+#### `int32_t kimix_graphdb_edge_free(kimix_gdb_session *session, kimix_gdb_guid edge);`
+Removes one edge.
+- Wraps: `kimix_gdb_edge_free()` — a one-line forward, nothing added.
+- Ownership: nothing.
+- Errors: `KIMIX_GDB_ERR_EDGE` for an unknown uid.
+
+#### `int32_t kimix_graphdb_edge_set_origin(kimix_gdb_session *session, kimix_gdb_guid edge, kimix_gdb_guid origin);`
+Re-points the edge's origin (the new endpoint must be a live vertex).
+- Wraps: `kimix_gdb_edge_set_origin()` — a one-line forward, nothing added.
+- Ownership: nothing.
+- Errors: `KIMIX_GDB_ERR_EDGE` / `KIMIX_GDB_ERR_VERTEX`.
+
+#### `int32_t kimix_graphdb_edge_set_target(kimix_gdb_session *session, kimix_gdb_guid edge, kimix_gdb_guid target);`
+Re-points the edge's target.
+- Wraps: `kimix_gdb_edge_set_target()` — a one-line forward, nothing added.
+- Ownership: nothing.
+- Errors: `KIMIX_GDB_ERR_EDGE` / `KIMIX_GDB_ERR_VERTEX`.
+
+#### `int32_t kimix_graphdb_edge_set_direction(kimix_gdb_session *session, kimix_gdb_guid edge, uint8_t direction);`
+Flips the edge between directed and undirected.
+- Wraps: `kimix_gdb_edge_set_direction()` — a one-line forward, nothing added.
+- Ownership: nothing.
+- Errors: `KIMIX_GDB_ERR_EDGE` for an unknown uid.
+
+#### `int32_t kimix_graphdb_edge_endpoints(kimix_gdb_session *session, kimix_gdb_guid edge, kimix_gdb_guid *out_origin, kimix_gdb_guid *out_target);`
+Reads the two endpoints of one edge (GDI's `GetVerticesOfEdge`).
+- Wraps: `kimix_gdb_edge_endpoints()` — a one-line forward, nothing added.
+- Ownership: `*out_origin` / `*out_target` caller storage, written on success.
+- Errors: `KIMIX_GDB_ERR_EDGE` for an unknown uid; `KIMIX_GDB_ERR_ARGUMENT` for a NULL out-parameter.
+
+### 7. Filtered, oriented, paged reads
+
+The paged neighbour reads. `constraint` is an id from section 10 (`0` = none); `orientation` is `KIMIX_GDB_ORIENTATION_OUTGOING` / `_INCOMING` / `_BOTH`. Each read is two-phase: pass `items == NULL` to learn `*out_count` / `*out_total`, then fetch. `cap` limits the page; `*out_total` always reports the full (uncapped) count, so `cap == 0` yields an empty page plus the total.
+
+#### `int32_t kimix_graphdb_edges_of_vertex(kimix_gdb_session *session, kimix_gdb_guid vertex, uint32_t constraint, uint8_t orientation, int64_t cap, kimix_gdb_edge_record *items, size_t capacity, size_t *out_count, size_t *out_total);`
+Paged read of the EDGE records incident to a vertex.
+- Wraps: `kimix_gdb_edges_of_vertex()` — a one-line forward, nothing added.
+- Ownership: `items` caller-owned output; each `kimix_gdb_edge_record` carries the edge uid plus both endpoints.
+- Errors: `KIMIX_GDB_ERR_BUFFER` when `capacity` is below the page; `KIMIX_GDB_ERR_VERTEX` for an unknown vertex; `KIMIX_GDB_ERR_CONSTRAINT` for an unknown constraint id.
+
+#### `int32_t kimix_graphdb_neighbors_of_vertex(kimix_gdb_session *session, kimix_gdb_guid vertex, uint32_t constraint, uint8_t orientation, int64_t cap, kimix_gdb_guid *items, size_t capacity, size_t *out_count, size_t *out_total);`
+The same walk returning the neighbour VERTEX uids.
+- Wraps: `kimix_gdb_neighbors_of_vertex()` — a one-line forward, nothing added.
+- Ownership: `items` caller-owned output.
+- Errors: same codes as `edges_of_vertex`.
+
+#### `int32_t kimix_graphdb_count_neighbors(kimix_gdb_session *session, kimix_gdb_guid vertex, uint32_t constraint, uint8_t orientation, size_t *out_count);`
+How many neighbours the `(constraint, orientation)` pair has.
+- Wraps: `kimix_gdb_count_neighbors()` — a one-line forward, nothing added.
+- Ownership: `*out_count` caller storage.
+- Errors: `KIMIX_GDB_ERR_VERTEX` / `KIMIX_GDB_ERR_CONSTRAINT`; `KIMIX_GDB_ERR_ARGUMENT` for a NULL `out_count`.
+
+#### `int32_t kimix_graphdb_exists_neighbor(kimix_gdb_session *session, kimix_gdb_guid vertex, uint32_t constraint, uint8_t orientation, uint8_t *out_exists);`
+Whether the pair has at least one neighbour (`*out_exists` 0/1).
+- Wraps: `kimix_gdb_exists_neighbor()` — a one-line forward, nothing added.
+- Ownership: `*out_exists` caller storage.
+- Errors: `KIMIX_GDB_ERR_VERTEX` / `KIMIX_GDB_ERR_CONSTRAINT`; `KIMIX_GDB_ERR_ARGUMENT` for a NULL `out_exists`.
+
+### 8. Transactions (one open transaction per session)
+
+Begin, commit or abort the session's ONE transaction; a second begin (or a commit/abort with none open) is an error, so the caller drives the state machine.
+
+#### `int32_t kimix_graphdb_tx_begin(kimix_gdb_session *session);`
+Opens the session's writable transaction.
+- Wraps: `kimix_gdb_tx_begin()` — a one-line forward, nothing added.
+- Ownership: nothing.
+- Errors: `KIMIX_GDB_ERR_TRANSACTION` (48) when one is already open (one transaction per session); `KIMIX_GDB_ERR_ARGUMENT` for a NULL `session`.
+
+#### `int32_t kimix_graphdb_tx_commit(kimix_gdb_session *session);`
+Closes the transaction, keeping its changes (persisting when `persist_on_commit` was set).
+- Wraps: `kimix_gdb_tx_commit()` — a one-line forward, nothing added.
+- Ownership: nothing.
+- Errors: `KIMIX_GDB_ERR_TRANSACTION` (48) with no open transaction.
+
+#### `int32_t kimix_graphdb_tx_abort(kimix_gdb_session *session);`
+Closes the transaction, undoing everything it touched in reverse order.
+- Wraps: `kimix_gdb_tx_abort()` — a one-line forward, nothing added.
+- Ownership: nothing.
+- Errors: `KIMIX_GDB_ERR_TRANSACTION` with no open transaction.
+
+#### `int32_t kimix_graphdb_tx_begin_collective(kimix_gdb_session *session);`
+Opens the READ-ONLY collective scope (GDI's batched read).
+- Wraps: `kimix_gdb_tx_begin_collective()` — a one-line forward, nothing added.
+- Ownership: nothing.
+- Errors: `KIMIX_GDB_ERR_TRANSACTION` when a transaction is already open.
+
+#### `int32_t kimix_graphdb_tx_close_collective(kimix_gdb_session *session, uint8_t commit);`
+Closes the collective scope (`commit != 0` commits, 0 aborts).
+- Wraps: `kimix_gdb_tx_close_collective()` — a one-line forward, nothing added.
+- Ownership: nothing.
+- Errors: `KIMIX_GDB_ERR_TRANSACTION` (48) when the open transaction is NOT a collective one.
+
+### 9. Schema: labels and property types
+
+The registries a GDI backend owns. Names are `(pointer, length)` UTF-8 spans (no NUL terminator required). A blank name is `KIMIX_GDB_ERR_EMPTY_NAME` (17), a collision `KIMIX_GDB_ERR_NAME_EXISTS` (24) / `KIMIX_GDB_ERR_PROPERTY_TYPE_EXISTS` (36).
+
+#### `int32_t kimix_graphdb_label_create(kimix_gdb_session *session, const char *name, size_t name_len, uint32_t *out_label);`
+Registers a label and returns its id.
+- Wraps: `kimix_gdb_label_create()` — a one-line forward, nothing added.
+- Ownership: `*out_label` caller storage, written on success.
+- Errors: `KIMIX_GDB_ERR_NAME_EXISTS` for a duplicate, `KIMIX_GDB_ERR_EMPTY_NAME` for a blank name; `KIMIX_GDB_ERR_READ_ONLY_TRANSACTION` inside a collective tx.
+
+#### `int32_t kimix_graphdb_label_find(kimix_gdb_session *session, const char *name, size_t name_len, uint32_t *out_label, uint8_t *out_found);`
+Looks a label up by name.
+- Wraps: `kimix_gdb_label_find()` — a one-line forward, nothing added.
+- Ownership: `*out_found` 1 on a hit (then `*out_label` is written), 0 on a miss.
+- Errors: a miss is NOT an error.
+
+#### `int32_t kimix_graphdb_label_get_all(kimix_gdb_session *session, kimix_gdb_label *items, size_t capacity, uint8_t *scratch, size_t scratch_capacity, size_t *out_count, size_t *out_scratch_bytes);`
+Two-phase read of every registered label, in id order; names land in `scratch`.
+- Wraps: `kimix_gdb_label_get_all()` — a one-line forward, nothing added.
+- Ownership: `items` / `scratch` caller-owned; probe with both NULL.
+- Errors: `KIMIX_GDB_ERR_BUFFER` when too small (sizes still reported).
+
+#### `int32_t kimix_graphdb_label_update(kimix_gdb_session *session, uint32_t label, const char *name, size_t name_len);`
+Renames a registered label.
+- Wraps: `kimix_gdb_label_update()` — a one-line forward, nothing added.
+- Ownership: nothing.
+- Errors: `KIMIX_GDB_ERR_LABEL` for an unknown id; the name-collision codes.
+
+#### `int32_t kimix_graphdb_label_free(kimix_gdb_session *session, uint32_t label);`
+Removes a label registration.
+- Wraps: `kimix_gdb_label_free()` — a one-line forward, nothing added.
+- Ownership: nothing.
+- Errors: `KIMIX_GDB_ERR_LABEL` for an unknown id.
+
+#### `int32_t kimix_graphdb_label_name(kimix_gdb_session *session, uint32_t label, char *out, size_t capacity, size_t *out_required);`
+Writes ONE label's name into the caller's `out` buffer and reports the required bytes.
+- Wraps: `kimix_gdb_label_name()` — a one-line forward, nothing added.
+- Ownership: `out` caller-owned; `capacity == 0` probes `*out_required` (the name is written WITHOUT a NUL).
+- Errors: `KIMIX_GDB_ERR_BUFFER` when `capacity` is short; `KIMIX_GDB_ERR_LABEL` for an unknown id.
+
+#### `int32_t kimix_graphdb_property_type_create(kimix_gdb_session *session, const char *name, size_t name_len, uint8_t container, uint8_t dtype, uint32_t count, uint32_t *out_type);`
+Registers a property type (`container` KIMIX_GDB_CONTAINER_*, `dtype` KIMIX_GDB_DTYPE_*, `count` the element count for an array).
+- Wraps: `kimix_gdb_property_type_create()` — a one-line forward, nothing added.
+- Ownership: `*out_type` caller storage.
+- Errors: `KIMIX_GDB_ERR_PROPERTY_TYPE_EXISTS` for a duplicate name.
+
+#### `int32_t kimix_graphdb_property_type_find(kimix_gdb_session *session, const char *name, size_t name_len, uint32_t *out_type, uint8_t *out_found);`
+Looks a property type up by name.
+- Wraps: `kimix_gdb_property_type_find()` — a one-line forward, nothing added.
+- Ownership: `*out_found` 1/0 (and `*out_type` on a hit).
+- Errors: a miss is NOT an error.
+
+#### `int32_t kimix_graphdb_property_type_get_all(kimix_gdb_session *session, kimix_gdb_property_type *items, size_t capacity, uint8_t *scratch, size_t scratch_capacity, size_t *out_count, size_t *out_scratch_bytes);`
+Two-phase read of every registered property type; names in `scratch`.
+- Wraps: `kimix_gdb_property_type_get_all()` — a one-line forward, nothing added.
+- Ownership: `items` / `scratch` caller-owned.
+- Errors: `KIMIX_GDB_ERR_BUFFER` when too small.
+
+#### `int32_t kimix_graphdb_property_type_update(kimix_gdb_session *session, uint32_t type, const char *name, size_t name_len, uint8_t container, uint8_t dtype, uint32_t count);`
+Renames or re-declares a property type.
+- Wraps: `kimix_gdb_property_type_update()` — a one-line forward, nothing added.
+- Ownership: nothing.
+- Errors: `KIMIX_GDB_ERR_PROPERTY_TYPE` for an unknown id; the collision / blank-name codes.
+
+#### `int32_t kimix_graphdb_property_type_free(kimix_gdb_session *session, uint32_t type);`
+Removes a property-type registration.
+- Wraps: `kimix_gdb_property_type_free()` — a one-line forward, nothing added.
+- Ownership: nothing.
+- Errors: `KIMIX_GDB_ERR_PROPERTY_TYPE` for an unknown id.
+
+### 10. Constraints
+
+Constraint handles live SESSION-side (a `Constraint` is a C++ value a C caller cannot hold): `create` takes a dense id, `add_label` / `add_property` attach one condition each, and the id feeds section 7. Freeing releases the slot.
+
+#### `int32_t kimix_graphdb_constraint_create(kimix_gdb_session *session, uint32_t *out_constraint);`
+Allocates an empty constraint and returns its id.
+- Wraps: `kimix_gdb_constraint_create()` — a one-line forward, nothing added.
+- Ownership: `*out_constraint` caller storage.
+- Errors: `KIMIX_GDB_ERR_ARGUMENT` for a NULL `session` / `out_constraint`; `KIMIX_GDB_ERR_SIZE_LIMIT` (43) past the 256-handle session registry.
+
+#### `int32_t kimix_graphdb_constraint_add_label(kimix_gdb_session *session, uint32_t constraint, uint32_t label, uint8_t op);`
+Adds a label condition (op KIMIX_GDB_OP_*).
+- Wraps: `kimix_gdb_constraint_add_label()` — a one-line forward, nothing added.
+- Ownership: nothing.
+- Errors: `KIMIX_GDB_ERR_CONSTRAINT` (7) for an unknown id, `KIMIX_GDB_ERR_LABEL` for an unregistered label.
+
+#### `int32_t kimix_graphdb_constraint_add_property(kimix_gdb_session *session, uint32_t constraint, uint32_t property, uint8_t op, const kimix_gdb_property *value, uint32_t count);`
+Adds a property condition: `(property id, op, value, count)`.
+- Wraps: `kimix_gdb_constraint_add_property()` — a one-line forward, nothing added.
+- Ownership: the value is copied into the session-side condition.
+- Errors: `KIMIX_GDB_ERR_CONSTRAINT` for an unknown id, `KIMIX_GDB_ERR_PROPERTY_TYPE` for an unregistered property.
+
+#### `int32_t kimix_graphdb_constraint_free(kimix_gdb_session *session, uint32_t constraint);`
+Releases the constraint slot.
+- Wraps: `kimix_gdb_constraint_free()` — a one-line forward, nothing added.
+- Ownership: nothing.
+- Errors: `KIMIX_GDB_ERR_CONSTRAINT` for an unknown id.
+
+### 11. Bulk
+
+N creates in ONE transaction (a local scope when the session has none open). Per-row results land in caller arrays of `count` entries; any of them may be NULL. `continue_on_error != 0` isolates the failing row and keeps going; 0 aborts the batch at the first error, and every later row reports `KIMIX_GDB_ERR_STATE` (never attempted). The call's own status is `KIMIX_GDB_OK` when the batch ran.
+
+#### `int32_t kimix_graphdb_vertices_create_bulk(kimix_gdb_session *session, const kimix_gdb_vertex_spec *specs, size_t count, uint8_t continue_on_error, kimix_gdb_guid *out_uids, int32_t *out_status, uint8_t *out_warning);`
+N vertex creates (see section 3's per-row codes).
+- Wraps: `kimix_gdb_vertices_create_bulk()` — a one-line forward, nothing added.
+- Ownership: `out_uids` / `out_status` / `out_warning` are caller arrays of `count`.
+- Errors: `KIMIX_GDB_ERR_READ_ONLY_TRANSACTION` (40) inside a collective tx; `KIMIX_GDB_ERR_ARGUMENT` for a NULL `specs` with `count > 0`.
+
+#### `int32_t kimix_graphdb_edges_create_bulk(kimix_gdb_session *session, const kimix_gdb_edge_spec *specs, size_t count, uint8_t continue_on_error, kimix_gdb_guid *out_uids, int32_t *out_status);`
+N edge creates, the same shape without a per-row warning (a duplicate edge is not a key collision).
+- Wraps: `kimix_gdb_edges_create_bulk()` — a one-line forward, nothing added.
+- Ownership: `out_uids` / `out_status` caller arrays of `count`.
+- Errors: `KIMIX_GDB_ERR_READ_ONLY_TRANSACTION` inside a collective tx; `KIMIX_GDB_ERR_ARGUMENT` for a NULL `specs` with `count > 0`.
+
+---
 ## Quick start
 
 ## Quick start
@@ -2481,6 +2922,70 @@ sub-section) the declaration lives in.
 | `kimix_api_version_string`               | ABI      | The `kimix-core` version string this library was built against, e.g. `"kimix 1.2.3"`. NUL-terminated UTF-8. |
 | `kimix_fiber_run`                        | parallel | Runs `fn(context, i)` for every `i` in `[0, job_count)` across the fiber pool, blocking until every started job has returned. |
 | `kimix_fiber_worker_count`               | parallel | How many worker threads the CALLING thread can fan out over right now: the bound scheduler's worker count, else 1. |
+| `kimix_graphdb_abi_version` | graphdb §1 | The `KIMIX_GDB_ABI_VERSION` the graph archive was compiled with. Assert it before trusting a mirrored layout |
+| `kimix_graphdb_capabilities` | graphdb §2 | Fills `*out` (`kimix_gdb_capability`) with the honest advertisement of this backend — read once at open and translate byte-for-byte |
+| `kimix_graphdb_close` | graphdb §2 | Closes and destroys the session (an open transaction is aborted first) |
+| `kimix_graphdb_constraint_add_label` | graphdb §10 | Adds a label condition (op KIMIX_GDB_OP_*) |
+| `kimix_graphdb_constraint_add_property` | graphdb §10 | Adds a property condition: `(property id, op, value, count)` |
+| `kimix_graphdb_constraint_create` | graphdb §10 | Allocates an empty constraint and returns its id |
+| `kimix_graphdb_constraint_free` | graphdb §10 | Releases the constraint slot |
+| `kimix_graphdb_count_neighbors` | graphdb §7 | How many neighbours the `(constraint, orientation)` pair has |
+| `kimix_graphdb_edge_create` | graphdb §6 | Connects `origin` to `target` (direction `KIMIX_GDB_EDGE_DIRECTED` / `_UNDIRECTED`) with optional labels and properties, and returns the ... |
+| `kimix_graphdb_edge_endpoints` | graphdb §6 | Reads the two endpoints of one edge (GDI's `GetVerticesOfEdge`) |
+| `kimix_graphdb_edge_free` | graphdb §6 | Removes one edge |
+| `kimix_graphdb_edge_label_add` | graphdb §4 | Attaches one registered label to an edge |
+| `kimix_graphdb_edge_label_remove` | graphdb §4 | Detaches one label from an edge |
+| `kimix_graphdb_edge_labels` | graphdb §4 | Reads the edge's labels (two-phase; no key-label rule here) |
+| `kimix_graphdb_edge_properties` | graphdb §5 | Two-phase read of every property of a edge: records plus a scratch buffer for the payloads |
+| `kimix_graphdb_edge_properties_remove` | graphdb §5 | Removes the named properties from a edge |
+| `kimix_graphdb_edge_property_add` | graphdb §5 | Add a property to a edge. Fails when the name is already carried |
+| `kimix_graphdb_edge_property_set` | graphdb §5 | Set a property on a edge: requires the name to be present, then overwrites it |
+| `kimix_graphdb_edge_property_types` | graphdb §5 | Two-phase read of the DECLARATION (`kimix_gdb_property_type`) of every property a edge carries; `name_offset` / `name_len` index into `sc... |
+| `kimix_graphdb_edge_property_update` | graphdb §5 | Update a property on an edge: an UPSERT — insert or overwrite, never an existence error |
+| `kimix_graphdb_edge_set_direction` | graphdb §6 | Flips the edge between directed and undirected |
+| `kimix_graphdb_edge_set_origin` | graphdb §6 | Re-points the edge's origin (the new endpoint must be a live vertex) |
+| `kimix_graphdb_edge_set_target` | graphdb §6 | Re-points the edge's target |
+| `kimix_graphdb_edges_create_bulk` | graphdb §11 | N edge creates, the same shape without a per-row warning (a duplicate edge is not a key collision) |
+| `kimix_graphdb_edges_of_vertex` | graphdb §7 | Paged read of the EDGE records incident to a vertex |
+| `kimix_graphdb_exists_neighbor` | graphdb §7 | Whether the pair has at least one neighbour (`*out_exists` 0/1) |
+| `kimix_graphdb_label_create` | graphdb §9 | Registers a label and returns its id |
+| `kimix_graphdb_label_find` | graphdb §9 | Looks a label up by name |
+| `kimix_graphdb_label_free` | graphdb §9 | Removes a label registration |
+| `kimix_graphdb_label_get_all` | graphdb §9 | Two-phase read of every registered label, in id order; names land in `scratch` |
+| `kimix_graphdb_label_name` | graphdb §9 | Writes ONE label's name into the caller's `out` buffer and reports the required bytes |
+| `kimix_graphdb_label_update` | graphdb §9 | Renames a registered label |
+| `kimix_graphdb_layout_info` | graphdb §1 | Fills the POD `kimix_gdb_layout` with the struct sizes of the running image (`sizeof_property`, `sizeof_vertex_key`, ...), so a binding c... |
+| `kimix_graphdb_load` | graphdb §2 | Re-reads the store into the open session |
+| `kimix_graphdb_neighbors_of_vertex` | graphdb §7 | The same walk returning the neighbour VERTEX uids |
+| `kimix_graphdb_open` | graphdb §2 | Opens a session over `*options` (a NULL `options` uses the library defaults: auto-create schema on, unique keys enforced, parallel/self e... |
+| `kimix_graphdb_persist` | graphdb §2 | Saves the store. `full != 0` rewrites every record; 0 writes exactly the dirty ones |
+| `kimix_graphdb_property_type_create` | graphdb §9 | Registers a property type (`container` KIMIX_GDB_CONTAINER_*, `dtype` KIMIX_GDB_DTYPE_*, `count` the element count for an array) |
+| `kimix_graphdb_property_type_find` | graphdb §9 | Looks a property type up by name |
+| `kimix_graphdb_property_type_free` | graphdb §9 | Removes a property-type registration |
+| `kimix_graphdb_property_type_get_all` | graphdb §9 | Two-phase read of every registered property type; names in `scratch` |
+| `kimix_graphdb_property_type_update` | graphdb §9 | Renames or re-declares a property type |
+| `kimix_graphdb_status_name` | graphdb §1 | The textual name of a status code (`"ok"`, `"error_vertex"`, ...) |
+| `kimix_graphdb_tx_abort` | graphdb §8 | Closes the transaction, undoing everything it touched in reverse order |
+| `kimix_graphdb_tx_begin` | graphdb §8 | Opens the session's writable transaction |
+| `kimix_graphdb_tx_begin_collective` | graphdb §8 | Opens the READ-ONLY collective scope (GDI's batched read) |
+| `kimix_graphdb_tx_close_collective` | graphdb §8 | Closes the collective scope (`commit != 0` commits, 0 aborts) |
+| `kimix_graphdb_tx_commit` | graphdb §8 | Closes the transaction, keeping its changes (persisting when `persist_on_commit` was set) |
+| `kimix_graphdb_version_string` | graphdb §1 | The graph-db version string (`"graph db 1.2.3"` shape), from the archive's `KIMIX_GRAPH_DB_VERSION` |
+| `kimix_graphdb_vertex_create` | graphdb §3 | Creates one keyed vertex from `*spec` (label + external id key, optional extra labels / named properties / opaque content) |
+| `kimix_graphdb_vertex_free` | graphdb §3 | Removes a vertex and cascades its edges away |
+| `kimix_graphdb_vertex_free_guarded` | graphdb §3 | The guarded delete: refuses while the vertex still carries any edge |
+| `kimix_graphdb_vertex_get_or_create` | graphdb §3 | The MERGE shape: an existing key is adopted, never an error |
+| `kimix_graphdb_vertex_label_add` | graphdb §4 | Attaches one registered label to a vertex |
+| `kimix_graphdb_vertex_label_remove` | graphdb §4 | Detaches one label (the key label is not removable through this call) |
+| `kimix_graphdb_vertex_labels` | graphdb §4 | Reads the vertex's labels. The FIRST entry is the key label (GDI's `GetLabelsOfVertex` order) |
+| `kimix_graphdb_vertex_properties` | graphdb §5 | Two-phase read of every property of a vertex: records plus a scratch buffer for the payloads |
+| `kimix_graphdb_vertex_properties_remove` | graphdb §5 | Removes the named properties from a vertex |
+| `kimix_graphdb_vertex_property_add` | graphdb §5 | Add a property to a vertex. Fails when the name is already carried |
+| `kimix_graphdb_vertex_property_set` | graphdb §5 | Set a property on a vertex: requires the name to be present, then overwrites it |
+| `kimix_graphdb_vertex_property_types` | graphdb §5 | Two-phase read of the DECLARATION (`kimix_gdb_property_type`) of every property a vertex carries; `name_offset` / `name_len` index into `... |
+| `kimix_graphdb_vertex_property_update` | graphdb §5 | Update a property on a vertex: an UPSERT — insert or overwrite, never an existence error |
+| `kimix_graphdb_vertex_translate` | graphdb §3 | Resolves the `(label, external_id)` key to a uid |
+| `kimix_graphdb_vertices_create_bulk` | graphdb §11 | N vertex creates (see section 3's per-row codes) |
 | `kimix_json_is_valid`                    | repair   | "Would `kimix_repair()` return an empty result for these bytes because they need no repair?"… |
 | `kimix_json_is_valid_str`                | repair   | The NUL-terminated spelling of the same probe; the length is `strlen(nul_terminated_json)`. |
 | `kimix_map_allocated_count`              | map      | The bytes this map owns on the library heap: the object + the dense entry array at its reserved capacity + the bucket index. |
@@ -2713,4 +3218,4 @@ sub-section) the declaration lives in.
 | `kimix_yyjson_write`                     | json §6  | Serialises a whole document into a freshly allocated, NUL-terminated UTF-8 string. |
 | `kimix_yyjson_write_buf`                 | json §6  | Serialises a document into the caller's own buffer: no allocation at all, nothing to free. |
 
-Total: **272 functions** — ABI 5, `kimix_mem_*` 35, `kimix_vec_*` 36, `kimix_map_*` 11, `kimix_fiber_*` 2, `kimix_yyjson_*` 140, repair 8, canonical 2, sqlite 33. Any of these is a valid Ctrl-F target for the section above.
+Total: **336 functions** — ABI 5, `kimix_mem_*` 35, `kimix_vec_*` 36, `kimix_map_*` 11, `kimix_fiber_*` 2, `kimix_yyjson_*` 140, repair 8, canonical 2, sqlite 33, graphdb 64. Any of these is a valid Ctrl-F target for the section above.

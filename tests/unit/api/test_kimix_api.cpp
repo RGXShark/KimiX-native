@@ -26,10 +26,19 @@
  *   unbound again on return
  *
  * - the SQLite FFI: library queries, :memory: open/close, exec DDL/DML, the
- * prepare/bind/step/column round trip over every storage class (int, float,
- * text incl. UTF-8, blob, NULL), changes/last_insert_rowid, reset-reuse,
- * named parameters, the exec error message owned by the caller (kimix_mem_free),
- * extended errcodes, and every documented NULL/neutral-value edge
+ *   prepare/bind/step/column round trip over every storage class (int, float,
+ *   text incl. UTF-8, blob, NULL), changes/last_insert_rowid, reset-reuse,
+ *   named parameters, the exec error message owned by the caller (kimix_mem_free),
+ *   extended errcodes, and every documented NULL/neutral-value edge
+ * - the graph-db re-export family (kimix_graphdb_*): everything the archive's
+ *   C ABI offers, driven through the WRAPPER names only, so the DLL exports —
+ *   not just the static archive — are what the suite proves: the layout probe,
+ *   the session lifecycle (in-memory open, capabilities, the storeless
+ *   persist/load), schema CRUD through the two-phase scratch protocol, the
+ *   vertex / label / property / edge command walk with its read-backs, the
+ *   constraint-filtered paged reads (with and without a constraint, cap
+ *   0/1/N), transactions (commit, abort-restores, the read-only collective),
+ *   the bulk calls with continue_on_error, and the NULL-session contract.
  *
  * Registered in tests/xmake.lua behind has_config("kimix_enable_api"): with the
  * option off neither kimix_api nor this test is part of the configuration.
@@ -229,11 +238,194 @@ int ffi_expect_utf16_rejected(const uint16_t *units, size_t n) {
     } else if (len != 4u || std::memcmp(got, "keep", 4) != 0) {
         result = 4; // the vector must be exactly what it was before the call
     }
-    kimix_vec_destroy(&v);
-    return result;
-}
+      kimix_vec_destroy(&v);
+      return result;
+  }
 
-} // namespace
+  // ------------------------------------------------------------------- graphdb
+  /* The graphdb suite is a foreign binding in miniature: only the C surface, only
+     caller-owned buffers (every fixed array below is sized off the probe's own
+     count), and the TWO-PHASE protocol the header documents — NULL first to
+     learn the sizes, then the real fetch, then the deliberately too-small call
+     that must report KIMIX_GDB_ERR_BUFFER with the need still written out. */
+  kimix_gdb_bytes g_bytes(char const *text) {
+      kimix_gdb_bytes out;
+      out.data = reinterpret_cast<uint8_t const *>(text);
+      out.len = std::strlen(text);
+      return out;
+  }
+    /* The property builders return a REFERENCE so a call site can spell
+       &g_int(33): the reference binds a function-local thread_local that the
+       very next native call consumes synchronously (tests are single-threaded;
+       nothing outlives the full expression).  Building an array copies out of
+       it, which is the only other use these helpers have. */
+    kimix_gdb_property &g_int(int64_t value) {
+        static thread_local kimix_gdb_property property;
+        property = kimix_gdb_property{};
+        property.kind = KIMIX_GDB_KIND_INT64;
+        property.dtype = KIMIX_GDB_DTYPE_INT64;
+        property.count = 1;
+        property.i64 = value;
+        return property;
+    }
+    kimix_gdb_property &g_double(double value) {
+        static thread_local kimix_gdb_property property;
+        property = kimix_gdb_property{};
+        property.kind = KIMIX_GDB_KIND_DOUBLE;
+        property.dtype = KIMIX_GDB_DTYPE_DOUBLE;
+        property.count = 1;
+        property.f64 = value;
+        return property;
+    }
+    kimix_gdb_property &g_text(char const *text) {
+        static thread_local kimix_gdb_property property;
+        property = kimix_gdb_property{};
+        property.kind = KIMIX_GDB_KIND_STRING;
+        property.dtype = KIMIX_GDB_DTYPE_CHAR;
+        property.count = 1;
+        property.payload = g_bytes(text);
+        return property;
+    }
+    kimix_gdb_property &g_blob(uint8_t const *data, size_t len) {
+        static thread_local kimix_gdb_property property;
+        property = kimix_gdb_property{};
+        property.kind = KIMIX_GDB_KIND_BLOB;
+        property.dtype = KIMIX_GDB_DTYPE_BYTE;
+        property.count = 1;
+        property.payload = kimix_gdb_bytes{data, len};
+        return property;
+    }
+    kimix_gdb_property &g_int_array(int64_t const *elements, size_t n) {
+        static thread_local kimix_gdb_property property;
+        property = kimix_gdb_property{};
+        property.kind = KIMIX_GDB_KIND_INT64_ARRAY;
+        property.dtype = KIMIX_GDB_DTYPE_INT64;
+        property.count = static_cast<uint16_t>(n);
+        property.payload =
+            kimix_gdb_bytes{reinterpret_cast<uint8_t const *>(elements), n * sizeof(int64_t)};
+        return property;
+    }
+    kimix_gdb_property &g_double_array(double const *elements, size_t n) {
+        static thread_local kimix_gdb_property property;
+        property = kimix_gdb_property{};
+        property.kind = KIMIX_GDB_KIND_DOUBLE_ARRAY;
+        property.dtype = KIMIX_GDB_DTYPE_DOUBLE;
+        property.count = static_cast<uint16_t>(n);
+        property.payload =
+            kimix_gdb_bytes{reinterpret_cast<uint8_t const *>(elements), n * sizeof(double)};
+        return property;
+    }
+  bool g_same(kimix_gdb_guid a, kimix_gdb_guid b) {
+      return a.lo == b.lo && a.hi == b.hi;
+  }
+  bool g_has(uint32_t const *ids, size_t n, uint32_t needle) {
+      for (size_t i = 0; i < n; ++i) {
+          if (ids[i] == needle) {
+              return true;
+          }
+      }
+      return false;
+  }
+  /* A registered label by name (the suite's sessions are GDI-strict, so every
+     name is created explicitly — a typo fails right here, not later). */
+  uint32_t g_label(kimix_gdb_session *session, char const *name) {
+      uint32_t id = 0;
+      expect(kimix_graphdb_label_create(session, name, std::strlen(name), &id) ==
+             KIMIX_GDB_OK);
+      return id;
+  }
+  uint32_t g_property_type(kimix_gdb_session *session, char const *name, uint8_t container,
+                           uint8_t dtype, uint32_t count) {
+      uint32_t id = 0;
+      expect(kimix_graphdb_property_type_create(session, name, std::strlen(name), container,
+                                                dtype, count, &id) == KIMIX_GDB_OK);
+      return id;
+  }
+  /* One keyed vertex, created through the wrapper.  A NULL `out_warning` is the
+     documented "nobody asks" shape (the session enforces unique ids, so the
+     warning branch cannot fire here anyway). */
+  kimix_gdb_guid g_vertex(kimix_gdb_session *session, uint32_t label_id, char const *external) {
+      kimix_gdb_vertex_spec spec{};
+      spec.key.label = label_id;
+      spec.key.external_id = g_bytes(external);
+      kimix_gdb_guid uid{};
+      expect(kimix_graphdb_vertex_create(session, &spec, &uid, nullptr) == KIMIX_GDB_OK);
+      return uid;
+  }
+  /* The spec of a keyed vertex: what a bulk row creates (a NEW vertex under
+     that key — the uid is an OUT of the call, never an input).  The key label
+     alone is enough here; the extra-label array is only used where the test
+     needs its own (caller-owned, stable) storage. */
+    kimix_gdb_vertex_spec &g_spec(uint32_t label_id, char const *external) {
+        /* The same take-a-reference trick as the property builders: a call site
+           may spell &g_spec(person, "a").key.  Copies out of it are the only
+           other use (spec arrays and plain assignments both copy). */
+        static thread_local kimix_gdb_vertex_spec spec;
+        spec = kimix_gdb_vertex_spec{};
+        spec.key.label = label_id;
+        spec.key.external_id = g_bytes(external);
+        return spec;
+    }
+  kimix_gdb_edge_spec g_edge_spec(kimix_gdb_guid origin, kimix_gdb_guid target) {
+      kimix_gdb_edge_spec spec{};
+      spec.origin = origin;
+      spec.target = target;
+      spec.direction = KIMIX_GDB_EDGE_DIRECTED;
+      return spec;
+  }
+  kimix_gdb_guid g_edge(kimix_gdb_session *session, kimix_gdb_guid origin,
+                        kimix_gdb_guid target) {
+      kimix_gdb_guid id{};
+      expect(kimix_graphdb_edge_create(session, origin, target, KIMIX_GDB_EDGE_DIRECTED,
+                                       nullptr, 0, nullptr, 0, &id) == KIMIX_GDB_OK);
+      return id;
+  }
+  /* The two-phase property read: probe, then fetch, with the caller's arrays
+     already known (from the probe) to be big enough. */
+  size_t g_read_properties(kimix_gdb_session *session, kimix_gdb_guid vertex,
+                           kimix_gdb_property_record *items, size_t capacity,
+                           uint8_t *scratch, size_t scratch_capacity) {
+      size_t count = 0;
+      size_t bytes = 0;
+      expect(kimix_graphdb_vertex_properties(session, vertex, nullptr, 0, nullptr, 0, &count,
+                                             &bytes) == KIMIX_GDB_OK);
+      expect(count <= capacity);
+      expect(bytes <= scratch_capacity);
+      count = 0;
+      bytes = 0;
+      expect(kimix_graphdb_vertex_properties(session, vertex, items, capacity, scratch,
+                                             scratch_capacity, &count, &bytes) ==
+             KIMIX_GDB_OK);
+      expect(count <= capacity);
+      return count;
+  }
+
+  /* One open IN-MEMORY session, GDI-strict schema and enforced unique ids — the
+     defaults the IGraphBackend contract wants; the guard's close is the only
+     owned object's release, reached even on an early return. */
+  struct gd_guard {
+      kimix_gdb_session *session{nullptr};
+      gd_guard() {
+          kimix_gdb_open_options options{};
+          options.directory = nullptr; // in memory: persist()/load() report no store
+          options.auto_create_schema = 0; // GDI-strict: names must exist
+          options.key_mode = 0; // enforce unique
+          options.allow_parallel_edges = 1;
+          options.allow_self_edges = 1;
+          options.max_journal_bytes = 64ull * 1024ull * 1024ull;
+          expect(kimix_graphdb_open(&options, &session) == KIMIX_GDB_OK);
+          expect(session != nullptr);
+      }
+      gd_guard(gd_guard const &) = delete;
+      gd_guard &operator=(gd_guard const &) = delete;
+      ~gd_guard() {
+          if (session != nullptr) {
+              kimix_graphdb_close(session);
+          }
+      }
+  };
+  
+  } // namespace
 
 int main() {
     // ----------------------------------------------------------------- identity
@@ -1439,6 +1631,646 @@ int main() {
         expect(gone == nullptr) << "out_db is untouched when the open fails";
 
         expect(kimix_sqlite_busy_timeout(db, 250) == KIMIX_OK);
-        expect(kimix_sqlite_close(db) == KIMIX_OK);
-    };
-}
+          expect(kimix_sqlite_close(db) == KIMIX_OK);
+      };
+      // ----------------------------------------------------------------- graphdb
+      "graphdb: identity, layout and status names"_test = [] {
+          expect(kimix_graphdb_abi_version() == KIMIX_GDB_ABI_VERSION);
+          expect(std::strlen(kimix_graphdb_version_string()) > 0);
+          kimix_gdb_layout layout{};
+          expect(kimix_graphdb_layout_info(&layout) == KIMIX_GDB_OK);
+          expect(layout.abi_version == kimix_graphdb_abi_version());
+          expect(layout.sizeof_property == sizeof(kimix_gdb_property));
+          expect(layout.sizeof_property_record == sizeof(kimix_gdb_property_record));
+          expect(layout.sizeof_vertex_key == sizeof(kimix_gdb_vertex_key));
+          expect(layout.sizeof_edge_record == sizeof(kimix_gdb_edge_record));
+          expect(layout.sizeof_property_type == sizeof(kimix_gdb_property_type));
+          expect(layout.sizeof_capability == sizeof(kimix_gdb_capability));
+          expect(layout.sizeof_vertex_spec == sizeof(kimix_gdb_vertex_spec));
+          expect(layout.sizeof_size_t == sizeof(size_t));
+          expect(layout.alignof_guid == alignof(kimix_gdb_guid));
+          expect(kimix_graphdb_layout_info(nullptr) == KIMIX_GDB_ERR_ARGUMENT);
+          expect(std::strcmp(kimix_graphdb_status_name(KIMIX_GDB_OK), "ok") == 0);
+          expect(std::strcmp(kimix_graphdb_status_name(KIMIX_GDB_ERR_VERTEX), "error_vertex") ==
+                 0);
+          expect(std::strcmp(kimix_graphdb_status_name(12345), "status_unknown") == 0);
+          expect(kimix_graphdb_status_name(-1) != nullptr) << "never NULL, always printable";
+      };
+      "graphdb: NULL session contract"_test = [] {
+          kimix_gdb_guid guid{};
+          kimix_gdb_vertex_spec vspec = g_spec(0, "x");
+          uint32_t id = 0;
+          size_t count = 0;
+          expect(kimix_graphdb_capabilities(nullptr, nullptr) == KIMIX_GDB_ERR_ARGUMENT);
+          expect(kimix_graphdb_vertex_create(nullptr, &vspec, &guid, nullptr) ==
+                 KIMIX_GDB_ERR_ARGUMENT);
+          expect(kimix_graphdb_vertex_translate(nullptr, &vspec.key, &guid, nullptr) ==
+                 KIMIX_GDB_ERR_ARGUMENT);
+          expect(kimix_graphdb_edge_free(nullptr, guid) == KIMIX_GDB_ERR_ARGUMENT);
+          expect(kimix_graphdb_tx_begin(nullptr) == KIMIX_GDB_ERR_ARGUMENT);
+          expect(kimix_graphdb_tx_commit(nullptr) == KIMIX_GDB_ERR_ARGUMENT);
+          expect(kimix_graphdb_label_create(nullptr, "l", 1, &id) == KIMIX_GDB_ERR_ARGUMENT);
+          expect(kimix_graphdb_vertex_labels(nullptr, guid, nullptr, 0, &count) ==
+                 KIMIX_GDB_ERR_ARGUMENT);
+          expect(kimix_graphdb_vertex_properties(nullptr, guid, nullptr, 0, nullptr, 0, &count,
+                                                 &count) == KIMIX_GDB_ERR_ARGUMENT);
+          expect(kimix_graphdb_edges_of_vertex(nullptr, guid, 0, 0, 0, nullptr, 0, &count,
+                                               &count) == KIMIX_GDB_ERR_ARGUMENT);
+          expect(kimix_graphdb_vertices_create_bulk(nullptr, &vspec, 1, 1, nullptr, nullptr,
+                                                    nullptr) == KIMIX_GDB_ERR_ARGUMENT);
+          expect(kimix_graphdb_persist(nullptr, 0) == KIMIX_GDB_ERR_ARGUMENT);
+          kimix_graphdb_close(nullptr); // documented no-op
+      };
+      "graphdb: session lifecycle, capabilities, the storeless persist/load"_test = [] {
+          gd_guard g;
+          kimix_gdb_capability caps{};
+          expect(kimix_graphdb_capabilities(g.session, &caps) == KIMIX_GDB_OK);
+          expect(caps.supports_edge_by_stable_uid == 1);
+          expect(caps.supports_edge_property_read == 1);
+          expect(caps.supports_collective_transactions == 1);
+          expect(caps.enforces_unique_external_ids == 1);
+          expect(caps.supports_global_scan == 0);
+          expect(caps.supports_native_multi_hop == 0);
+          expect(caps.supports_global_aggregates == 0);
+          // An in-memory session has no store to write back into or re-read.
+          expect(kimix_graphdb_persist(g.session, 1) == KIMIX_GDB_ERR_NO_SUCH_FILE);
+          expect(kimix_graphdb_load(g.session) == KIMIX_GDB_ERR_NO_SUCH_FILE);
+      };
+      "graphdb: label schema CRUD through the two-phase scratch protocol"_test = [] {
+          gd_guard g;
+          uint32_t person = g_label(g.session, "person");
+          uint32_t again = 0;
+          uint8_t found = 0;
+          expect(kimix_graphdb_label_find(g.session, "person", 6, &again, &found) ==
+                 KIMIX_GDB_OK);
+          expect(found == 1 && again == person);
+          expect(kimix_graphdb_label_find(g.session, "alien", 5, &again, &found) ==
+                 KIMIX_GDB_OK);
+          expect(found == 0) << "a miss is found=0, never an error";
+          expect(kimix_graphdb_label_create(g.session, "person", 6, &again) ==
+                 KIMIX_GDB_ERR_NAME_EXISTS);
+          char name[32] = {0};
+          size_t required = 0;
+          expect(kimix_graphdb_label_name(g.session, person, name, sizeof name, &required) ==
+                 KIMIX_GDB_OK);
+          expect(std::strcmp(name, "person") == 0);
+          size_t count = 0;
+          size_t bytes = 0;
+          expect(kimix_graphdb_label_get_all(g.session, nullptr, 0, nullptr, 0, &count,
+                                             &bytes) == KIMIX_GDB_OK);
+          expect(count == 1 && bytes == 6);
+          kimix_gdb_label items[4];
+          uint8_t scratch[64];
+          expect(kimix_graphdb_label_get_all(g.session, items, 4, scratch, sizeof scratch,
+                                             &count, &bytes) == KIMIX_GDB_OK);
+          expect(count == 1);
+          expect(std::memcmp(scratch + items[0].name_offset, "person", items[0].name_len) ==
+                 0);
+          expect(kimix_graphdb_label_get_all(g.session, items, 0, scratch, sizeof scratch,
+                                             &count, &bytes) == KIMIX_GDB_ERR_BUFFER);
+          expect(count == 1) << "the too-small call still reports the sizes";
+          expect(kimix_graphdb_label_update(g.session, person, "human", 5) == KIMIX_GDB_OK);
+          expect(kimix_graphdb_label_find(g.session, "human", 5, &again, &found) ==
+                 KIMIX_GDB_OK);
+          expect(found == 1 && again == person);
+          expect(kimix_graphdb_label_free(g.session, person) == KIMIX_GDB_OK);
+          expect(kimix_graphdb_label_find(g.session, "human", 5, &again, &found) ==
+                 KIMIX_GDB_OK);
+          expect(found == 0);
+      };
+      "graphdb: property type schema CRUD"_test = [] {
+          gd_guard g;
+          uint32_t age = g_property_type(g.session, "age", KIMIX_GDB_CONTAINER_SINGLE,
+                                         KIMIX_GDB_DTYPE_INT64, 1);
+          uint32_t scores = g_property_type(g.session, "scores", KIMIX_GDB_CONTAINER_ARRAY,
+                                            KIMIX_GDB_DTYPE_DOUBLE, 3);
+          uint32_t found_id = 0;
+          uint8_t found = 0;
+          expect(kimix_graphdb_property_type_find(g.session, "age", 3, &found_id, &found) ==
+                 KIMIX_GDB_OK);
+          expect(found == 1 && found_id == age);
+          expect(kimix_graphdb_property_type_find(g.session, "nope", 4, &found_id, &found) ==
+                 KIMIX_GDB_OK);
+          expect(found == 0);
+          expect(kimix_graphdb_property_type_create(g.session, "age", 3, KIMIX_GDB_CONTAINER_SINGLE,
+                                                    KIMIX_GDB_DTYPE_INT64, 1, &found_id) ==
+                 KIMIX_GDB_ERR_NAME_EXISTS);
+          size_t count = 0;
+          size_t bytes = 0;
+          expect(kimix_graphdb_property_type_get_all(g.session, nullptr, 0, nullptr, 0, &count,
+                                                     &bytes) == KIMIX_GDB_OK);
+          expect(count == 2);
+          kimix_gdb_property_type items[4];
+          uint8_t scratch[64];
+          expect(kimix_graphdb_property_type_get_all(g.session, items, 4, scratch,
+                                                     sizeof scratch, &count, &bytes) ==
+                 KIMIX_GDB_OK);
+          expect(count == 2);
+          bool saw_scores = false;
+          for (size_t i = 0; i < count; ++i) {
+              if (items[i].id == scores) {
+                  saw_scores = true;
+                  expect(items[i].container == KIMIX_GDB_CONTAINER_ARRAY);
+                  expect(items[i].dtype == KIMIX_GDB_DTYPE_DOUBLE);
+                  expect(items[i].count == 3);
+                  expect(std::memcmp(scratch + items[i].name_offset, "scores",
+                                     items[i].name_len) == 0);
+              }
+          }
+          expect(saw_scores);
+          expect(kimix_graphdb_property_type_update(g.session, age, "years", 5,
+                                                    KIMIX_GDB_CONTAINER_SINGLE,
+                                                    KIMIX_GDB_DTYPE_INT64, 1) == KIMIX_GDB_OK);
+          expect(kimix_graphdb_property_type_find(g.session, "years", 5, &found_id, &found) ==
+                 KIMIX_GDB_OK);
+          expect(found == 1 && found_id == age);
+          expect(kimix_graphdb_property_type_free(g.session, age) == KIMIX_GDB_OK);
+          expect(kimix_graphdb_property_type_find(g.session, "years", 5, &found_id, &found) ==
+                 KIMIX_GDB_OK);
+          expect(found == 0);
+      };
+      "graphdb: vertex create / merge / translate / free"_test = [] {
+          gd_guard g;
+          uint32_t person = g_label(g.session, "person");
+          auto a = g_vertex(g.session, person, "a");
+          kimix_gdb_guid out{};
+          uint8_t found = 0;
+          kimix_gdb_vertex_key key = g_spec(person, "a").key;
+          expect(kimix_graphdb_vertex_translate(g.session, &key, &out, &found) == KIMIX_GDB_OK);
+          expect(found == 1 && g_same(out, a));
+          kimix_gdb_vertex_key missing = g_spec(person, "nope").key;
+          expect(kimix_graphdb_vertex_translate(g.session, &missing, &out, &found) ==
+                 KIMIX_GDB_OK);
+          expect(found == 0) << "a miss is ok + found=0, never an error";
+          // MERGE: an existing key matches untouched; a new key creates.
+          kimix_gdb_vertex_spec spec = g_spec(person, "a");
+          uint8_t created = 0;
+          expect(kimix_graphdb_vertex_get_or_create(g.session, &spec, &out, &created) ==
+                 KIMIX_GDB_OK);
+          expect(created == 0 && g_same(out, a));
+          spec = g_spec(person, "b");
+          expect(kimix_graphdb_vertex_get_or_create(g.session, &spec, &out, &created) ==
+                 KIMIX_GDB_OK);
+          expect(created == 1 && !g_same(out, a));
+          // enforce-unique mode: a straight duplicate create is an error.
+          spec = g_spec(person, "a");
+          expect(kimix_graphdb_vertex_create(g.session, &spec, &out, nullptr) ==
+                 KIMIX_GDB_ERR_NON_UNIQUE_ID);
+          kimix_gdb_guid no_such{1, 2};
+          expect(kimix_graphdb_vertex_free(g.session, no_such) == KIMIX_GDB_ERR_VERTEX);
+          expect(kimix_graphdb_vertex_free(g.session, a) == KIMIX_GDB_OK);
+          expect(kimix_graphdb_vertex_free(g.session, a) == KIMIX_GDB_ERR_VERTEX);
+          expect(kimix_graphdb_vertex_translate(g.session, &key, &out, &found) ==
+                 KIMIX_GDB_OK);
+          expect(found == 0) << "the freed key left the index too";
+      };
+      "graphdb: vertex labels, the key-label-first order"_test = [] {
+          gd_guard g;
+          uint32_t person = g_label(g.session, "person");
+          uint32_t tag = g_label(g.session, "tag");
+          uint32_t labels[2] = {person, tag};
+          kimix_gdb_vertex_spec spec = g_spec(person, "v1");
+          spec.labels = labels;
+          spec.label_count = 2;
+          kimix_gdb_guid v{};
+          expect(kimix_graphdb_vertex_create(g.session, &spec, &v, nullptr) == KIMIX_GDB_OK);
+          uint32_t out[4] = {0, 0, 0, 0};
+          size_t count = 0;
+          expect(kimix_graphdb_vertex_labels(g.session, v, out, 4, &count) == KIMIX_GDB_OK);
+          expect(count == 2);
+          expect(out[0] == person) << "the key label comes first (the read-back order)";
+          expect(g_has(out, count, tag));
+          expect(kimix_graphdb_vertex_label_add(g.session, v, tag) == KIMIX_GDB_ERR_LABEL)
+              << "already present";
+          expect(kimix_graphdb_vertex_label_add(g.session, v, 424242) == KIMIX_GDB_ERR_LABEL)
+              << "undeclared on a GDI-strict session";
+          expect(kimix_graphdb_vertex_label_remove(g.session, v, tag) == KIMIX_GDB_OK);
+          expect(kimix_graphdb_vertex_label_remove(g.session, v, tag) == KIMIX_GDB_ERR_LABEL)
+              << "already absent";
+          expect(kimix_graphdb_vertex_labels(g.session, v, nullptr, 0, &count) ==
+                 KIMIX_GDB_OK);
+          expect(count == 1);
+          expect(kimix_graphdb_vertex_labels(g.session, v, out, 0, &count) ==
+                 KIMIX_GDB_ERR_BUFFER);
+      };
+      "graphdb: vertex properties of every kind, the add/set/update/remove semantics"_test =
+          [] {
+              gd_guard g;
+              uint32_t person = g_label(g.session, "person");
+              auto v = g_vertex(g.session, person, "v1");
+              uint32_t age = g_property_type(g.session, "age", KIMIX_GDB_CONTAINER_SINGLE,
+                                             KIMIX_GDB_DTYPE_INT64, 1);
+              uint32_t score = g_property_type(g.session, "score", KIMIX_GDB_CONTAINER_SINGLE,
+                                               KIMIX_GDB_DTYPE_DOUBLE, 1);
+              uint32_t name = g_property_type(g.session, "name", KIMIX_GDB_CONTAINER_SINGLE,
+                                              KIMIX_GDB_DTYPE_CHAR, 1);
+              uint32_t data = g_property_type(g.session, "data", KIMIX_GDB_CONTAINER_SINGLE,
+                                              KIMIX_GDB_DTYPE_BYTE, 1);
+              uint32_t ints = g_property_type(g.session, "ints", KIMIX_GDB_CONTAINER_ARRAY,
+                                              KIMIX_GDB_DTYPE_INT64, 3);
+              uint32_t ds = g_property_type(g.session, "ds", KIMIX_GDB_CONTAINER_ARRAY,
+                                            KIMIX_GDB_DTYPE_DOUBLE, 2);
+              uint32_t tag = g_property_type(g.session, "tag", KIMIX_GDB_CONTAINER_SINGLE,
+                                             KIMIX_GDB_DTYPE_CHAR, 1);
+              int64_t iv[3] = {1, 2, 3};
+              double dv[2] = {2.5, 3.5};
+              uint8_t blob[3] = {7, 8, 9};
+              expect(kimix_graphdb_vertex_property_add(g.session, v, age, &g_int(33)) ==
+                     KIMIX_GDB_OK);
+              expect(kimix_graphdb_vertex_property_add(g.session, v, score, &g_double(9.5)) ==
+                     KIMIX_GDB_OK);
+              expect(kimix_graphdb_vertex_property_add(g.session, v, name, &g_text("alice")) ==
+                     KIMIX_GDB_OK);
+              expect(kimix_graphdb_vertex_property_add(g.session, v, data, &g_blob(blob, 3)) ==
+                     KIMIX_GDB_OK);
+              expect(kimix_graphdb_vertex_property_add(g.session, v, ints, &g_int_array(iv, 3)) ==
+                     KIMIX_GDB_OK);
+              expect(kimix_graphdb_vertex_property_add(g.session, v, ds, &g_double_array(dv, 2)) ==
+                     KIMIX_GDB_OK);
+              kimix_gdb_property_record items[8];
+              uint8_t scratch[256];
+              size_t count = g_read_properties(g.session, v, items, 8, scratch, sizeof scratch);
+              expect(count == 6);
+              auto rec = [&](uint32_t name_id) -> kimix_gdb_property_record const * {
+                  for (size_t i = 0; i < count; ++i) {
+                      if (items[i].name_id == name_id) {
+                          return &items[i];
+                      }
+                  }
+                  return nullptr;
+              };
+              kimix_gdb_property_record const *r = rec(age);
+              expect(r != nullptr && r->kind == KIMIX_GDB_KIND_INT64 && r->i64 == 33);
+              r = rec(score);
+              expect(r != nullptr && r->kind == KIMIX_GDB_KIND_DOUBLE && r->f64 == 9.5);
+              r = rec(name);
+              expect(r != nullptr && r->kind == KIMIX_GDB_KIND_STRING && r->payload_len == 5);
+              expect(std::memcmp(scratch + r->payload_offset, "alice", 5) == 0);
+              r = rec(data);
+              expect(r != nullptr && r->kind == KIMIX_GDB_KIND_BLOB && r->payload_len == 3);
+              expect(scratch[r->payload_offset] == 7 && scratch[r->payload_offset + 2] == 9);
+              r = rec(ints);
+              expect(r != nullptr && r->kind == KIMIX_GDB_KIND_INT64_ARRAY && r->count == 3);
+              expect(r->payload_len == 3 * sizeof(int64_t));
+              expect(std::memcmp(scratch + r->payload_offset, iv, sizeof iv) == 0);
+              r = rec(ds);
+              expect(r != nullptr && r->kind == KIMIX_GDB_KIND_DOUBLE_ARRAY && r->count == 2);
+              expect(std::memcmp(scratch + r->payload_offset, dv, sizeof dv) == 0);
+              // The three write semantics stay distinct, and the type checks bite.
+              expect(kimix_graphdb_vertex_property_add(g.session, v, age, &g_int(1)) ==
+                     KIMIX_GDB_ERR_PROPERTY_EXISTS);
+              expect(kimix_graphdb_vertex_property_add(g.session, v, name, &g_int(1)) ==
+                     KIMIX_GDB_ERR_WRONG_TYPE);
+              int64_t short_iv[2] = {1, 2};
+              expect(kimix_graphdb_vertex_property_add(g.session, v, ints,
+                                                       &g_int_array(short_iv, 2)) ==
+                     KIMIX_GDB_ERR_COUNT);
+              expect(kimix_graphdb_vertex_property_add(g.session, v, 424242, &g_int(1)) ==
+                     KIMIX_GDB_ERR_PROPERTY_TYPE);
+              expect(kimix_graphdb_vertex_property_set(g.session, v, tag, &g_text("x")) ==
+                     KIMIX_GDB_ERR_NO_PROPERTY)
+                  << "set replaces and refuses to create";
+              expect(kimix_graphdb_vertex_property_add(g.session, v, tag, &g_text("t1")) ==
+                     KIMIX_GDB_OK);
+              expect(kimix_graphdb_vertex_property_set(g.session, v, tag, &g_text("t2")) ==
+                     KIMIX_GDB_OK);
+              expect(kimix_graphdb_vertex_property_update(g.session, v, tag,
+                                                          &g_text("t3")) == KIMIX_GDB_OK);
+              expect(kimix_graphdb_vertex_property_update(g.session, v, age, &g_int(34)) ==
+                     KIMIX_GDB_OK)
+                  << "update merges (upserts)";
+              uint32_t remove_names[2] = {age, tag};
+              expect(kimix_graphdb_vertex_properties_remove(g.session, v, remove_names, 2) ==
+                     KIMIX_GDB_OK);
+              expect(kimix_graphdb_vertex_properties_remove(g.session, v, remove_names, 2) ==
+                     KIMIX_GDB_OK)
+                  << "absent names are ignored";
+              count = g_read_properties(g.session, v, items, 8, scratch, sizeof scratch);
+              expect(count == 5) << "six added + tag, minus age and tag";
+              // removing ARRAY-typed values is the same path with destructors in it:
+              uint32_t array_names[2] = {ints, ds};
+              expect(kimix_graphdb_vertex_properties_remove(g.session, v, array_names, 2) ==
+                     KIMIX_GDB_OK);
+              count = g_read_properties(g.session, v, items, 8, scratch, sizeof scratch);
+              expect(count == 3);
+              // NULL names with a nonzero count is an argument error, never a crash.
+              expect(kimix_graphdb_vertex_properties_remove(g.session, v, nullptr, 2) ==
+                     KIMIX_GDB_ERR_ARGUMENT);
+            };
+      "graphdb: edges — create, endpoints, direction, labels, properties, free"_test = [] {
+          gd_guard g;
+          uint32_t person = g_label(g.session, "person");
+          uint32_t age = g_property_type(g.session, "age", KIMIX_GDB_CONTAINER_SINGLE,
+                                         KIMIX_GDB_DTYPE_INT64, 1);
+          auto v1 = g_vertex(g.session, person, "v1");
+          auto v2 = g_vertex(g.session, person, "v2");
+          auto v3 = g_vertex(g.session, person, "v3");
+          kimix_gdb_guid no_such{1, 2};
+          kimix_gdb_guid e{};
+          expect(kimix_graphdb_edge_create(g.session, no_such, v2, KIMIX_GDB_EDGE_DIRECTED,
+                                           nullptr, 0, nullptr, 0, &e) == KIMIX_GDB_ERR_VERTEX);
+          expect(kimix_graphdb_edge_create(g.session, v1, v2, KIMIX_GDB_EDGE_DIRECTED, nullptr,
+                                           0, nullptr, 0, &e) == KIMIX_GDB_OK);
+          kimix_gdb_guid origin{};
+          kimix_gdb_guid target{};
+          expect(kimix_graphdb_edge_endpoints(g.session, e, &origin, &target) == KIMIX_GDB_OK);
+          expect(g_same(origin, v1) && g_same(target, v2));
+          expect(kimix_graphdb_edge_set_origin(g.session, e, v3) == KIMIX_GDB_OK);
+          expect(kimix_graphdb_edge_set_target(g.session, e, v1) == KIMIX_GDB_OK);
+          expect(kimix_graphdb_edge_endpoints(g.session, e, &origin, &target) == KIMIX_GDB_OK);
+          expect(g_same(origin, v3) && g_same(target, v1));
+          expect(kimix_graphdb_edge_set_direction(g.session, e, KIMIX_GDB_EDGE_UNDIRECTED) ==
+                 KIMIX_GDB_OK);
+          // labels on the edge
+          expect(kimix_graphdb_edge_label_add(g.session, e, person) == KIMIX_GDB_OK);
+          uint32_t out[4] = {0, 0, 0, 0};
+          size_t count = 0;
+          expect(kimix_graphdb_edge_labels(g.session, e, out, 4, &count) == KIMIX_GDB_OK);
+          expect(count == 1 && out[0] == person);
+          expect(kimix_graphdb_edge_label_add(g.session, e, person) == KIMIX_GDB_ERR_LABEL);
+          expect(kimix_graphdb_edge_label_remove(g.session, e, person) == KIMIX_GDB_OK);
+          expect(kimix_graphdb_edge_labels(g.session, e, out, 4, &count) == KIMIX_GDB_OK);
+          expect(count == 0);
+          // properties on the edge: add + two-phase read + set/update/remove
+          expect(kimix_graphdb_edge_property_add(g.session, e, age, &g_int(5)) == KIMIX_GDB_OK);
+          kimix_gdb_property_record items[4];
+          uint8_t scratch[128];
+          size_t bytes = 0;
+          expect(kimix_graphdb_edge_properties(g.session, e, nullptr, 0, nullptr, 0, &count,
+                                               &bytes) == KIMIX_GDB_OK);
+          expect(count == 1);
+          expect(kimix_graphdb_edge_properties(g.session, e, items, 4, scratch, sizeof scratch,
+                                               &count, &bytes) == KIMIX_GDB_OK);
+          expect(count == 1 && items[0].name_id == age && items[0].i64 == 5);
+          expect(kimix_graphdb_edge_property_set(g.session, e, age, &g_int(6)) == KIMIX_GDB_OK);
+          expect(kimix_graphdb_edge_property_update(g.session, e, age, &g_int(7)) ==
+                 KIMIX_GDB_OK);
+          uint32_t only_age[1] = {age};
+          expect(kimix_graphdb_edge_properties_remove(g.session, e, only_age, 1) ==
+                 KIMIX_GDB_OK);
+          expect(kimix_graphdb_edge_properties(g.session, e, nullptr, 0, nullptr, 0, &count,
+                                               &bytes) == KIMIX_GDB_OK);
+          expect(count == 0);
+          // free + the unknown-edge codes (unknown edges are error_uid)
+          expect(kimix_graphdb_edge_endpoints(g.session, no_such, &origin, &target) ==
+                 KIMIX_GDB_ERR_UID);
+          expect(kimix_graphdb_edge_free(g.session, e) == KIMIX_GDB_OK);
+          expect(kimix_graphdb_edge_free(g.session, e) == KIMIX_GDB_ERR_UID);
+      };
+      "graphdb: paged reads — orientations, constraints, cap 0/1/N"_test = [] {
+          gd_guard g;
+          uint32_t person = g_label(g.session, "person");
+          uint32_t tag = g_label(g.session, "tag");
+          uint32_t age = g_property_type(g.session, "age", KIMIX_GDB_CONTAINER_SINGLE,
+                                         KIMIX_GDB_DTYPE_INT64, 1);
+          auto a = g_vertex(g.session, person, "a");
+          auto b = g_vertex(g.session, person, "b");
+          auto c = g_vertex(g.session, person, "c");
+          auto d = g_vertex(g.session, person, "d");
+          kimix_gdb_vertex_spec es = g_spec(person, "e");
+          uint32_t e_labels[1] = {tag};
+          es.labels = e_labels;
+          es.label_count = 1;
+          kimix_gdb_guid ev{};
+          expect(kimix_graphdb_vertex_create(g.session, &es, &ev, nullptr) == KIMIX_GDB_OK);
+          expect(kimix_graphdb_vertex_property_add(g.session, b, age, &g_int(20)) ==
+                 KIMIX_GDB_OK);
+          expect(kimix_graphdb_vertex_property_add(g.session, c, age, &g_int(30)) ==
+                 KIMIX_GDB_OK);
+          expect(kimix_graphdb_vertex_property_add(g.session, d, age, &g_int(40)) ==
+                 KIMIX_GDB_OK);
+          (void)g_edge(g.session, a, b);
+          (void)g_edge(g.session, a, c);
+          auto ab = g_edge(g.session, a, b); // parallel edge, allowed by the options
+          (void)g_edge(g.session, a, d);
+          (void)g_edge(g.session, ev, a); // incoming
+          kimix_gdb_guid nbuf[8];
+          kimix_gdb_edge_record ebuf[8];
+          size_t count = 0;
+          size_t total = 0;
+          // neighbors: orientation + the cap protocol
+          expect(kimix_graphdb_neighbors_of_vertex(g.session, a, 0,
+                                                   KIMIX_GDB_ORIENTATION_OUTGOING, 0, nullptr,
+                                                   0, &count, &total) == KIMIX_GDB_OK);
+          expect(count == 0 && total == 3) << "cap 0 is the count probe";
+          expect(kimix_graphdb_neighbors_of_vertex(g.session, a, 0,
+                                                   KIMIX_GDB_ORIENTATION_OUTGOING, 2, nbuf, 8,
+                                                   &count, &total) == KIMIX_GDB_OK);
+          expect(count == 2 && total == 3) << "cap N: N items + the FULL count";
+          expect(kimix_graphdb_neighbors_of_vertex(g.session, a, 0,
+                                                   KIMIX_GDB_ORIENTATION_OUTGOING, 99, nbuf, 8,
+                                                   &count, &total) == KIMIX_GDB_OK);
+          expect(count == 3 && total == 3);
+          expect(kimix_graphdb_neighbors_of_vertex(g.session, a, 0,
+                                                   KIMIX_GDB_ORIENTATION_INCOMING, 99, nbuf, 8,
+                                                   &count, &total) == KIMIX_GDB_OK);
+          expect(count == 1 && total == 1 && g_same(nbuf[0], ev));
+          expect(kimix_graphdb_neighbors_of_vertex(g.session, a, 0, KIMIX_GDB_ORIENTATION_BOTH,
+                                                   99, nbuf, 8, &count, &total) == KIMIX_GDB_OK);
+          expect(count == 4 && total == 4);
+          expect(kimix_graphdb_count_neighbors(g.session, a, 0, KIMIX_GDB_ORIENTATION_OUTGOING,
+                                               &count) == KIMIX_GDB_OK);
+          expect(count == 3);
+          uint8_t exists = 0;
+          expect(kimix_graphdb_exists_neighbor(g.session, a, 0, KIMIX_GDB_ORIENTATION_OUTGOING,
+                                               &exists) == KIMIX_GDB_OK);
+          expect(exists == 1);
+          expect(kimix_graphdb_exists_neighbor(g.session, b, 0, KIMIX_GDB_ORIENTATION_OUTGOING,
+                                               &exists) == KIMIX_GDB_OK);
+          expect(exists == 0);
+          // a label constraint filters the NEIGHBOUR vertices (GDI §5.10)
+          uint32_t tag_constraint = 0;
+          expect(kimix_graphdb_constraint_create(g.session, &tag_constraint) == KIMIX_GDB_OK);
+          expect(kimix_graphdb_constraint_add_label(g.session, tag_constraint, tag,
+                                                    KIMIX_GDB_OP_EQUAL) == KIMIX_GDB_OK);
+          expect(kimix_graphdb_neighbors_of_vertex(g.session, a, tag_constraint,
+                                                   KIMIX_GDB_ORIENTATION_BOTH, 99, nbuf, 8,
+                                                   &count, &total) == KIMIX_GDB_OK);
+          expect(count == 1 && total == 1 && g_same(nbuf[0], ev));
+          // a property constraint with a comparison op
+          uint32_t grown = 0;
+          expect(kimix_graphdb_constraint_create(g.session, &grown) == KIMIX_GDB_OK);
+          expect(kimix_graphdb_constraint_add_property(g.session, grown, age,
+                                                       KIMIX_GDB_OP_GREATER, &g_int(25),
+                                                       1) == KIMIX_GDB_OK);
+          expect(kimix_graphdb_neighbors_of_vertex(g.session, a, grown,
+                                                   KIMIX_GDB_ORIENTATION_OUTGOING, 99, nbuf, 8,
+                                                   &count, &total) == KIMIX_GDB_OK);
+          expect(total == 2) << "neighbours older than 25: c and d";
+          // edge reads filter the EDGES: label one and require it
+          kimix_gdb_guid labelled = g_edge(g.session, a, b);
+          expect(kimix_graphdb_edge_label_add(g.session, labelled, tag) == KIMIX_GDB_OK);
+          uint32_t edge_constraint = 0;
+          expect(kimix_graphdb_constraint_create(g.session, &edge_constraint) == KIMIX_GDB_OK);
+          expect(kimix_graphdb_constraint_add_label(g.session, edge_constraint, tag,
+                                                    KIMIX_GDB_OP_EQUAL) == KIMIX_GDB_OK);
+          expect(kimix_graphdb_edges_of_vertex(g.session, a, edge_constraint,
+                                               KIMIX_GDB_ORIENTATION_OUTGOING, 99, ebuf, 8,
+                                               &count, &total) == KIMIX_GDB_OK);
+          expect(total == 1 && g_same(ebuf[0].uid, labelled));
+          expect(kimix_graphdb_edges_of_vertex(g.session, a, 0, KIMIX_GDB_ORIENTATION_OUTGOING,
+                                               0, nullptr, 0, &count, &total) == KIMIX_GDB_OK);
+          expect(count == 0 && total == 5) << "five out-edges: the parallel pair counts twice";
+          expect(kimix_graphdb_edges_of_vertex(g.session, a, 0, KIMIX_GDB_ORIENTATION_OUTGOING,
+                                               3, ebuf, 8, &count, &total) == KIMIX_GDB_OK);
+          expect(count == 3 && total == 5);
+          // A negative cap only bites on a real fetch: the items==NULL probe asks
+          // for the count regardless (effective cap 0).
+          expect(kimix_graphdb_edges_of_vertex(g.session, a, 0, KIMIX_GDB_ORIENTATION_OUTGOING,
+                                               -1, ebuf, 8, &count, &total) ==
+                 KIMIX_GDB_ERR_ARGUMENT)
+              << "a negative cap is an argument error";
+          // an EDGE read filtered by an EDGE PROPERTY condition (the §2.6 shape):
+          // weights over 15 keep the two heavy out-edges of a fresh hub.  The
+          // weight lands through edge_property_add: kimix_gdb_edge_create has no
+          // property NAMES to store create-time properties with (documented in
+          // graph_c_api.h), so a create-with-properties goes through
+          // kimix_gdb_edges_create_bulk or an add after the create.
+          {
+              uint32_t const knows = g_label(g.session, "knows");
+              uint32_t const weight = g_property_type(g.session, "weight", KIMIX_GDB_CONTAINER_SINGLE,
+                                                      KIMIX_GDB_DTYPE_INT64, 1);
+              kimix_gdb_guid const hub = g_vertex(g.session, person, "hub");
+              int64_t const ws[3] = {10, 20, 30};
+              char const *leaf_ids[3] = {"hub-leaf-0", "hub-leaf-1", "hub-leaf-2"};
+              for (int i = 0; i < 3; ++i) {
+                  kimix_gdb_guid const leaf = g_vertex(g.session, person, leaf_ids[i]);
+                  kimix_gdb_guid edge = g_edge(g.session, hub, leaf);
+                  expect(kimix_graphdb_edge_label_add(g.session, edge, knows) == KIMIX_GDB_OK);
+                  expect(kimix_graphdb_edge_property_add(g.session, edge, weight, &g_int(ws[i])) ==
+                         KIMIX_GDB_OK);
+              }
+              uint32_t heavy = 0;
+              expect(kimix_graphdb_constraint_create(g.session, &heavy) == KIMIX_GDB_OK);
+              expect(kimix_graphdb_constraint_add_property(g.session, heavy, weight,
+                                                           KIMIX_GDB_OP_GREATER, &g_int(15),
+                                                           1) == KIMIX_GDB_OK);
+              expect(kimix_graphdb_edges_of_vertex(g.session, hub, heavy,
+                                                   KIMIX_GDB_ORIENTATION_OUTGOING, 0, nullptr, 0,
+                                                   &count, &total) == KIMIX_GDB_OK);
+              expect(total == 2) << "the 20 and 30 out-edges pass weight > 15";
+              expect(kimix_graphdb_constraint_free(g.session, heavy) == KIMIX_GDB_OK);
+          }
+          expect(kimix_graphdb_constraint_free(g.session, tag_constraint) == KIMIX_GDB_OK);
+          expect(kimix_graphdb_constraint_free(g.session, grown) == KIMIX_GDB_OK);
+          expect(kimix_graphdb_constraint_free(g.session, edge_constraint) == KIMIX_GDB_OK);
+      };
+      "graphdb: transactions — commit keeps, abort restores, collective is read-only"_test =
+          [] {
+              gd_guard g;
+              uint32_t person = g_label(g.session, "person");
+              // abort discards everything, including the key index entry
+              expect(kimix_graphdb_tx_begin(g.session) == KIMIX_GDB_OK);
+              (void)g_vertex(g.session, person, "tx1");
+              expect(kimix_graphdb_tx_abort(g.session) == KIMIX_GDB_OK);
+              kimix_gdb_guid out{};
+              uint8_t found = 0;
+              kimix_gdb_vertex_key key = g_spec(person, "tx1").key;
+              expect(kimix_graphdb_vertex_translate(g.session, &key, &out, &found) ==
+                     KIMIX_GDB_OK);
+              expect(found == 0) << "aborted means gone, index included";
+              // commit keeps
+              expect(kimix_graphdb_tx_begin(g.session) == KIMIX_GDB_OK);
+              auto kept = g_vertex(g.session, person, "tx2");
+              expect(kimix_graphdb_tx_commit(g.session) == KIMIX_GDB_OK);
+              expect(kimix_graphdb_vertex_translate(g.session, &g_spec(person, "tx2").key,
+                                                    &out, &found) == KIMIX_GDB_OK);
+              expect(found == 1 && g_same(out, kept));
+              // one open transaction per session; commit/abort outside one is an error
+              expect(kimix_graphdb_tx_begin(g.session) == KIMIX_GDB_OK);
+              expect(kimix_graphdb_tx_begin(g.session) == KIMIX_GDB_ERR_TRANSACTION);
+              expect(kimix_graphdb_tx_abort(g.session) == KIMIX_GDB_OK);
+              expect(kimix_graphdb_tx_commit(g.session) == KIMIX_GDB_ERR_TRANSACTION);
+              expect(kimix_graphdb_tx_abort(g.session) == KIMIX_GDB_ERR_TRANSACTION);
+              // collective: reads run, writes refuse, close with commit ends it
+              expect(kimix_graphdb_tx_begin_collective(g.session) == KIMIX_GDB_OK);
+              kimix_gdb_vertex_spec ro = g_spec(person, "ro1");
+              expect(kimix_graphdb_vertex_create(g.session, &ro, &out, nullptr) ==
+                     KIMIX_GDB_ERR_READ_ONLY_TRANSACTION);
+              expect(kimix_graphdb_vertex_translate(g.session, &g_spec(person, "tx2").key,
+                                                    &out, &found) == KIMIX_GDB_OK);
+              expect(found == 1) << "reads still run inside the collective";
+              expect(kimix_graphdb_tx_close_collective(g.session, 1) == KIMIX_GDB_OK);
+              expect(kimix_graphdb_tx_close_collective(g.session, 1) ==
+                     KIMIX_GDB_ERR_TRANSACTION)
+                  << "no collective is open";
+          };
+      "graphdb: bulk vertices and edges, per-row isolation with continue_on_error"_test = [] {
+          gd_guard g;
+          uint32_t person = g_label(g.session, "person");
+          uint32_t age = g_property_type(g.session, "age", KIMIX_GDB_CONTAINER_SINGLE,
+                                         KIMIX_GDB_DTYPE_INT64, 1);
+          kimix_gdb_property props[1] = {g_int(7)};
+          uint32_t names[1] = {age};
+          kimix_gdb_vertex_spec specs[4] = {g_spec(person, "b1"), g_spec(person, "b2"),
+                                            g_spec(person, "b1"), g_spec(person, "b3")};
+          specs[1].properties = props;
+          specs[1].property_names = names;
+          specs[1].property_count = 1;
+          kimix_gdb_guid uids[4] = {};
+          int32_t statuses[4] = {0, 0, 0, 0};
+          uint8_t warns[4] = {0, 0, 0, 0};
+          expect(kimix_graphdb_vertices_create_bulk(g.session, specs, 4, 1, uids, statuses,
+                                                    warns) == KIMIX_GDB_OK);
+          expect(statuses[0] == KIMIX_GDB_OK && statuses[1] == KIMIX_GDB_OK);
+          expect(statuses[2] == KIMIX_GDB_ERR_NON_UNIQUE_ID)
+              << "the duplicate key fails its row only";
+          expect(statuses[3] == KIMIX_GDB_OK);
+          expect(uids[0].lo != 0 || uids[0].hi != 0);
+          kimix_gdb_guid out{};
+          uint8_t found = 0;
+          expect(kimix_graphdb_vertex_translate(g.session, &g_spec(person, "b3").key, &out,
+                                                &found) == KIMIX_GDB_OK);
+          expect(found == 1);
+          kimix_gdb_property_record items[4];
+          uint8_t scratch[64];
+          size_t count = g_read_properties(g.session, uids[1], items, 4, scratch,
+                                           sizeof scratch);
+          expect(count == 1 && items[0].name_id == age && items[0].i64 == 7);
+          // edges bulk: two good rows, one with an unknown endpoint
+          kimix_gdb_guid no_such{1, 2};
+          kimix_gdb_edge_spec especs[3] = {g_edge_spec(uids[0], uids[1]),
+                                             g_edge_spec(uids[1], uids[3]),
+                                             g_edge_spec(uids[0], no_such)};
+          kimix_gdb_guid eids[3] = {};
+          int32_t estatus[3] = {0, 0, 0};
+          expect(kimix_graphdb_edges_create_bulk(g.session, especs, 3, 1, eids, estatus) ==
+                 KIMIX_GDB_OK);
+          expect(estatus[0] == KIMIX_GDB_OK && estatus[1] == KIMIX_GDB_OK);
+          expect(estatus[2] == KIMIX_GDB_ERR_VERTEX);
+          kimix_gdb_guid origin{};
+          kimix_gdb_guid target{};
+          expect(kimix_graphdb_edge_endpoints(g.session, eids[1], &origin, &target) ==
+                 KIMIX_GDB_OK);
+          expect(g_same(origin, uids[1]) && g_same(target, uids[3]));
+      };
+      "graphdb: constraint handles — create, extend, the error codes, free"_test = [] {
+          gd_guard g;
+          uint32_t person = g_label(g.session, "person");
+          uint32_t age = g_property_type(g.session, "age", KIMIX_GDB_CONTAINER_SINGLE,
+                                         KIMIX_GDB_DTYPE_INT64, 1);
+          uint32_t c = 0;
+          expect(kimix_graphdb_constraint_create(g.session, &c) == KIMIX_GDB_OK);
+          expect(kimix_graphdb_constraint_add_label(g.session, c, person,
+                                                    KIMIX_GDB_OP_EQUAL) == KIMIX_GDB_OK);
+          expect(kimix_graphdb_constraint_add_property(g.session, c, age,
+                                                       KIMIX_GDB_OP_GREATER_OR_EQUAL,
+                                                       &g_int(18), 1) == KIMIX_GDB_OK);
+          expect(kimix_graphdb_constraint_add_label(g.session, c, 9999, KIMIX_GDB_OP_EQUAL) ==
+                 KIMIX_GDB_ERR_LABEL)
+              << "an unknown label inside a condition is error_label";
+          expect(kimix_graphdb_constraint_add_label(g.session, c + 1000, person,
+                                                    KIMIX_GDB_OP_EQUAL) ==
+                 KIMIX_GDB_ERR_CONSTRAINT)
+              << "an unknown constraint is error_constraint";
+          expect(kimix_graphdb_constraint_free(g.session, c) == KIMIX_GDB_OK);
+          expect(kimix_graphdb_constraint_free(g.session, c) == KIMIX_GDB_ERR_CONSTRAINT)
+              << "double free";
+          // a label condition only admits equal / not_equal
+          uint32_t c2 = 0;
+          expect(kimix_graphdb_constraint_create(g.session, &c2) == KIMIX_GDB_OK);
+          expect(kimix_graphdb_constraint_add_label(g.session, c2, person,
+                                                    KIMIX_GDB_OP_GREATER) == KIMIX_GDB_ERR_OP);
+          expect(kimix_graphdb_constraint_free(g.session, c2) == KIMIX_GDB_OK);
+      };
+  }

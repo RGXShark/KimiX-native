@@ -41,16 +41,25 @@
 --                   column access; the only caller-owned buffer is the exec
 --                   error message (mimalloc, freed with kimix_mem_free)
 --                                                        -> ffi_sqlite.cpp
+--   ffi_graphdb.h    the kimix-graph-db C ABI re-exported one line per entry
+--                   point (kimix-graph-db): the graph_c_api.h surface under
+--                   house KIMIX_FFI names, so a foreign caller gets the whole
+--                   GDI graph vocabulary (int32_t status codes, two-phase
+--                   caller-owned buffers) from this image; the session is the
+--                   only allocated object, released by kimix_graphdb_close
+--                                                        -> ffi_graphdb.cpp
 --
 -- Dependency rule: kimix_api depends on kimix-core for everything core-ish —
 -- never on a src/ext target directly for those (mimalloc/yyjson, and the marl
 -- objects that ffi_parallel.h fans jobs over, arrive through core, exactly
 -- like every other kimix library; see the note at the top of the kimix-core
--- target).  The one exception is kimix-sqlite3: ffi_sqlite.h wraps the
--- amalgamation itself, so the target is declared here the same way kimix-llm
--- declares its own extra third-party deps (kimix-mbedtls / kimix-reproc /
+-- target).  The exceptions are kimix-sqlite3 and kimix-graph-db: ffi_sqlite.h
+-- wraps the amalgamation itself and ffi_graphdb.h forwards into the graph
+-- archive, so both targets are declared here the same way kimix-llm declares
+-- its own extra third-party deps (kimix-mbedtls / kimix-reproc /
 -- kimix-sqlite3).  The sqlite3 include directory arrives through the
--- kimix-sqlite3 target's public includedirs.
+-- kimix-sqlite3 target's public includedirs; <graph_db/graph_c_api.h> through
+-- kimix-graph-db's.
 --
 -- Heap ownership: the mimalloc objects live INSIDE this DLL (MI_SHARED_LIB /
 -- MI_SHARED_LIB_EXPORT are propagated by the mimalloc target, so the mi_*
@@ -87,6 +96,11 @@ target("kimix_api")
     -- kimix-core), so this dep gates nothing and costs nothing when the
     -- option that disables this target is off.
     add_deps("kimix-sqlite3")
+    -- The graphdb family forwards into the graph archive (its C ABI has no
+    -- export macro of its own, so linking the archive is what makes the
+    -- kimix_graphdb_* re-exports callable).  kimix-graph-db is likewise
+    -- always built.
+    add_deps("kimix-graph-db")
     on_load(function(target)
         -- Our own symbols are dllexport'd from this image; a consumer without
         -- either macro sees dllimport (src/core/dll_export.h, KIMIX_API_API).

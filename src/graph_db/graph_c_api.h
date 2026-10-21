@@ -396,6 +396,13 @@ int32_t kimix_gdb_edge_property_types(kimix_gdb_session *session, kimix_gdb_guid
  * Edges
  * ------------------------------------------------------------------------- */
 
+/* Initial `properties` are NOT stored by this entry point: a stored value needs
+ * its property-type NAME, and a bare kimix_gdb_property has none to give (this
+ * is the documented §8.8 degrade, same shape as GDI-RMA).  To create an edge
+ * carrying properties in one call, use kimix_gdb_edges_create_bulk with a
+ * one-row spec (kimix_gdb_edge_spec carries property_names), or create the
+ * edge here and kimix_gdb_edge_property_add each value.  The properties /
+ * property_count arguments are accepted for signature symmetry and ignored. */
 int32_t kimix_gdb_edge_create(kimix_gdb_session *session, kimix_gdb_guid origin,
                               kimix_gdb_guid target, uint8_t direction,
                               const uint32_t *labels, size_t label_count,
