@@ -11,6 +11,7 @@
 #include "builtin_tools/regex_lite.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <utility>
 
@@ -642,17 +643,36 @@ void Regex::reset_state() const {
     _consumed = 0;
 }
 
-// Backtracking VM entry: recursion-depth guard. Nested quantifiers recurse
-// once per consumed character ((a|b)* is ~2 frames per char), and a path
-//ological line could nest thousands of frames deep - past the 1 MiB fiber
-//stack the fan-out scans run on - LONG before the step budget trips. Beyond
-//the cap the search aborts to the NFA exactly like a budget trip.
+// Backtracking VM entry: recursion guards. Nested quantifiers recurse once
+// per consumed character ((a|b)* is ~2 frames per char), and a pathological
+// line could nest thousands of frames deep - LONG before the step budget
+// trips. Two caps, whichever fires first:
+//  - a frame-count cap, and
+//  - a REAL stack-consumption cap. Frames measure ~512 B each in debug
+//    builds (not the ~170 B the old cap assumed), so the old count cap of
+//    3072 needed ~1.5 MiB - more than the 1 MiB stack the fan-out scans run
+//    on (marl fiber stacks are 1 MiB) - and STATUS_STACK_OVERFLOW killed the
+//    process before the guard could ever fire (observed: `.*` over a 64 KiB
+//    line overflows at depth ~2000). The byte cap measures consumption from
+//    the search() entry frame, so it holds on threads, fibers and any stack
+//    size. Beyond either cap the search aborts to the NFA exactly like a
+//    budget trip.
 bool Regex::run(kimix::string_view text, int32_t pc, size_t pos) const {
-    constexpr uint32_t k_max_depth = 3072; // ~0.5 MiB of frames at worst
+    constexpr uint32_t k_max_depth = 1024;
+    constexpr intptr_t k_max_stack_bytes = 400 * 1024; // 2.5x margin on 1 MiB
     if (++_depth > k_max_depth) {
         _aborted = true;
         --_depth;
         return false;
+    }
+    if (_stack_base != 0) {
+        char here;
+        const intptr_t used = _stack_base - reinterpret_cast<intptr_t>(&here);
+        if (used > k_max_stack_bytes || used < -k_max_stack_bytes) {
+            _aborted = true;
+            --_depth;
+            return false;
+        }
     }
     const bool r = run_impl(text, pc, pos);
     --_depth;
@@ -819,6 +839,11 @@ bool Regex::search(kimix::string_view text, size_t &out_begin, size_t &out_end,
     _steps = 0;
     _depth = 0;
     _aborted = false;
+    // Anchor of the stack-consumption guard in run(): the recursion below
+    // stays on this thread's current stack (run() never switches stacks), so
+    // the entry frame's address bounds the measurement.
+    int stack_marker = 0;
+    _stack_base = reinterpret_cast<intptr_t>(&stack_marker);
     for (size_t pos = start; pos <= text.size();) {
         reset_state();
         _match_end = pos;

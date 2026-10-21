@@ -22,6 +22,10 @@
 // threaded/serialized ones through explicit steady_clock loops), and every result
 // is sunk with kimix_bench::sink. THERE IS NOT ONE TIMING ASSERTION IN THIS FILE,
 // on purpose: a benchmark that fails on a slow CI machine is a broken benchmark.
+// GATED: only runs when KIMIX_GRAPH_DB_BENCH=1 is set (same convention as
+// KIMIX_PDQSORT_BENCH / KIMIX_GREP_BENCH); the fixtures take minutes to build
+// in debug, so a plain test run skips the suite:
+//   set KIMIX_GRAPH_DB_BENCH=1 && xmake run test_graph_db_bench
 // The only expects() here are methodology checks — the fiber scheduler is bound,
 // the worker bodies really ran on N distinct OS threads, the workloads really did
 // work, and the serializer's counts are exact (saved == N, incremental == N/100).
@@ -87,6 +91,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib> // std::getenv (KIMIX_GRAPH_DB_BENCH gate)
 #include <random>
 #include <thread>
 #include <utility>
@@ -639,10 +644,17 @@ serialize_numbers run_serialize_pass(size_t vertices, char const *tag, uint32_t 
 } // namespace
 
 int main(int argc, char *argv[]) {
-    boost::ut::detail::cfg::parse_arg_with_fallback(
-        argc, const_cast<const char **>(argv));
-
-    // FIRST, before any suite can run: bind a scheduler for the whole process. The
+      boost::ut::detail::cfg::parse_arg_with_fallback(
+          argc, const_cast<const char **>(argv));
+      // Gated like the other benches (KIMIX_PDQSORT_BENCH, KIMIX_GREP_BENCH):
+      // the fixture build plus the timed windows take ~3 minutes even in a
+      // debug build, so a plain `xmake test` run skips the suite.
+      const char *gate = std::getenv("KIMIX_GRAPH_DB_BENCH");
+      if (gate == nullptr || gate[0] == '0') {
+          std::fprintf(stderr, "[bench] KIMIX_GRAPH_DB_BENCH not set; skipping.\n");
+          return 0;
+      }
+      // FIRST, before any suite can run: bind a scheduler for the whole process. The
     // benchmark threads are plain std::threads, but the serializer's save/load
     // fan-outs are kimix::fiber::parallel and need it bound on the calling thread.
     // Declared first so it outlives every suite Boost.UT runs from the _test

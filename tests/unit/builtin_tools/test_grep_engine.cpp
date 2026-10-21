@@ -208,17 +208,23 @@ struct fixture {
         // crashed a live CLI run when grep's walk converted it with
         // path::string()). Created through the wide interface; the walk must
         // degrade lossily instead of terminating the process.
+        // Only created on a legacy ANSI code page: on a UTF-8 ACP (CP_UTF8)
+        // every scalar is representable, so the directory converts cleanly,
+        // the walk descends into it, and this extra "hit" file would change
+        // every pinned corpus count below (10 matches / 9 files).
         const kimix::filesystem::path weird =
             root / std::wstring(L"weird_\xF03A\xF05C_dir");
-        fs::create_directories(weird, ec);
-        std::FILE *wf = _wfopen((weird / L"inner.txt").c_str(), L"wb");
-        expect(wf != nullptr);
-        if (wf != nullptr) {
-            std::fwrite("hit\n", 1, 4, wf);
-            std::fclose(wf);
+        if (::GetACP() != CP_UTF8) {
+            fs::create_directories(weird, ec);
+            std::FILE *wf = _wfopen((weird / L"inner.txt").c_str(), L"wb");
+            expect(wf != nullptr);
+            if (wf != nullptr) {
+                std::fwrite("hit\n", 1, 4, wf);
+                std::fclose(wf);
+            }
         }
-#endif
-    }
+  #endif
+      }
 
     ~fixture() {
         std::error_code ec;
