@@ -55,6 +55,7 @@
 #pragma once
 
 #include "graph_db_api.h"
+#include "property.h"
 
 #include <core/guid.h>
 #include <core/lmdb.h>
@@ -80,11 +81,32 @@ namespace kimix::graph_db {
 inline constexpr kimix::string_view kVertexKeyPrefix = "v/";
 // Total length of a vertex key: 2-byte prefix + 16-byte guid.
 inline constexpr size_t kVertexKeySize = 18;
-// Reserved key for graph-level metadata (never a vertex key: 'm' != 'v').
+// Prefix of every edge key: "e/" + the 16 binary edge id bytes. Same length as a
+// vertex key, so a key family is decided by its prefix byte alone.
+inline constexpr kimix::string_view kEdgeKeyPrefix = "e/";
+inline constexpr size_t kEdgeKeySize = 18;
+// Prefix of the schema tables ("s/labels", "s/proptypes").
+inline constexpr kimix::string_view kSchemaKeyPrefix = "s/";
+// Reserved for future secondary indexes; NEVER written by this library.
+inline constexpr kimix::string_view kIndexKeyPrefix = "i/";
+// Graph-level metadata (never a vertex key: 'm' is no key family prefix).
 inline constexpr kimix::string_view kMetaRootKey = "meta/root";
-// Magic that starts every vertex record value.
+// Magic that starts every v1 (GDB1) vertex record value.
 inline constexpr kimix::string_view kRecordMagic = "GDB1";
+// Magic of the v2 vertex record. A store may mix GDB1 and GDB2 records: the
+// decoder dispatches on the magic, so a v1 store loads unchanged and a v2 store
+// keeps working after a partial downgrade is impossible (a newer FORMAT is
+// refused through the meta record, see kFormatVersion).
+inline constexpr kimix::string_view kRecordMagicV2 = "GDB2";
+// Magic of an edge record ("GDE2" = graph database edge, format 2).
+inline constexpr kimix::string_view kEdgeRecordMagic = "GDE2";
+// Magic of the meta record and of the two schema tables.
+inline constexpr kimix::string_view kMetaRecordMagic = "GDM2";
+inline constexpr kimix::string_view kSchemaTableMagic = "GDS2";
 inline constexpr size_t kRecordMagicSize = 4;
+// Format version this build writes. 1 = the original layout (no meta record, no
+// edge records); 2 = meta + schema + edge records + typed vertex records.
+inline constexpr uint32_t kFormatVersion = 2;
 // magic + guid + md5 + n_depending + n_depended = 4 + 16 + 16 + 4 + 4.
 inline constexpr size_t kVertexRecordHeaderSize = 44;
 inline constexpr size_t kRecordGuidOffset = 4;
@@ -110,6 +132,15 @@ KIMIX_GRAPH_DB_API void guid_key(kimix::Guid const &guid,
 // exactly kVertexKeySize bytes or does not carry the "v/" prefix.
 [[nodiscard]] KIMIX_GRAPH_DB_API kimix::optional<kimix::Guid>
 guid_from_key(kimix::span<const std::byte> key) noexcept;
+
+// "e/" + the 16 little-endian edge-id bytes, and its parser. The edge key space
+// is a sibling of the vertex space, so one scan can be partitioned by prefix.
+[[nodiscard]] KIMIX_GRAPH_DB_API std::array<std::byte, kEdgeKeySize>
+edge_key(kimix::Guid const &edge_id) noexcept;
+KIMIX_GRAPH_DB_API void edge_key(kimix::Guid const &edge_id,
+                                 kimix::vector<std::byte> &out);
+[[nodiscard]] KIMIX_GRAPH_DB_API kimix::optional<kimix::Guid>
+edge_from_key(kimix::span<const std::byte> key) noexcept;
 
 // MD5 of an opaque byte blob (the content hash cached on a Vertex).
 [[nodiscard]] KIMIX_GRAPH_DB_API kimix::MD5
@@ -145,13 +176,114 @@ encoded_record_size(VertexRecord const &record) noexcept;
 KIMIX_GRAPH_DB_API void encode_vertex_record(VertexRecord const &record,
                                             kimix::vector<std::byte> &out);
 
-// Decode a record written by encode_vertex_record(). Returns false — leaving
-// `out` in an unspecified but destructible state — for a buffer that is
-// truncated, has a wrong magic, or whose dependency counts do not fit. Never
-// aborts, never reads past `bytes`.
+// Decode a vertex record — a "GDB1" one written by encode_vertex_record() OR a
+// "GDB2" one, which lands in the same VertexRecord through its compatibility
+// projection (guid, hash, both dependency tables, content; the GDI fields need
+// decode_vertex_record_v2). Returns false — leaving `out` in an unspecified but
+// destructible state — for a truncated buffer, a wrong magic, or a record whose
+// counts do not fit. Never aborts, never reads past `bytes`.
 [[nodiscard]] KIMIX_GRAPH_DB_API bool
 decode_vertex_record(kimix::span<const std::byte> bytes,
                      VertexRecord &out) noexcept;
+
+// ---------------------------------------------------------------------------
+// Vertex record v2 ("GDB2")
+// ---------------------------------------------------------------------------
+
+/*
+ * The v2 vertex record: everything a v1 record holds EXCEPT the dependency guid
+ * lists, plus the GDI data model.
+ *
+ *   [4B "GDB2"][16B guid][16B content MD5]
+ *   [4B key label][4B n_labels][4B n_props][4B n_dep][4B n_depended][4B ext len]
+ *   [4B reserved]
+ *   [ext id bytes][n_labels x 4B label id][n_props x property entry]
+ *   [n_dep x 16B guid][n_depended x 16B guid][content bytes]
+ *
+ * THE EDGE RECORDS ARE AUTHORITATIVE, the two dependency tables are a
+ * COMPATIBILITY PROJECTION of them (the same shape a v1 record carried). The
+ * load adopts the "e/" records first and only synthesizes an edge from a link
+ * that no edge record covers — which is exactly what a v1 store needs (it has no
+ * edge records at all) and what keeps a hand-edited or partially written store
+ * loadable. Writing both costs 32 bytes per edge on disk, once, which buys:
+ *   - a v1 store and a v2 store have the same in-memory result,
+ *   - `dependent`-only information (an incoming edge whose source record is
+ *     missing) still survives,
+ *   - an older reader's expectation that a vertex record describes its
+ *     adjacency keeps holding for the tools that decode records directly.
+ *
+ * `key_label` == 0 means the vertex has no GDI key (a container-API vertex, or
+ * one migrated from a v1 store).
+ */
+struct KIMIX_GRAPH_DB_API VertexRecordV2 {
+    kimix::Guid guid;
+    kimix::MD5 content_hash;
+    LabelId key_label{kNoLabel};
+    // Raw external-id bytes (an ExternalId's payload).
+    kimix::vector<std::byte> external_id;
+    kimix::vector<LabelId> labels;
+    PropertyList properties;
+    kimix::vector<std::byte> content;
+    // Compatibility projection of the edge set (see the layout note above): the
+    // outgoing and incoming neighbour guids. Filled by a save, verified by a load.
+    kimix::vector<kimix::Guid> depending_guids;
+    kimix::vector<kimix::Guid> depended_guids;
+};
+
+[[nodiscard]] KIMIX_GRAPH_DB_API size_t
+encoded_vertex_record_v2_size(VertexRecordV2 const &record) noexcept;
+KIMIX_GRAPH_DB_API void encode_vertex_record_v2(VertexRecordV2 const &record,
+                                                kimix::vector<std::byte> &out);
+// Requires the "GDB2" magic.
+[[nodiscard]] KIMIX_GRAPH_DB_API bool
+decode_vertex_record_v2(kimix::span<const std::byte> bytes, VertexRecordV2 &out) noexcept;
+// Dispatches on the magic: a "GDB2" record fills the whole struct, a "GDB1"
+// record fills guid/content/hash plus the two dependency tables and leaves the
+// GDI fields (key, labels, properties) empty; `was_v1` says which. A buffer with
+// neither magic fails.
+[[nodiscard]] KIMIX_GRAPH_DB_API bool
+decode_any_vertex_record(kimix::span<const std::byte> bytes, VertexRecordV2 &out,
+                         bool &was_v1) noexcept;
+
+// ---------------------------------------------------------------------------
+// Meta record ("meta/root") — format version negotiation
+// ---------------------------------------------------------------------------
+
+/*
+ * What a store says about itself. Written on every full save (and on an
+ * incremental save only when it changed), read by every load.
+ *
+ *   absent key            -> format 1 (a v1 store: no metadata at all)
+ *   format_version <= 2   -> loadable; a record whose version is 1 but whose
+ *                            meta is present is treated as format 1
+ *   format_version > 2    -> REFUSED with error_bad_file, never partially loaded
+ *
+ * `store_uuid` identifies this store instance (a copy_to() checkpoint keeps it),
+ * `schema_version` is bumped by every schema mutation so a load can tell whether
+ * the schema tables must be re-read, and the two next_*_id counters continue the
+ * registries' dense id allocation across a save/load cycle.
+ */
+struct KIMIX_GRAPH_DB_API MetaRecord {
+    uint32_t format_version{kFormatVersion};
+    kimix::Guid store_uuid;
+    uint64_t last_full_save_ms{0};
+    uint64_t last_incr_save_ms{0};
+    uint32_t schema_version{0};
+    uint32_t next_label_id{1};
+    uint32_t next_prop_name_id{1};
+    kimix::string graph_name;
+};
+
+// True when this build can load a store whose meta record says `format_version`.
+[[nodiscard]] KIMIX_GRAPH_DB_API bool
+format_version_supported(uint32_t format_version) noexcept;
+
+[[nodiscard]] KIMIX_GRAPH_DB_API size_t
+encoded_meta_size(MetaRecord const &record) noexcept;
+KIMIX_GRAPH_DB_API void encode_meta_record(MetaRecord const &record,
+                                           kimix::vector<std::byte> &out);
+[[nodiscard]] KIMIX_GRAPH_DB_API bool
+decode_meta_record(kimix::span<const std::byte> bytes, MetaRecord &out) noexcept;
 
 // ---------------------------------------------------------------------------
 // Filesystem helpers
@@ -215,6 +347,21 @@ public:
     // region (the LMDB iterator is holding one cursor, so this is sequential).
     [[nodiscard]] bool
     load_all_records(kimix::vector<ColdRecord> &out) const noexcept;
+
+    // Scan only the pairs whose key starts with `prefix` — how the load path
+    // separates the vertex ("v/"), edge ("e/") and schema ("s/") families of ONE
+    // LMDB database (kimix::LMDB has a single DBI and one cursor, so the
+    // partition is by prefix and this filter is the only thing that keeps the
+    // loader from treating an edge record as a vertex).
+    [[nodiscard]] bool
+    scan_prefix(kimix::string_view prefix,
+                kimix::vector<ColdRecord> &out) const noexcept;
+
+    // The store's meta record. read_meta() returns false when the key is absent
+    // (a v1 store) or the value does not decode; write_meta() writes/replaces it
+    // in one transaction.
+    [[nodiscard]] bool read_meta(MetaRecord &out) const noexcept;
+    [[nodiscard]] bool write_meta(MetaRecord const &record) const noexcept;
 
     // Scan + decode in one call: every "v/" key that decodes goes into `out`,
     // corrupt/foreign records are counted in `skipped` (may be null) and

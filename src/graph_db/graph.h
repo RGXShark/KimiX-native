@@ -260,6 +260,41 @@
  * deterministic (the same graph always produces the same order) — but it is now
  * shard order first, not one global insertion order, because the map is sharded.
  *
+ * ===========================================================================
+ * EPOCH 4 — FIRST-CLASS EDGES (the GDI alignment)
+ * ===========================================================================
+ * An edge is now an OBJECT (edge.h): uid, origin, target, direction, labels,
+ * properties. Vertex adjacency became
+ *
+ *     kimix::vector<EdgeLink> _out_links, _in_links;   // {edge uid, neighbour}
+ *
+ * i.e. one entry per EDGE instead of one per neighbour, which is what makes
+ * parallel edges, per-edge direction and delete-by-uid expressible at all. The
+ * neighbour guid lists (_depending_guids / _depended_guids) and the resolved
+ * Vertex* sets (_depending / _depended) stay as MAINTAINED PROJECTIONS: they are
+ * updated in place on every link insert/erase, so dependencies()/dependents()/
+ * has_path()/neighbors() keep their 16-byte-per-edge read shape and their
+ * behaviour. The alternative (rebuild a projection on demand) was rejected
+ * because dependencies() returns a const reference and every traversal calls it
+ * once per visited vertex.
+ *
+ * The legacy connect()/disconnect()/connect_bulk() semantics are UNCHANGED and
+ * are now implemented THROUGH the edge table: connect() creates one DIRECTED
+ * edge, refuses a second edge between the same ordered pair, and refuses
+ * from == to. create_edge() is the GDI entry point: it allows parallel edges and
+ * (option-gated) self-loops, and it is the only place that does.
+ *
+ * LOCK HIERARCHY v2 (the full version is in README.md):
+ *   1. Schema::_mutex          (owned by Database, never taken by Graph)
+ *   2. vertex shards           (this class, ascending index)
+ *   3. edge shards             (EdgeTable, ascending index)
+ *   4. key-index shards        (KeyIndex, one at a time)
+ *   5. leaf locks              (Vertex::_mutex — content/props/labels)
+ * A structural write holds 2 -> 3 (or 2 -> 4) in that order and never a leaf
+ * lock; a payload write takes 2 shared to resolve, RELEASES it, then a leaf
+ * lock; a payload read takes the edge shard shared (edge payloads are guarded by
+ * their shard, not by a per-edge mutex).
+ *
  * Example:
  *   kimix::graph_db::Graph graph;
  *   auto *a = graph.create_vertex(bytes_a);
@@ -276,6 +311,11 @@
 #pragma once
 
 #include "graph_db_api.h"
+#include "edge.h"
+#include "graph_db_options.h"
+#include "key.h"
+#include "property.h"
+#include "status.h"
 #include "vertex.h"
 
 #include <core/guid.h>
@@ -316,6 +356,9 @@ static_assert(kGraphShardCount > 0 &&
               "kGraphShardCount must be a power of two (the shard index is a mask)");
 // log2 of kGraphShardCount: the shard index is the top that many bits of the
 // mixed guid hash (see Graph::_shard_of).
+static_assert(kGraphShardCount == kEdgeShardCount && kGraphShardCount == kKeyShardCount,
+              "vertex, edge and key shard counts must match: the lock-order argument "
+              "(level 2 -> 3 -> 4, ascending index) is written down once, for one count");
 inline constexpr unsigned kGraphShardShift =
     kGraphShardCount == 1    ? 0u
     : kGraphShardCount == 2  ? 1u
@@ -462,6 +505,12 @@ public:
     // reader can never observe freed memory. The removed vertex is returned
     // (nullptr when `guid` is unknown) so the caller can persist or resurrect it.
     kimix::unique_ptr<Vertex> remove_vertex(kimix::Guid const &guid);
+    // Transaction-aware removal: the cascade hands back the EDGE objects it
+    // deleted (in `removed_edges`, when non-null) instead of discarding them, so
+    // an aborting transaction can re-adopt them verbatim.
+    kimix::unique_ptr<Vertex>
+    remove_vertex(kimix::Guid const &guid,
+                  kimix::vector<kimix::unique_ptr<Edge>> *removed_edges);
     // Record "from depends on to". False when either guid is unknown, when
     // from == to, or when the edge already exists. Takes the one or two
     // endpoint shards' unique locks in ascending shard order.
@@ -529,6 +578,138 @@ public:
     // A structural write: takes that ONE shard's UNIQUE lock and is subject to the
     // single-writer contract like every other structural mutation.
     bool reserve_links(kimix::Guid const &guid, size_t outgoing, size_t incoming);
+
+    // --- options (key mode, edge policy) ------------------------------------
+    void set_options(GraphOptions const &options) noexcept { _options = options; }
+    [[nodiscard]] GraphOptions const &options() const noexcept { return _options; }
+
+    // --- GDI-shaped vertex creation (P1/P2) ---------------------------------
+    struct VertexSpec {
+        // Primary key. `key_label` == kNoLabel creates an unkeyed vertex (the
+        // container API's shape); a keyed one is indexed and must be unique.
+        LabelId key_label{kNoLabel};
+        kimix::span<const std::byte> external_id;
+        kimix::span<const LabelId> labels;
+        // Optional payload (already schema-validated by the Database).
+        PropertyList const *properties{nullptr};
+        kimix::span<const std::byte> content;
+    };
+
+    // Create a vertex with a key, labels and properties in ONE structural write.
+    // error_empty_name for an empty external id on a keyed vertex,
+    // error_non_unique_id for a taken key (GraphOptions::key_mode ==
+    // report_warning turns that into warning_non_unique_id plus the EXISTING
+    // vertex's uid, which is GDI's under-enforced-uniqueness path).
+    [[nodiscard]] GdiStatus create_vertex(VertexSpec const &spec, kimix::Guid &out_guid);
+    // MERGE: match an existing key (no mutation at all, per the C# reference) or
+    // create a fresh vertex. `created` says which happened.
+    [[nodiscard]] GdiStatus get_or_create_vertex(VertexSpec const &spec, kimix::Guid &out_guid,
+                                                 bool &created);
+    // Key -> uid. `found == false` is NOT an error (GDI's TranslateVertexID
+    // returns a nullable uid).
+    [[nodiscard]] GdiStatus translate_vertex_id(VertexKeyView const &key, kimix::Guid &out_guid,
+                                                bool &found) const;
+    // Delete a vertex. `guarded` (GDI's FreeVertexGuarded) refuses with
+    // error_edge while any incident edge exists; the cascading form (GDI's
+    // FreeVertex, DETACH DELETE) removes every incident edge first, in either
+    // direction. error_vertex when the guid is unknown.
+    [[nodiscard]] GdiStatus free_vertex(kimix::Guid const &guid, bool guarded);
+
+    // --- first-class edges (P3) ---------------------------------------------
+    // Create an edge between two EXISTING vertices. `allow_parallel` and
+    // `allow_self_loop` come from GraphOptions for the GDI entry point; the legacy
+    // connect() passes false for both, which is exactly its old contract.
+    // error_vertex for a missing endpoint, error_edge for a refused self-loop,
+    // error_edge_orientation for an unknown direction value.
+    [[nodiscard]] GdiStatus edge_create(kimix::Guid const &origin, kimix::Guid const &target,
+                                        EdgeDirectionType direction,
+                                        kimix::span<const LabelId> labels,
+                                        PropertyList const *properties, kimix::Guid &out_edge);
+    [[nodiscard]] GdiStatus edge_free(kimix::Guid const &edge);
+    [[nodiscard]] GdiStatus edge_set_origin(kimix::Guid const &edge, kimix::Guid const &origin);
+    [[nodiscard]] GdiStatus edge_set_target(kimix::Guid const &edge, kimix::Guid const &target);
+    [[nodiscard]] GdiStatus edge_set_direction(kimix::Guid const &edge,
+                                               EdgeDirectionType direction);
+    // Payload of one edge. Labels/properties are guarded by the edge's shard, so
+    // these take exactly that one lock (shared to read, unique to write).
+    [[nodiscard]] GdiStatus edge_add_label(kimix::Guid const &edge, LabelId label);
+    [[nodiscard]] GdiStatus edge_remove_label(kimix::Guid const &edge, LabelId label);
+    [[nodiscard]] bool edge_labels(kimix::Guid const &edge, kimix::vector<LabelId> &out) const;
+    [[nodiscard]] GdiStatus edge_add_property(kimix::Guid const &edge, PropNameId name,
+                                              PropertyValue value);
+    [[nodiscard]] GdiStatus edge_set_property(kimix::Guid const &edge, PropNameId name,
+                                              PropertyValue value);
+    [[nodiscard]] GdiStatus edge_put_property(kimix::Guid const &edge, PropNameId name,
+                                              PropertyValue value);
+    [[nodiscard]] GdiStatus edge_remove_properties(kimix::Guid const &edge,
+                                                   kimix::span<PropNameId const> names);
+    [[nodiscard]] bool edge_properties(kimix::Guid const &edge, PropertyList &out) const;
+    [[nodiscard]] bool edge_property(kimix::Guid const &edge, PropNameId name,
+                                     PropertyValue &out) const;
+    // Read-backs (a copy each, one shard lock per call).
+    [[nodiscard]] bool edge_record(kimix::Guid const &edge, EdgeRecord &out) const;
+    [[nodiscard]] bool edge_endpoints(kimix::Guid const &edge, kimix::Guid &origin,
+                                      kimix::Guid &target) const;
+    // Incident edge ids of `vertex`, oriented. One vertex-shard shared lock; the
+    // ids are then resolved by the caller (never two shard locks at once).
+    void incident_edges(kimix::Guid const &vertex, EdgeOrientation orientation,
+                        kimix::vector<EdgeId> &out) const;
+    // True when an edge origin -> target exists (one vertex shard shared lock).
+    [[nodiscard]] bool has_edge(kimix::Guid const &origin, kimix::Guid const &target) const;
+    // True when `vertex` has at least one incident edge in `orientation` — the
+    // guarded-delete probe. Takes ONE vertex shard shared lock.
+    [[nodiscard]] bool has_incident_edges(kimix::Guid const &vertex, EdgeOrientation orientation) const;
+    [[nodiscard]] EdgeTable const &edges() const noexcept { return _edges; }
+    [[nodiscard]] EdgeTable &edges() noexcept { return _edges; }
+    // Dirty EDGE records for the incremental serializer (one shard shared lock at
+    // a time, deterministic order).
+    [[nodiscard]] kimix::vector<EdgeRecord> dirty_edges() const;
+    // --- deletion tombstones (the save path's purge) -------------------------
+    // A save is a WRITE transaction: it never removes a stored key (see
+    // serialize.h). A DELETED entity therefore has to be tombstoned, or the next
+    // load would resurrect it. Graph records the ids this graph removed since the
+    // last save; GraphSerializer writes an EMPTY value under each key in the same
+    // transaction as the records, and the loader treats an empty value as "this
+    // entity is gone" (silently, not as a corrupt record).
+    // Writer-only state (single-writer contract), so no lock is taken.
+    // take_*() moves the lists out and empties them; adopt_vertex / adopt_edge
+    // REMOVE an id from them again, so an aborted transaction that re-adopts a
+    // deleted entity cannot tombstone a live one.
+    [[nodiscard]] kimix::vector<kimix::Guid> take_removed_vertices();
+    [[nodiscard]] kimix::vector<EdgeId> take_removed_edges();
+    void restore_removed_vertex(kimix::Guid const &guid);
+    void restore_removed_edge(EdgeId const &edge);
+    [[nodiscard]] size_t removed_vertex_count() const noexcept { return _removed_vertices.size(); }
+    [[nodiscard]] size_t removed_edge_count() const noexcept { return _removed_edges.size(); }
+
+    // Every vertex guid / every edge id, copied one shard at a time (shard index,
+    // then map insertion order — deterministic). O(n); used by the schema
+    // cascades and by the statistics the tests assert on, never on a hot path.
+    [[nodiscard]] kimix::vector<kimix::Guid> vertex_guids() const;
+    [[nodiscard]] kimix::vector<EdgeId> edge_ids() const;
+    // Overwrite an edge's labels and properties in one step (the transaction
+    // rollback path: it restores a payload exactly, without pretending to be a
+    // sequence of add/remove calls).
+    void edge_restore_payload(EdgeId const &edge, kimix::span<const LabelId> labels,
+                              PropertyList const &properties);
+    // The key index (level 4). Exposed for the database facade's statistics and
+    // for the tests' leak checks.
+    [[nodiscard]] KeyIndex const &key_index() const noexcept { return _keys; }
+    // Degree hints of one vertex (its out/in link counts), copied under one
+    // shard shared lock — what a save writes as the vertex record's reserve hint.
+    [[nodiscard]] bool link_counts(kimix::Guid const &guid, size_t &outgoing,
+                                   size_t &incoming) const;
+
+    // --- loader-only adoption (P1/P3) ---------------------------------------
+    // Adopt a vertex that is ALREADY fully built (key, labels, properties and
+    // content on it) and index its key. error_vertex when the guid is present,
+    // error_non_unique_id when the key is (a store whose records disagree — the
+    // load skips such a record and counts it). Structural write.
+    [[nodiscard]] GdiStatus adopt_vertex(kimix::unique_ptr<Vertex> vertex);
+    // Adopt an already built edge record and link both endpoints. error_vertex
+    // when an endpoint is not in the graph (a dangling edge: the load skips and
+    // counts it), error_edge for a self loop the options forbid.
+    [[nodiscard]] GdiStatus adopt_edge(kimix::unique_ptr<Edge> edge);
 
     // --- level-2 write (VERTEX unique lock only, no shard lock held) --------
     // Replace one vertex's content. The vertex's shard is taken SHARED only to
@@ -618,9 +799,9 @@ public:
 
     // --- dirty bookkeeping (for the incremental serializer) -----------------
 
-    // Set/clear every vertex's dirty flag. The flags are atomics, so this needs
-    // no vertex lock; one shard shared lock at a time keeps each shard's map
-    // alive while it is walked.
+    // Set/clear every vertex's AND every edge's dirty flag (a full save rewrites
+    // both families). The vertex flags are atomics; one shard shared lock at a
+    // time keeps each shard's map alive while it is walked.
     void mark_dirty() noexcept;
     void clear_dirty() noexcept;
     // Snapshot of the dirty vertices with their guid and cached content hash:
@@ -705,12 +886,31 @@ private:
                          kimix::Guid const &from, kimix::Guid const &to);
     bool _disconnect_locked(Shard &from_shard, Shard &to_shard,
                             kimix::Guid const &from, kimix::Guid const &to);
-    // The shared edge-creation body: the caller already resolved both endpoints
-    // and holds their shards UNIQUE. `nullptr` (unknown endpoint) and
-    // from == to return false; an edge already present returns false. This is
-    // the ONE place an edge is added, for connect() and connect_bulk() alike, and
-    // the one place the roots cache is invalidated for an edge.
-    bool _connect_resolved_locked(Vertex *from_vertex, Vertex *to_vertex);
+    // The ONE place an edge is added. The caller has resolved both endpoints and
+    // holds their shards UNIQUE (the same shard once when origin == target, which
+    // is why the two vertex uniques are taken only when they differ). Performs
+    // the duplicate probe against the origin's link list, inserts the record into
+    // the edge table and links both sides. `via_gdi_api` selects the option-gated
+    // policy (parallel edges + self loops) over the legacy one.
+    GdiStatus _create_edge_locked(Vertex *origin, Vertex *target,
+                                  EdgeDirectionType direction,
+                                  kimix::span<const LabelId> labels,
+                                  PropertyList const *properties, bool via_gdi_api,
+                                  EdgeId &out_edge);
+    // The shared body of edge_set_origin/edge_set_target: validate the new
+    // endpoint, then move the record's endpoint AND both adjacency entries under
+    // one ascending lock set (vertex shards, then the edge's own shard).
+    GdiStatus _move_edge_endpoint(EdgeId const &edge, kimix::Guid const &endpoint,
+                                  bool move_origin);
+    // Duplicate probe over the link list: is there an edge origin->target?
+    [[nodiscard]] static bool _has_out_edge_locked(Vertex const *origin,
+                                                  kimix::Guid const &target) noexcept;
+    // Remove one edge's record and BOTH adjacency links. The endpoint shards are
+    // taken one at a time (ascending order when they differ), never nested with
+    // the edge shard held.
+    GdiStatus _free_edge_locked(EdgeId const &edge);
+    // Resolve a guid under one shard SHARED lock. Nullptr when unknown.
+    [[nodiscard]] Vertex *_resolve(kimix::Guid const &guid) const noexcept;
 
     // Allocating adjacency copy (dependencies / dependents): one shard shared
     // lock, one allocation, no intermediate buffer.
@@ -739,6 +939,13 @@ private:
     [[nodiscard]] kimix::vector<Vertex *> _compute_roots() const;
 
     std::array<Shard, kGraphShardCount> _shards;
+    // First-class edges (level 3) and the (label, external_id) index (level 4).
+    EdgeTable _edges;
+    KeyIndex _keys;
+    GraphOptions _options;
+    // Ids removed since the last save (the tombstones it writes). Writer-only.
+    kimix::vector<kimix::Guid> _removed_vertices;
+    kimix::vector<EdgeId> _removed_edges;
     // Vertex count, maintained by the structural writers, so size() is lock-free.
     std::atomic<size_t> _size{0};
     // Structural version + the roots cache (see roots()). The cache fields are

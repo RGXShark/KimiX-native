@@ -1,39 +1,56 @@
 -- Kimix graph database (src/graph_db)
 --
--- Target: kimix-graph-db — a STATIC library holding the in-memory graph layer
--- and its cold-storage glue, on top of kimix-core only:
+-- Target: kimix-graph-db — a STATIC library holding the in-memory graph layer,
+-- its cold-storage glue and the GDI backend facade, on top of kimix-core only:
 --
---   graph_db_api.h  the KIMIX_GRAPH_DB_API linkage-macro family (three states,
---                   same shape as KIMIX_CORE_API in src/core/dll_export.h).
---                   The target is static, so it defines KIMIX_GRAPH_DB_STATIC
---                   publicly and the macro expands to nothing for the library
---                   and for every consumer.
---   utils.h/.cpp    key scheme ("v/" + 16-byte binary guid, "meta/root"
---                   reserved), encode/decode_vertex_record (the little-endian
---                   [GDB1][guid][MD5][n_dep][n_depended][guids][content]
---                   record), and ColdStorage — a thin RAII front end over
---                   kimix::LMDB (src/core/lmdb.h) with batched transactional
---                   writes and copy_to() checkpoints.
---   vertex.h/.cpp   one vertex: guid, opaque content blob + cached MD5, the
---                   dependency links in both forms (guids and Vertex* sets), a
---                   64-byte-separated kimix::shared_atomic_mutex and the dirty
---                   flag.
---   graph.h/.cpp    the vertex container: structural CRUD with a cascading
---                   remove, connect/disconnect, roots, neighbors/dependencies,
---                   cycle-safe BFS has_path/shortest_path, dirty bookkeeping,
---                   and the two-level (graph shared_mutex / vertex
---                   shared_atomic_mutex) concurrency contract.
---   graph_db.h      umbrella include + KIMIX_GRAPH_DB_VERSION.
+--   graph_db_api.h   the KIMIX_GRAPH_DB_API linkage-macro family (three states,
+--                    same shape as KIMIX_CORE_API in src/core/dll_export.h).
+--                    The target is static, so it defines KIMIX_GRAPH_DB_STATIC
+--                    publicly and the macro expands to nothing for the library
+--                    and for every consumer.
+--   graph_db.h       umbrella include + KIMIX_GRAPH_DB_VERSION +
+--                    KIMIX_GRAPH_DB_FORMAT_VERSION.
+--   utils.h/.cpp     key spaces ("v/", "e/", "s/", "meta/root", "i/" reserved),
+--                    the v1 (GDB1) and v2 (GDB2) vertex-record codecs, the meta
+--                    record codec and ColdStorage — a thin RAII front end over
+--                    kimix::LMDB (src/core/lmdb.h) with batched transactional
+--                    writes, prefix scans and copy_to() checkpoints.
+--   vertex.h/.cpp    one vertex: guid, opaque content blob + cached MD5, the
+--                    typed payload (labels, properties), the immutable
+--                    (label, external_id) key, the edge-link adjacency, a
+--                    64-byte-separated kimix::shared_atomic_mutex and the dirty
+--                    flag.
+--   edge.h/.cpp      first-class edges: uid, endpoints, direction, labels,
+--                    properties, the sharded EdgeTable and the "GDE2" codec.
+--   key.h/.cpp       ExternalId (16-byte SSO), VertexKey and the sharded KeyIndex.
+--   graph.h/.cpp     the container: structural CRUD with a cascading remove,
+--                    connect/disconnect/connect_bulk through the edge table,
+--                    the edge + key API, roots, neighbors/dependencies,
+--                    cycle-safe BFS, dirty bookkeeping, and the five-level lock
+--                    hierarchy (see README.md §5b).
+--   serialize.h/.cpp GraphSerializer / GraphDeserializer (v2 records, the edge
+--                    family, the schema tables and the meta record).
+--   status.h/.cpp    GdiStatus: the 63 GDI status codes, pinned by a test.
+--   property.h/.cpp  PropertyValue / PropertyBag, the GDI type vocabulary,
+--                    evaluate() and the record-level property codec.
+--   schema.h/.cpp    label / property-type / constraint registries + codecs.
+--   query.h/.cpp     Page<T> and the constraint evaluation.
+--   transaction.h/.cpp  the undo journal.
+--   database.h/.cpp  Database: the GDI backend facade (one per session).
+--   capability.h/.cpp   the honest capability advertisement.
+--   graph_db_options.h  GraphOptions / KeyMode.
+--   graph_c_api.h/.cpp  the C ABI (ASCII, C99-clean, two-phase buffers).
+--   binary_le.h      INTERNAL little-endian helpers (not in the umbrella).
+--   reports/gdi_alignment.md  the graph_report.md §2.1-§2.16 checklist.
 --
 -- Dependency rule: kimix-core only. Third-party code is reached through it
 -- (LMDB's C sources are already compiled into kimix-core, mimalloc backs
 -- kimix::allocator), so this target never add_deps() a src/ext target — the
 -- same rule kimix-llm and kimix_api follow.
 --
--- Later subtasks add serialize.cpp (parallel incremental save + dual-stage
--- load) and the benchmark target; this file needs no change for them
--- (`add_files("*.cpp")` picks them up), only the test registrations in
--- tests/xmake.lua.
+-- New sources need no change to this file (`add_files("*.cpp")` picks them up),
+-- and neither does a new header (`add_headerfiles("*.h")`); only the test
+-- registrations in tests/xmake.lua.
 --
 -- Build:   xmake build kimix-graph-db   ->  bin/<mode>/libkimix-graph-db.a
 target("kimix-graph-db")

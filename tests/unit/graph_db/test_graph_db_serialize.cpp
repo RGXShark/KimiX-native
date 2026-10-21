@@ -596,12 +596,19 @@ int main(int argc, char *argv[]) {
                 << "an intact record keeps its content and hash";
         }
 
-        // c's record is the corrupt one, so the only reference to it that survives
-        // is a's outgoing edge: exactly one unresolvable dependency.
-        auto a_dependencies = restored.dependencies(dag.a->guid());
-        expect(eq(a_dependencies.size(), size_t{1})) << "a keeps only its edge to b";
-        expect(a_dependencies.front() == dag.b->guid());
-        expect(eq(stats.skipped_edge_count, size_t{1}));
+            // c's record is the corrupt one, so the only reference to it that
+            // survives from the VERTEX side is a's outgoing link.
+            auto a_dependencies = restored.dependencies(dag.a->guid());
+            expect(eq(a_dependencies.size(), size_t{1})) << "a keeps only its edge to b";
+            expect(a_dependencies.front() == dag.b->guid());
+            // TWO edges are now unresolvable, not one: a -> c (a's link, which
+            // needs c) and c -> d (c's own EDGE record, which also needs c). An
+            // edge is a record of its own since epoch 4, so it survives the loss
+            // of its endpoints' vertex records and is reported on its own — the
+            // v1 model could not even see the second one, because it only ever
+            // knew edges as entries inside a vertex record. Both are counted once
+            // (the link fallback skips a pair an edge record already reported).
+            expect(eq(stats.skipped_edge_count, size_t{2}));
 
         // The surviving part of the DAG still traverses.
         expect(restored.has_path(dag.a->guid(), dag.d->guid()));

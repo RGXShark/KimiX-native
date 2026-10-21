@@ -53,6 +53,9 @@
 #pragma once
 
 #include "graph_db_api.h"
+#include "edge.h"
+#include "key.h"
+#include "property.h"
 
 #include <core/guid.h>
 #include <core/md5.h>
@@ -152,6 +155,66 @@ public:
         return _dirty.load(std::memory_order_acquire);
     }
 
+    // --- typed payload: labels and properties (VERTEX lock) ------------------
+    // The vertex lock (_mutex, the same one content uses) guards these: a
+    // property read takes it shared, a write unique. Two threads updating two
+    // DIFFERENT vertices never contend, which is the whole point of keeping the
+    // payload off the shard lock.
+    //   add_*    inserts only; false when the name/label is already present
+    //   set_*    replaces only; false when it is absent
+    //   put_*    upsert (GDI's UpdateProperty): true when a value was replaced
+    //   remove_* ignores an absent name and returns how many were removed
+    // The schema's declaration checks live one layer up (Database): a Vertex
+    // stores what it is given, which keeps the container usable without a schema.
+    bool add_property(PropNameId name, PropertyValue value);
+    bool set_property(PropNameId name, PropertyValue value);
+    bool put_property(PropNameId name, PropertyValue value);
+    size_t remove_properties(kimix::span<PropNameId const> names);
+    [[nodiscard]] bool has_property(PropNameId name) const;
+    [[nodiscard]] bool property(PropNameId name, PropertyValue &out) const;
+    // Every property, copied. Order: the bag's iteration order (insertion order
+    // for ankerl's dense map), so an unfiltered read-back is stable.
+    void properties(PropertyList &out) const;
+    [[nodiscard]] PropertyList property_list() const;
+    [[nodiscard]] size_t property_count() const;
+
+    bool add_label(LabelId label);
+    bool remove_label(LabelId label);
+    [[nodiscard]] bool has_label(LabelId label) const;
+    void labels(kimix::vector<LabelId> &out) const;
+
+    // Payload assignment for a vertex that is NOT published yet: the loader and
+    // Graph::create_vertex fill a fresh vertex through this before it becomes
+    // visible, which is why it needs no lock. Calling it on a vertex the graph
+    // already holds is a contract violation (and would race every reader).
+    void assign_payload(LabelId key_label, kimix::span<const std::byte> external_id,
+                        kimix::span<const LabelId> labels, PropertyList const &properties);
+
+    // Overwrite a PUBLISHED vertex's labels and properties in one step (vertex
+    // unique lock). The transaction rollback path: it restores a payload exactly,
+    // without pretending to be a sequence of add/remove calls.
+    void restore_payload(kimix::span<const LabelId> labels, PropertyList const &properties);
+
+    // --- key (IMMUTABLE: set before insert, read-only afterwards) -----------
+    // A vertex's (label, external id) key never changes — GDI has no rename
+    // command for it, and a change would have to re-index the vertex. Like
+    // guid(), both accessors are therefore lock-free.
+    [[nodiscard]] LabelId key_label() const noexcept { return _key_label; }
+    [[nodiscard]] ExternalId const &external_id() const noexcept { return _external_id; }
+    [[nodiscard]] bool has_key() const noexcept { return _key_label != kNoLabel; }
+    // Same key in its owned form (a copy).
+    [[nodiscard]] VertexKey key() const;
+
+    // --- dependency links (GRAPH structure: caller holds this vertex's SHARD
+    // lock, unique to mutate / shared to read) --------------------------------
+    // The adjacency is a list of (edge uid, neighbour uid) pairs, one entry per
+    // EDGE: parallel edges are therefore representable, and an oriented read is a
+    // scan of one list. The neighbour guid lists below are a maintained
+    // PROJECTION of it (one guid per edge) — see README.md, epoch 4: a projection
+    // that is updated in place beats a rebuilt one on every traversal, measured.
+    [[nodiscard]] kimix::vector<EdgeLink> const &out_links() const noexcept { return _out_links; }
+    [[nodiscard]] kimix::vector<EdgeLink> const &in_links() const noexcept { return _in_links; }
+
     // --- dependencies (GRAPH structure: caller holds this vertex's SHARD lock,
     // or runs under the single-writer rule; see the LOCKING comment above) ----
     // Epoch-2 sizing hook: reserve room for `outgoing` + `incoming` edges in the
@@ -205,17 +268,36 @@ public:
     static void operator delete(void *ptr, size_t size, std::align_val_t align) noexcept;
 
 private:
-    // Graph-only mutators of the serialized dep lists. A Graph calls these
-    // while holding the graph unique lock and this vertex's unique lock.
-    void _add_depending(Vertex *other);
-    // Insert-if-absent in ONE hash operation (the probe and the insert are the
-    // same lookup), returning whether the edge was new. This is what
-    // Graph::_connect_resolved_locked uses, so an "edge already present" costs one
-    // hash lookup instead of a find() plus an insert().
-    bool _add_depending_if_absent(Vertex *other);
-    void _remove_depending(Vertex *other);
-    void _add_depended(Vertex *other);
-    void _remove_depended(Vertex *other);
+    // Pre-insert population: called by Graph on a vertex no reader can see yet,
+    // so no lock is taken (and none could be: the lock protects published state).
+    void _labels_unlocked_push(LabelId label) {
+        if (label != kNoLabel) {
+            _labels.push_back(label);
+        }
+    }
+    void _properties_unlocked_set(PropertyList const &properties) {
+        for (auto const &entry : properties) {
+            _properties.emplace(entry.name, entry.value);
+        }
+    }
+
+    // Key assignment: called by Graph BEFORE the vertex is inserted (and by the
+    // loader before add_vertex), i.e. while no reader can observe the vertex.
+    void _set_key(LabelId label, ExternalId external_id) noexcept {
+        _key_label = label;
+        _external_id = std::move(external_id);
+    }
+
+    // Edge-link mutators. The caller holds this vertex's shard UNIQUE lock (and
+    // nothing else), which is what makes the link list, the guid projection and
+    // the neighbour sets mutually consistent.
+    // `neighbour` may be nullptr (the neighbour is already being removed): the
+    // link and its guid projection are dropped either way, only the resolved
+    // pointer set is skipped.
+    void _add_out_link(kimix::Guid const &edge, Vertex *neighbour);
+    void _add_in_link(kimix::Guid const &edge, Vertex *neighbour);
+    bool _remove_out_link(kimix::Guid const &edge, Vertex *neighbour);
+    bool _remove_in_link(kimix::Guid const &edge, Vertex *neighbour);
     // Drop every edge of this vertex without touching the neighbours (the
     // cascade in Graph::remove_vertex does the neighbour side).
     void _clear_links() noexcept;
@@ -223,8 +305,14 @@ private:
     kimix::Guid _guid;
     kimix::MD5 _content_hash;             // guarded by _mutex
     kimix::vector<std::byte> _content;    // guarded by _mutex
-    kimix::vector<kimix::Guid> _depending_guids; // graph lock
-    kimix::vector<kimix::Guid> _depended_guids;  // graph lock
+    kimix::vector<EdgeLink> _out_links;   // graph lock (shard unique/shared)
+    kimix::vector<EdgeLink> _in_links;    // graph lock
+    kimix::vector<kimix::Guid> _depending_guids; // graph lock (projection of _out_links)
+    kimix::vector<kimix::Guid> _depended_guids;  // graph lock (projection of _in_links)
+    PropertyBag _properties;              // guarded by _mutex
+    kimix::vector<LabelId> _labels;       // guarded by _mutex
+    LabelId _key_label{kNoLabel};         // immutable after construction
+    ExternalId _external_id;              // immutable after construction
     kimix::unordered_set<Vertex *> _depending;   // graph lock + vertex locks
     kimix::unordered_set<Vertex *> _depended;    // graph lock + vertex locks
 
