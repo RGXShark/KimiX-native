@@ -159,17 +159,37 @@ bool Graph::add_vertex(kimix::unique_ptr<Vertex> vertex) {
     return true;
 }
 
+Vertex *Graph::_resolve(kimix::Guid const &guid) const noexcept {
+    size_t const shard_index = _shard_of(guid);
+    std::shared_lock<std::shared_mutex> lock(_shards[shard_index].mutex);
+    return _shards[shard_index]._find(guid);
+}
+
 kimix::unique_ptr<Vertex> Graph::remove_vertex(kimix::Guid const &guid) {
+    return remove_vertex(guid, nullptr);
+}
+
+kimix::unique_ptr<Vertex>
+Graph::remove_vertex(kimix::Guid const &guid,
+                     kimix::vector<kimix::unique_ptr<Edge>> *removed_edges) {
     if (!_check_writer()) {
         return nullptr;
     }
     size_t const own_shard = _shard_of(guid);
     kimix::unique_ptr<Vertex> victim;
-    kimix::vector<kimix::Guid> neighbours;
+    // The cascade's work list: one entry per incident EDGE, holding the edge id,
+    // the neighbour guid and whether the victim was its origin (so the neighbour's
+    // list to clean is decided without touching the edge record again).
+    struct Cascade {
+        kimix::Guid edge;
+        kimix::Guid neighbour;
+        bool victim_is_origin;
+    };
+    kimix::vector<Cascade> cascade;
     {
-        // 1. Detach the victim from its own shard's map, copying out the guids of
-        //    every neighbour it is linked to. Only the OWN shard is locked, so no
-        //    second shard can be held here.
+        // 1. Detach the victim from its own shard's map, copying out every
+        //    incident edge. Only the OWN shard is locked, so no second shard can
+        //    be held here.
         std::unique_lock<std::shared_mutex> lock(_shards[own_shard].mutex);
         auto index = _shards[own_shard].vertices.find(guid);
         if (!index) {
@@ -179,61 +199,76 @@ kimix::unique_ptr<Vertex> Graph::remove_vertex(kimix::Guid const &guid) {
         if (!victim) {
             return nullptr;
         }
-        // `_depending_guids` are the outgoing targets (they hold `victim` in their
-        // _depended set), `_depended_guids` the incoming sources (they hold it in
-        // their _depending set). Both directions have to be unlinked, and the two
-        // lists may legitimately share a guid (A -> B and B -> A), which is why
-        // both removal helpers are called per neighbour below — each is a no-op
-        // when the edge is absent.
-        //
-        // BOTH forms are collected, not just the guids: `connect` keeps the guid
-        // lists and the pointer sets in lockstep, so the union of the two pointer
-        // sets is a superset of the union of the two guid lists, and a vertex the
-        // two forms disagree about would otherwise be missed by the cascade (a
-        // dangling Vertex* in a neighbour's set — the one outcome the cascade
-        // exists to prevent). Resolving a neighbour that no longer has the edge is
-        // simply a no-op in the loop below, so the wider set costs a little
-        // redundancy and buys an invariant that does not rely on that in-lockstep
-        // assumption.
-        neighbours.reserve(victim->_depending.size() + victim->_depended.size());
-        for (auto *other : victim->_depending) {
-            if (other != nullptr) {
-                neighbours.push_back(other->guid());
-            }
+        cascade.reserve(victim->_out_links.size() + victim->_in_links.size() +
+                        victim->_depending_guids.size() + victim->_depended_guids.size());
+        // The link lists are authoritative (one entry per EDGE, so parallel edges
+        // and self loops are covered exactly once each). The guid projections are
+        // collected as well, defensively: a vertex whose two forms disagreed
+        // would otherwise leave a dangling entry behind, and resolving a
+        // neighbour that no longer has the link is a no-op below.
+        for (auto const &link : victim->_out_links) {
+            cascade.push_back(Cascade{link.edge, link.neighbour, true});
         }
-        for (auto *other : victim->_depended) {
-            if (other != nullptr) {
-                neighbours.push_back(other->guid());
-            }
-        }
-        for (auto const &other : victim->_depending_guids) {
-            neighbours.push_back(other);
-        }
-        for (auto const &other : victim->_depended_guids) {
-            neighbours.push_back(other);
+        for (auto const &link : victim->_in_links) {
+            cascade.push_back(Cascade{link.edge, link.neighbour, false});
         }
         _shards[own_shard].vertices.remove(guid);
         _size.fetch_sub(1, std::memory_order_relaxed);
+        // Tombstone: a save never deletes a stored key, so the removal has to be
+        // recorded for the next save to write (see graph.h).
+        _removed_vertices.push_back(guid);
         _bump_structure(); // the victim is gone: it is not a root (nor anything) now
     }
-    // 2. Cascade: unlink the victim from every neighbour's pointer set and guid
-    //    list, ONE shard lock at a time (never two), which is what keeps the
+
+    // 2. Drop the incident edge RECORDS. One edge shard lock at a time, taken
+    //    AFTER the vertex shard lock above has been released (level 2 -> 3). A
+    //    transaction keeps the removed objects so an abort can put them back.
+    for (auto const &item : cascade) {
+        kimix::unique_ptr<Edge> removed = _edges.erase(item.edge);
+        if (removed) {
+            // Tombstone every cascaded edge too, or the next load would bring it
+            // back with a dangling endpoint.
+            _removed_edges.push_back(item.edge);
+            if (removed_edges != nullptr) {
+                removed_edges->push_back(std::move(removed));
+            }
+        }
+    }
+
+    // 2b. The key index entry (level 4, one shard, after every higher level is
+    //     released). A vertex without a key owns no entry.
+    if (victim->has_key()) {
+        kimix::Guid removed;
+        _keys.erase(victim->key(), removed);
+    }
+
+    // 3. Cascade: unlink the victim from every neighbour's link list and guid
+    //    projection, ONE shard lock at a time (never two), which is what keeps the
     //    deadlock-freedom argument trivial. The victim stays alive (it is the
     //    unique_ptr above, and it is returned to the caller), so even a reader
     //    that raced the detach can never touch freed memory: at worst it sees the
     //    edge for one more visit.
-    for (auto const &other_guid : neighbours) {
-        size_t const other_shard = _shard_of(other_guid);
-        // A neighbour may well live in the victim's OWN shard (1/kGraphShardCount
-        // of them do): the lock above was released, so re-taking it here is a
-        // fresh acquisition, not recursion.
+    for (auto const &item : cascade) {
+        if (item.neighbour == guid) {
+            // A self loop lives entirely on the victim, which is already detached.
+            continue;
+        }
+        size_t const other_shard = _shard_of(item.neighbour);
+        // A neighbour may well live in the victim's OWN shard
+        // (1/kGraphShardCount of them do): the lock above was released, so
+        // re-taking it here is a fresh acquisition, not recursion.
         std::unique_lock<std::shared_mutex> lock(_shards[other_shard].mutex);
-        Vertex *other = _shards[other_shard]._find(other_guid);
+        Vertex *other = _shards[other_shard]._find(item.neighbour);
         if (other == nullptr || other == victim.get()) {
             continue;
         }
-        other->_remove_depended(victim.get());
-        other->_remove_depending(victim.get());
+        // The neighbour's OUT list holds an edge whose origin is the victim; its
+        // IN list an edge whose target is the victim.
+        if (item.victim_is_origin) {
+            other->_remove_in_link(item.edge, victim.get());
+        } else {
+            other->_remove_out_link(item.edge, victim.get());
+        }
     }
     victim->_clear_links();
     // The cascade's LAST bump. Every neighbour above lost an edge to a vertex that
@@ -246,66 +281,412 @@ kimix::unique_ptr<Vertex> Graph::remove_vertex(kimix::Guid const &guid) {
     return victim;
 }
 
-bool Graph::_connect_resolved_locked(Vertex *from_vertex, Vertex *to_vertex) {
-    // The ONE implementation of "this edge exists", shared by connect() (which
-    // resolves its two endpoints per edge) and connect_bulk() (which resolves
-    // each endpoint once per batch). The callers hold the endpoint shards'
-    // UNIQUE locks, so the duplicate probe and the four container updates below
-    // cannot interleave with a reader or with another structural write.
-    if (from_vertex == nullptr || to_vertex == nullptr || from_vertex == to_vertex) {
-        return false;
+// ---------------------------------------------------------------------------
+// Keyed vertex creation / translation (P2)
+// ---------------------------------------------------------------------------
+
+GdiStatus Graph::create_vertex(VertexSpec const &spec, kimix::Guid &out_guid) {
+    if (!_check_writer()) {
+        return GdiStatus::error_state;
     }
-    // Edge bookkeeping is graph structure: both endpoints' shard locks are held
-    // UNIQUE, so the two guid lists and the two pointer sets would already be
-    // safe. The two vertex uniques are taken on top of that because the contract
-    // in graph.h says so — they also flush a reader that is in the middle of a
-    // content read of either endpoint, which keeps the "shard lock, then vertex
-    // lock" nesting exercised and tested. from != to is guaranteed by the
-    // caller, so the two uniques are never the same mutex
-    // (shared_atomic_mutex is not recursive).
-    from_vertex->lock_unique();
-    to_vertex->lock_unique();
-    if (!from_vertex->_add_depending_if_absent(to_vertex)) {
-        // The probe and the insert are ONE hash operation, so an edge that is
-        // already present is discovered here instead of by a separate find().
-        // connect() and connect_bulk() therefore agree on "already present"
-        // without either of them paying for two lookups.
-        to_vertex->unlock_unique();
-        from_vertex->unlock_unique();
-        return false;
+    bool const keyed = spec.key_label != kNoLabel;
+    if (keyed && spec.external_id.empty()) {
+        // GDI's VertexKey.Validate: the label must not be empty, and an id of
+        // zero length names nothing.
+        return GdiStatus::error_empty_name;
     }
-    to_vertex->_add_depended(from_vertex);
-    _bump_structure(); // `to_vertex` gained an incoming edge, so it left the root set
-    to_vertex->unlock_unique();
-    from_vertex->unlock_unique();
-    return true;
+    if (!keyed && !spec.external_id.empty()) {
+        return GdiStatus::error_argument; // an id without a label names nothing
+    }
+
+    // The key probe happens BEFORE the structural write, under one key shard
+    // shared lock (level 4 alone — the hierarchy forbids taking it while a
+    // higher level is held, and nothing is held here).
+    if (keyed) {
+        VertexKeyView const view{spec.key_label, spec.external_id};
+        kimix::Guid existing;
+        if (_keys.find(view, existing)) {
+            if (_options.key_mode == KeyMode::report_warning) {
+                // GDI-RMA's under-enforced uniqueness: the caller gets the
+                // EXISTING vertex plus the warning, and nothing is created.
+                out_guid = existing;
+                return GdiStatus::warning_non_unique_id;
+            }
+            return GdiStatus::error_non_unique_id;
+        }
+    }
+
+    kimix::unique_ptr<Vertex> vertex{new Vertex(kimix::Guid{true}, spec.content)};
+    if (keyed) {
+        vertex->_set_key(spec.key_label, ExternalId::from_bytes(spec.external_id));
+    }
+    for (auto label : spec.labels) {
+        vertex->_labels_unlocked_push(label);
+    }
+    if (spec.properties != nullptr) {
+        vertex->_properties_unlocked_set(*spec.properties);
+    }
+    Vertex *raw = vertex.get();
+    kimix::Guid const guid = raw->guid();
+    Shard &shard = _shards[_shard_of(guid)];
+    {
+        std::unique_lock<std::shared_mutex> lock(shard.mutex);
+        auto inserted = shard.vertices.try_emplace(guid, std::move(vertex));
+        if (!inserted.second) {
+            return GdiStatus::error_intern; // guid collision: astronomically unlikely
+        }
+        _size.fetch_add(1, std::memory_order_relaxed);
+        _bump_structure();
+    }
+    if (keyed) {
+        // Level 4 AFTER the vertex shard has been released.
+        GdiStatus const status = _keys.insert(raw->key(), guid);
+        if (is_error(status)) {
+            // A concurrent create won the race between the probe and now: undo the
+            // insertion instead of leaving an unindexed vertex behind.
+            std::unique_lock<std::shared_mutex> lock(shard.mutex);
+            shard.vertices.remove(guid);
+            _size.fetch_sub(1, std::memory_order_relaxed);
+            _bump_structure();
+            return status;
+        }
+    }
+    out_guid = guid;
+    return GdiStatus::ok;
 }
+
+GdiStatus Graph::get_or_create_vertex(VertexSpec const &spec, kimix::Guid &out_guid,
+                                      bool &created) {
+    created = false;
+    if (spec.key_label != kNoLabel) {
+        VertexKeyView const view{spec.key_label, spec.external_id};
+        kimix::Guid existing;
+        if (_keys.find(view, existing)) {
+            // MERGE semantics: a match is returned untouched — no label, no
+            // property is applied (the C# reference does exactly this).
+            out_guid = existing;
+            return GdiStatus::ok;
+        }
+    }
+    GdiStatus const status = create_vertex(spec, out_guid);
+    if (is_error(status)) {
+        return status;
+    }
+    created = true;
+    return GdiStatus::ok;
+}
+
+GdiStatus Graph::translate_vertex_id(VertexKeyView const &key, kimix::Guid &out_guid,
+                                     bool &found) const {
+    found = false;
+    if (key.label == kNoLabel) {
+        return GdiStatus::error_empty_name;
+    }
+    kimix::Guid existing;
+    if (!_keys.find(key, existing)) {
+        // GDI's TranslateVertexID answers "no such key" with a null uid, not an
+        // error; the caller distinguishes the two through `found`.
+        return GdiStatus::ok;
+    }
+    out_guid = existing;
+    found = true;
+    return GdiStatus::ok;
+}
+
+GdiStatus Graph::free_vertex(kimix::Guid const &guid, bool guarded) {
+    if (guarded) {
+        if (!contains(guid)) {
+            return GdiStatus::error_vertex;
+        }
+        if (has_incident_edges(guid, EdgeOrientation::both)) {
+            // GDI's FreeVertexGuarded: ErrorEdge and NOTHING removed.
+            return GdiStatus::error_edge;
+        }
+    }
+    kimix::unique_ptr<Vertex> removed = remove_vertex(guid);
+    if (!removed) {
+        return GdiStatus::error_vertex;
+    }
+    return GdiStatus::ok;
+}
+
+// ---------------------------------------------------------------------------
+// First-class edges (P3)
+// ---------------------------------------------------------------------------
+
+bool Graph::_has_out_edge_locked(Vertex const *origin,
+                                 kimix::Guid const &target) noexcept {
+    for (auto const &link : origin->_out_links) {
+        if (link.neighbour == target) {
+            return true;
+        }
+    }
+    return false;
+}
+
+GdiStatus Graph::_create_edge_locked(Vertex *origin, Vertex *target,
+                                     EdgeDirectionType direction,
+                                     kimix::span<const LabelId> labels,
+                                     PropertyList const *properties, bool via_gdi_api,
+                                     EdgeId &out_edge) {
+    if (origin == nullptr || target == nullptr) {
+        return GdiStatus::error_vertex;
+    }
+    bool const self_loop = origin == target;
+    if (self_loop && !(via_gdi_api && _options.allow_self_edges)) {
+        // The legacy contract: from == to is never an edge.
+        return GdiStatus::error_edge;
+    }
+    if (!via_gdi_api || !_options.allow_parallel_edges) {
+        if (_has_out_edge_locked(origin, target->guid())) {
+            return GdiStatus::error_edge;
+        }
+    }
+    EdgeId const id{kimix::Guid{true}};
+    kimix::unique_ptr<Edge> edge{new Edge(id, origin->guid(), target->guid(), direction)};
+    for (auto label : labels) {
+        if (label == kNoLabel) {
+            return GdiStatus::error_label;
+        }
+        edge->_labels.push_back(label);
+    }
+    if (properties != nullptr) {
+        for (auto const &entry : *properties) {
+            edge->_properties.emplace(entry.name, entry.value);
+        }
+    }
+    // Record first, then the adjacency: an adjacency entry that outlives its
+    // record would be a dangling edge for every reader, while a record inserted a
+    // moment earlier is invisible until a link names it.
+    if (!_edges.insert(std::move(edge))) {
+        return GdiStatus::error_intern;
+    }
+    // The two vertex uniques flush a reader that is in the middle of a payload
+    // read; for a self loop origin == target and the mutex is taken ONCE
+    // (shared_atomic_mutex is not recursive).
+    origin->lock_unique();
+    if (!self_loop) {
+        target->lock_unique();
+    }
+    origin->_add_out_link(id, target);
+    target->_add_in_link(id, origin);
+    _bump_structure(); // `target` gained an incoming edge, so it left the root set
+    if (!self_loop) {
+        target->unlock_unique();
+    }
+    origin->unlock_unique();
+    out_edge = id;
+    return GdiStatus::ok;
+}
+
+GdiStatus Graph::edge_create(kimix::Guid const &origin, kimix::Guid const &target,
+                             EdgeDirectionType direction, kimix::span<const LabelId> labels,
+                             PropertyList const *properties, kimix::Guid &out_edge) {
+    if (!_check_writer()) {
+        return GdiStatus::error_state;
+    }
+    if (direction != EdgeDirectionType::directed &&
+        direction != EdgeDirectionType::undirected) {
+        return GdiStatus::error_edge_orientation;
+    }
+    size_t const origin_shard = _shard_of(origin);
+    size_t const target_shard = _shard_of(target);
+    if (!_options.allow_self_edges && origin == target) {
+        return GdiStatus::error_edge;
+    }
+    if (origin_shard == target_shard) {
+        std::unique_lock<std::shared_mutex> lock(_shards[origin_shard].mutex);
+        Vertex *from_vertex = _shards[origin_shard]._find(origin);
+        Vertex *to_vertex = _shards[origin_shard]._find(target);
+        return _create_edge_locked(from_vertex, to_vertex, direction, labels, properties,
+                                   /*via_gdi_api=*/true, out_edge);
+    }
+    // Two shards: UNIQUE in ascending shard order (level 2), then the edge shard
+    // inside _create_edge_locked (level 3).
+    size_t const first = origin_shard < target_shard ? origin_shard : target_shard;
+    size_t const second = origin_shard < target_shard ? target_shard : origin_shard;
+    std::unique_lock<std::shared_mutex> first_lock(_shards[first].mutex);
+    std::unique_lock<std::shared_mutex> second_lock(_shards[second].mutex);
+    Vertex *from_vertex = _shards[origin_shard]._find(origin);
+    Vertex *to_vertex = _shards[target_shard]._find(target);
+    return _create_edge_locked(from_vertex, to_vertex, direction, labels, properties,
+                               /*via_gdi_api=*/true, out_edge);
+}
+
+GdiStatus Graph::_free_edge_locked(EdgeId const &edge) {
+    EdgeRecord record_copy;
+    if (!_edges.record(edge, record_copy)) {
+        return GdiStatus::error_uid;
+    }
+    kimix::unique_ptr<Edge> removed = _edges.erase(edge);
+    if (!removed) {
+        return GdiStatus::error_uid;
+    }
+    _removed_edges.push_back(edge);
+    // Unlink both sides, one vertex shard at a time (ascending when they differ;
+    // a self loop touches its single shard once).
+    size_t const origin_shard = _shard_of(record_copy.origin);
+    size_t const target_shard = _shard_of(record_copy.target);
+    if (origin_shard == target_shard) {
+        std::unique_lock<std::shared_mutex> lock(_shards[origin_shard].mutex);
+        Vertex *origin = _shards[origin_shard]._find(record_copy.origin);
+        Vertex *target = _shards[origin_shard]._find(record_copy.target);
+        if (origin != nullptr) {
+            origin->_remove_out_link(edge, target);
+        }
+        if (target != nullptr) {
+            target->_remove_in_link(edge, origin);
+        }
+    } else {
+        size_t const first = origin_shard < target_shard ? origin_shard : target_shard;
+        size_t const second = origin_shard < target_shard ? target_shard : origin_shard;
+        {
+            std::unique_lock<std::shared_mutex> first_lock(_shards[first].mutex);
+            std::unique_lock<std::shared_mutex> second_lock(_shards[second].mutex);
+            Vertex *origin = _shards[origin_shard]._find(record_copy.origin);
+            Vertex *target = _shards[target_shard]._find(record_copy.target);
+            if (origin != nullptr) {
+                origin->_remove_out_link(edge, target);
+            }
+            if (target != nullptr) {
+                target->_remove_in_link(edge, origin);
+            }
+        }
+    }
+    _bump_structure(); // the target may be a root now
+    return GdiStatus::ok;
+}
+
+GdiStatus Graph::edge_free(kimix::Guid const &edge) {
+    if (!_check_writer()) {
+        return GdiStatus::error_state;
+    }
+    return _free_edge_locked(edge);
+}
+
+// One endpoint move, shared by edge_set_origin and edge_set_target. Everything
+// happens under ONE ascending lock set: the shards of every vertex involved
+// (level 2) and then the edge's own shard (level 3), so a reader can never see
+// the record and the adjacency disagree.
+GdiStatus Graph::_move_edge_endpoint(EdgeId const &edge, kimix::Guid const &endpoint,
+                                     bool move_origin) {
+    EdgeRecord record_copy;
+    if (!_edges.record(edge, record_copy)) {
+        return GdiStatus::error_uid;
+    }
+    kimix::Guid const new_origin = move_origin ? endpoint : record_copy.origin;
+    kimix::Guid const new_target = move_origin ? record_copy.target : endpoint;
+    if (new_origin == record_copy.origin && new_target == record_copy.target) {
+        return GdiStatus::ok; // already there: no mutation, no dirty flag
+    }
+
+    // The distinct vertex shards this move touches, by ascending index.
+    std::array<uint8_t, kGraphShardCount> touched{};
+    touched[_shard_of(record_copy.origin)] = 1;
+    touched[_shard_of(record_copy.target)] = 1;
+    touched[_shard_of(new_origin)] = 1;
+    touched[_shard_of(new_target)] = 1;
+    std::array<std::unique_lock<std::shared_mutex>, kGraphShardCount> held;
+    for (size_t shard = 0; shard < kGraphShardCount; ++shard) {
+        if (touched[shard] != 0) {
+            held[shard] = std::unique_lock<std::shared_mutex>(_shards[shard].mutex);
+        }
+    }
+    Vertex *old_origin = _shards[_shard_of(record_copy.origin)]._find(record_copy.origin);
+    Vertex *old_target = _shards[_shard_of(record_copy.target)]._find(record_copy.target);
+    Vertex *origin_vertex = _shards[_shard_of(new_origin)]._find(new_origin);
+    Vertex *target_vertex = _shards[_shard_of(new_target)]._find(new_target);
+    if (origin_vertex == nullptr || target_vertex == nullptr) {
+        // Endpoint mutation is validated against the live graph: GDI raises
+        // ErrorVertex for a uid that does not exist, and nothing is moved.
+        return GdiStatus::error_vertex;
+    }
+
+    // Level 3: the edge's own shard, taken AFTER every vertex shard.
+    size_t const edge_shard = EdgeTable::shard_of(edge);
+    std::unique_lock<std::shared_mutex> edge_lock(_edges.shard_mutex(edge_shard));
+    Edge *record = _edges._find_locked(edge_shard, edge);
+    if (record == nullptr) {
+        return GdiStatus::error_uid;
+    }
+
+    // Move the adjacency: an edge contributes exactly one out link (on its
+    // origin) and one in link (on its target). Removing by edge id and re-adding
+    // keeps parallel edges and self loops correct without special cases.
+    if (old_origin != nullptr) {
+        old_origin->_remove_out_link(edge, old_target);
+    }
+    if (old_target != nullptr) {
+        old_target->_remove_in_link(edge, old_origin);
+    }
+    origin_vertex->_add_out_link(edge, target_vertex);
+    target_vertex->_add_in_link(edge, origin_vertex);
+
+    record->_origin = new_origin;
+    record->_target = new_target;
+    record->mark_dirty();
+    _bump_structure(); // the new target gained an incoming edge (a former root may differ)
+    return GdiStatus::ok;
+}
+
+GdiStatus Graph::edge_set_origin(kimix::Guid const &edge, kimix::Guid const &origin) {
+    if (!_check_writer()) {
+        return GdiStatus::error_state;
+    }
+    return _move_edge_endpoint(edge, origin, /*move_origin=*/true);
+}
+
+GdiStatus Graph::edge_set_target(kimix::Guid const &edge, kimix::Guid const &target) {
+    if (!_check_writer()) {
+        return GdiStatus::error_state;
+    }
+    return _move_edge_endpoint(edge, target, /*move_origin=*/false);
+}
+
+// ---------------------------------------------------------------------------
+// Legacy edge API (connect / disconnect / connect_bulk), now implemented
+// THROUGH the edge table so the two worlds cannot drift apart
+// ---------------------------------------------------------------------------
 
 bool Graph::_connect_locked(Shard &from_shard, Shard &to_shard,
                             kimix::Guid const &from, kimix::Guid const &to) {
     Vertex *from_vertex = from_shard._find(from);
     Vertex *to_vertex = to_shard._find(to);
-    return _connect_resolved_locked(from_vertex, to_vertex);
+    EdgeId created;
+    // via_gdi_api = false: one directed edge per ordered pair, no self loop —
+    // exactly the epoch-1..3 contract.
+    return _create_edge_locked(from_vertex, to_vertex, EdgeDirectionType::directed, {}, nullptr,
+                               /*via_gdi_api=*/false, created) == GdiStatus::ok;
 }
 
 bool Graph::_disconnect_locked(Shard &from_shard, Shard &to_shard,
                                kimix::Guid const &from, kimix::Guid const &to) {
     Vertex *from_vertex = from_shard._find(from);
-    Vertex *to_vertex = to_shard._find(to);
-    if (from_vertex == nullptr || to_vertex == nullptr) {
+    if (from_vertex == nullptr) {
         return false;
     }
-    if (from_vertex->_depending.find(to_vertex) == from_vertex->_depending.end()) {
-        return false;
+    kimix::Guid const to_guid = to;
+    for (auto const &link : from_vertex->_out_links) {
+        if (link.neighbour != to_guid) {
+            continue;
+        }
+        // The caller holds both endpoint shards UNIQUE, so the unlink below is
+        // performed on the resolved vertices directly; _free_edge_locked would
+        // re-acquire them (not recursive).
+        EdgeId const edge = link.edge;
+        kimix::unique_ptr<Edge> removed = _edges.erase(edge);
+        if (!removed) {
+            continue;
+        }
+        from_vertex->_remove_out_link(edge, to_shard._find(to_guid));
+        Vertex *to_vertex = to_shard._find(to_guid);
+        if (to_vertex != nullptr) {
+            to_vertex->_remove_in_link(edge, from_vertex);
+        }
+        _bump_structure(); // `to` lost an incoming edge, so it may be a root now
+        return true;
     }
-    from_vertex->lock_unique();
-    to_vertex->lock_unique();
-    from_vertex->_remove_depending(to_vertex);
-    to_vertex->_remove_depended(from_vertex);
-    _bump_structure(); // `to_vertex` lost an incoming edge, so it may be a root now
-    to_vertex->unlock_unique();
-    from_vertex->unlock_unique();
-    return true;
+    return false;
 }
 
 bool Graph::connect(kimix::Guid const &from, kimix::Guid const &to) {
@@ -318,15 +699,9 @@ bool Graph::connect(kimix::Guid const &from, kimix::Guid const &to) {
     size_t const from_shard = _shard_of(from);
     size_t const to_shard = _shard_of(to);
     if (from_shard == to_shard) {
-        // Both endpoints live in one shard: ONE unique lock serves both, and no
-        // ordering question arises. (Self-recursion on a shared_mutex would
-        // deadlock, which is exactly why this case is special-cased.)
         std::unique_lock<std::shared_mutex> lock(_shards[from_shard].mutex);
         return _connect_locked(_shards[from_shard], _shards[from_shard], from, to);
     }
-    // Two shards: UNIQUE in ascending shard order (the lock-order rule in
-    // graph.h). Only connect/disconnect ever take two, and the single-writer
-    // contract keeps a second thread out of this pair anyway.
     size_t const first = from_shard < to_shard ? from_shard : to_shard;
     size_t const second = from_shard < to_shard ? to_shard : from_shard;
     std::unique_lock<std::shared_mutex> first_lock(_shards[first].mutex);
@@ -351,10 +726,6 @@ bool Graph::disconnect(kimix::Guid const &from, kimix::Guid const &to) {
     return _disconnect_locked(_shards[from_shard], _shards[to_shard], from, to);
 }
 
-// ---------------------------------------------------------------------------
-// Bulk edge creation (epoch 3): the loader's link pass
-// ---------------------------------------------------------------------------
-
 size_t Graph::connect_bulk(kimix::span<EdgeRequest const> edges,
                            kimix::span<EdgeOutcome> outcomes) noexcept {
     size_t const count = edges.size();
@@ -362,9 +733,6 @@ size_t Graph::connect_bulk(kimix::span<EdgeRequest const> edges,
     if (count == 0) {
         return 0;
     }
-    // ONE single-writer check for the WHOLE batch, not one per edge: the caller
-    // of a bulk load is a single-threaded phase by contract (graph.h, WRITE
-    // POLICY), and per-edge recording at ~600k edges is pure overhead.
     if (!_check_writer()) {
         if (want_outcomes) {
             for (size_t i = 0; i < count; ++i) {
@@ -374,42 +742,21 @@ size_t Graph::connect_bulk(kimix::span<EdgeRequest const> edges,
         return 0;
     }
 
-    // --- 1. resolve every DISTINCT endpoint once ----------------------------
-    // Two parallel structures, indexed by a dense endpoint id:
-    //   endpoints[id]      the resolved (Vertex*, shard) pair
-    //   resolved[guid]     guid -> id
-    // The pairing is deliberate: ankerl::unordered_dense stores its values in a
-    // dense array, so a rehash INVALIDATES every pointer into `resolved`, but it
-    // never moves `endpoints`, so an id stays valid for the whole call. (Storing
-    // Endpoint* into `resolved` and reusing them across a growth was measured to
-    // crash - that is why the ids exist.)
-    //
-    // The load's link pass passes ~2xN endpoints for N edges with heavy reuse
-    // (every vertex appears once per incident edge), so this collapses ~600k
-    // Graph::find calls into ~100k lookups: one SHARED shard lock per distinct
-    // endpoint instead of one per edge.
-    //
-    // The vertices stay alive for the whole call: removal is a structural write
-    // and the single-writer contract excludes it from running concurrently with
-    // this one (graph.h - the same argument update_content makes for its lookup).
+    // Resolve every DISTINCT endpoint once (one shard shared lock per unique
+    // endpoint instead of one Graph::find per edge). Ids stay valid under growth
+    // because the dense table only moves its own values (epoch-3 lesson).
     struct Endpoint {
         Vertex *vertex;
         uint32_t shard;
     };
     kimix::vector<Endpoint> endpoints;
-    endpoints.reserve(count / 4 + 16); // hint only; ids are stable under growth
-    // A quarter of the edge count covers the load's shape (a 6M-edge store names
-    // ~1M distinct endpoints) without over-reserving; a shape that shares less
-    // simply grows the table once, which costs a rehash of ids and nothing else.
+    endpoints.reserve(count / 4 + 16);
     kimix::unordered_map<kimix::Guid, uint32_t> resolved;
     resolved.reserve(count / 4 + 16);
     kimix::Guid last_guid{};
     uint32_t last_id = kNoEndpoint;
     auto resolve = [this, &endpoints, &resolved, &last_guid,
                     &last_id](kimix::Guid const &guid) -> uint32_t {
-        // The link pass emits one vertex's whole outgoing list at a time, so a
-        // one-entry (guid, id) memo removes the second hash probe for the ~2
-        // consecutive edges of the same source, for the cost of two compares.
         if (last_id != kNoEndpoint && last_guid == guid) {
             return last_id;
         }
@@ -426,7 +773,7 @@ size_t Graph::connect_bulk(kimix::span<EdgeRequest const> edges,
             vertex = _shards[shard_index]._find(guid);
         }
         if (vertex == nullptr) {
-            return kNoEndpoint; // unknown endpoint: the edge is skipped, counted
+            return kNoEndpoint;
         }
         uint32_t const id = static_cast<uint32_t>(endpoints.size());
         endpoints.push_back(Endpoint{vertex, static_cast<uint32_t>(shard_index)});
@@ -436,10 +783,6 @@ size_t Graph::connect_bulk(kimix::span<EdgeRequest const> edges,
         return id;
     };
 
-    // Resolve pass: one (cached) lookup per request endpoint. Self edges and
-    // unknown endpoints are decided HERE, before any structural lock is taken, so
-    // a store full of dangling dependencies costs a batch of shared lookups and
-    // nothing else.
     kimix::vector<uint32_t> from_ends(count, kNoEndpoint);
     kimix::vector<uint32_t> to_ends(count, kNoEndpoint);
     kimix::vector<EdgeOutcome> verdicts(count, EdgeOutcome::created);
@@ -464,16 +807,6 @@ size_t Graph::connect_bulk(kimix::span<EdgeRequest const> edges,
         pending[i] = 1;
     }
 
-    // --- 2. take every touched shard UNIQUE, in ascending index order, ONCE -
-    // The batch-wide lock set is the union of the pending edges' endpoint shards,
-    // so an edge whose two endpoints share a shard needs no ordering decision and
-    // no edge pays an acquire/release pair. The set is COLLECTED first and then
-    // acquired by ascending index, which is exactly what graph.h's
-    // deadlock-freedom argument requires: a bulk caller waits only for locks at
-    // its own level with a strictly higher index. One unique_lock slot per shard
-    // takes each at most once (std::shared_mutex is not recursive, so the second
-    // edge of a shard must NOT re-acquire it) and the array's destruction
-    // releases them all.
     std::array<uint8_t, kGraphShardCount> touched{};
     for (size_t i = 0; i < count; ++i) {
         if (pending[i] == 0) {
@@ -489,22 +822,19 @@ size_t Graph::connect_bulk(kimix::span<EdgeRequest const> edges,
         }
     }
 
-    // --- 3. create the edges ------------------------------------------------
-    // Same effect as connect(), with the endpoints already resolved and the shard
-    // locks already held: _connect_resolved_locked performs the identical
-    // duplicate test and the identical two-sided bookkeeping, in the same order,
-    // so the resulting guid lists, pointer sets and reverse edges are exactly what
-    // the per-edge connect loop produced.
     size_t created = 0;
     for (size_t i = 0; i < count; ++i) {
         if (pending[i] == 0) {
             continue;
         }
-        if (_connect_resolved_locked(endpoints[from_ends[i]].vertex,
-                                     endpoints[to_ends[i]].vertex)) {
+        EdgeId edge_id;
+        if (_create_edge_locked(endpoints[from_ends[i]].vertex,
+                                endpoints[to_ends[i]].vertex,
+                                EdgeDirectionType::directed, {}, nullptr,
+                                /*via_gdi_api=*/false, edge_id) == GdiStatus::ok) {
             ++created;
         } else {
-            verdicts[i] = EdgeOutcome::duplicate_edge; // already present
+            verdicts[i] = EdgeOutcome::duplicate_edge; // already present (or refused)
         }
     }
     if (want_outcomes) {
@@ -513,6 +843,25 @@ size_t Graph::connect_bulk(kimix::span<EdgeRequest const> edges,
         }
     }
     return created;
+}
+
+GdiStatus Graph::edge_set_direction(kimix::Guid const &edge, EdgeDirectionType direction) {
+    if (!_check_writer()) {
+        return GdiStatus::error_state;
+    }
+    if (direction != EdgeDirectionType::directed &&
+        direction != EdgeDirectionType::undirected) {
+        return GdiStatus::error_edge_orientation;
+    }
+    size_t const shard = EdgeTable::shard_of(edge);
+    std::unique_lock<std::shared_mutex> lock(_edges.shard_mutex(shard));
+    Edge *record = _edges._find_locked(shard, edge);
+    if (record == nullptr) {
+        return GdiStatus::error_uid;
+    }
+    record->_direction = direction;
+    record->mark_dirty();
+    return GdiStatus::ok;
 }
 
 bool Graph::reserve_links(kimix::Guid const &guid, size_t outgoing, size_t incoming) {
@@ -923,6 +1272,8 @@ void Graph::mark_dirty() noexcept {
             }
         }
     }
+    // A full save rewrites the edge family too (they are separate records now).
+    _edges.mark_dirty();
 }
 
 void Graph::clear_dirty() noexcept {
@@ -934,6 +1285,7 @@ void Graph::clear_dirty() noexcept {
             }
         }
     }
+    _edges.clear_dirty();
 }
 
 kimix::vector<DirtyVertex> Graph::dirty_vertices() const {
@@ -956,6 +1308,395 @@ kimix::vector<DirtyVertex> Graph::dirty_vertices() const {
         }
     }
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// Loader-only adoption
+// ---------------------------------------------------------------------------
+
+GdiStatus Graph::adopt_vertex(kimix::unique_ptr<Vertex> vertex) {
+    if (!vertex) {
+        return GdiStatus::error_argument;
+    }
+    if (!_check_writer()) {
+        return GdiStatus::error_state;
+    }
+    kimix::Guid const guid = vertex->guid();
+    bool const keyed = vertex->has_key();
+    VertexKey const key = keyed ? vertex->key() : VertexKey{};
+    Shard &shard = _shards[_shard_of(guid)];
+    {
+        std::unique_lock<std::shared_mutex> lock(shard.mutex);
+        if (!shard.vertices.try_emplace(guid, std::move(vertex)).second) {
+            return GdiStatus::error_vertex;
+        }
+        _size.fetch_add(1, std::memory_order_relaxed);
+        _bump_structure();
+    }
+    restore_removed_vertex(guid);
+    if (keyed) {
+        // Level 4, after the vertex shard is released. A store whose records
+        // disagree about uniqueness leaves the vertex in place but unindexed:
+        // the load counts it and carries on rather than dropping a vertex whose
+        // edges are still resolvable.
+        (void)_keys.insert(key, guid);
+    }
+    return GdiStatus::ok;
+}
+
+GdiStatus Graph::adopt_edge(kimix::unique_ptr<Edge> edge) {
+    if (!edge) {
+        return GdiStatus::error_argument;
+    }
+    if (!_check_writer()) {
+        return GdiStatus::error_state;
+    }
+    EdgeId const id = edge->id();
+    kimix::Guid const origin = edge->origin();
+    kimix::Guid const target = edge->target();
+    if (origin == target && !_options.allow_self_edges) {
+        return GdiStatus::error_edge;
+    }
+    if (!_edges.insert(std::move(edge))) {
+        return GdiStatus::error_vertex; // a duplicate edge uid: treated as a bad record
+    }
+    restore_removed_edge(id);
+    // Link both sides, one ascending lock set for the two (or one) endpoint
+    // shards. The endpoints were inserted by the vertex pass, so a missing one is
+    // a dangling record, not a race.
+    size_t const origin_shard = _shard_of(origin);
+    size_t const target_shard = _shard_of(target);
+    if (origin_shard == target_shard) {
+        std::unique_lock<std::shared_mutex> lock(_shards[origin_shard].mutex);
+        Vertex *origin_vertex = _shards[origin_shard]._find(origin);
+        Vertex *target_vertex = _shards[origin_shard]._find(target);
+        if (origin_vertex == nullptr || target_vertex == nullptr) {
+            _edges.erase(id);
+            return GdiStatus::error_vertex;
+        }
+        origin_vertex->_add_out_link(id, target_vertex);
+        target_vertex->_add_in_link(id, origin_vertex);
+    } else {
+        size_t const first = origin_shard < target_shard ? origin_shard : target_shard;
+        size_t const second = origin_shard < target_shard ? target_shard : origin_shard;
+        std::unique_lock<std::shared_mutex> first_lock(_shards[first].mutex);
+        std::unique_lock<std::shared_mutex> second_lock(_shards[second].mutex);
+        Vertex *origin_vertex = _shards[origin_shard]._find(origin);
+        Vertex *target_vertex = _shards[target_shard]._find(target);
+        if (origin_vertex == nullptr || target_vertex == nullptr) {
+            _edges.erase(id);
+            return GdiStatus::error_vertex;
+        }
+        origin_vertex->_add_out_link(id, target_vertex);
+        target_vertex->_add_in_link(id, origin_vertex);
+    }
+    _bump_structure();
+    return GdiStatus::ok;
+}
+
+// ---------------------------------------------------------------------------
+// Edge payload (labels / properties): guarded by the edge's OWN SHARD
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Build a PropertyList copy of a bag, so the edge read-back and the vertex
+// read-back return the same shape.
+void copy_bag(PropertyBag const &bag, PropertyList &out) {
+    out.clear();
+    out.reserve(bag.size());
+    for (auto const &entry : bag) {
+        PropertyEntry item;
+        item.name = entry.first;
+        item.value = entry.second;
+        out.push_back(std::move(item));
+    }
+}
+
+} // namespace
+
+GdiStatus Graph::edge_add_label(kimix::Guid const &edge, LabelId label) {
+    if (!_check_writer()) {
+        return GdiStatus::error_state;
+    }
+    if (label == kNoLabel) {
+        return GdiStatus::error_label;
+    }
+    size_t const shard = EdgeTable::shard_of(edge);
+    std::unique_lock<std::shared_mutex> lock(_edges.shard_mutex(shard));
+    Edge *record = _edges._find_locked(shard, edge);
+    if (record == nullptr) {
+        return GdiStatus::error_uid;
+    }
+    if (std::find(record->_labels.begin(), record->_labels.end(), label) !=
+        record->_labels.end()) {
+        return GdiStatus::error_label; // already present (GDI AddLabel semantics)
+    }
+    record->_labels.push_back(label);
+    record->mark_dirty();
+    return GdiStatus::ok;
+}
+
+GdiStatus Graph::edge_remove_label(kimix::Guid const &edge, LabelId label) {
+    if (!_check_writer()) {
+        return GdiStatus::error_state;
+    }
+    size_t const shard = EdgeTable::shard_of(edge);
+    std::unique_lock<std::shared_mutex> lock(_edges.shard_mutex(shard));
+    Edge *record = _edges._find_locked(shard, edge);
+    if (record == nullptr) {
+        return GdiStatus::error_uid;
+    }
+    auto it = std::find(record->_labels.begin(), record->_labels.end(), label);
+    if (it == record->_labels.end()) {
+        return GdiStatus::error_label; // absent (GDI RemoveLabel semantics)
+    }
+    record->_labels.erase(it);
+    record->mark_dirty();
+    return GdiStatus::ok;
+}
+
+bool Graph::edge_labels(kimix::Guid const &edge, kimix::vector<LabelId> &out) const {
+    return _edges.labels(edge, out);
+}
+
+GdiStatus Graph::edge_add_property(kimix::Guid const &edge, PropNameId name,
+                                   PropertyValue value) {
+    if (!_check_writer()) {
+        return GdiStatus::error_state;
+    }
+    size_t const shard = EdgeTable::shard_of(edge);
+    std::unique_lock<std::shared_mutex> lock(_edges.shard_mutex(shard));
+    Edge *record = _edges._find_locked(shard, edge);
+    if (record == nullptr) {
+        return GdiStatus::error_uid;
+    }
+    if (record->_properties.find(name) != record->_properties.end()) {
+        return GdiStatus::error_property_exists;
+    }
+    record->_properties.emplace(name, std::move(value));
+    record->mark_dirty();
+    return GdiStatus::ok;
+}
+
+GdiStatus Graph::edge_set_property(kimix::Guid const &edge, PropNameId name,
+                                   PropertyValue value) {
+    if (!_check_writer()) {
+        return GdiStatus::error_state;
+    }
+    size_t const shard = EdgeTable::shard_of(edge);
+    std::unique_lock<std::shared_mutex> lock(_edges.shard_mutex(shard));
+    Edge *record = _edges._find_locked(shard, edge);
+    if (record == nullptr) {
+        return GdiStatus::error_uid;
+    }
+    auto it = record->_properties.find(name);
+    if (it == record->_properties.end()) {
+        return GdiStatus::error_no_property;
+    }
+    it->second = std::move(value);
+    record->mark_dirty();
+    return GdiStatus::ok;
+}
+
+GdiStatus Graph::edge_put_property(kimix::Guid const &edge, PropNameId name,
+                                   PropertyValue value) {
+    if (!_check_writer()) {
+        return GdiStatus::error_state;
+    }
+    size_t const shard = EdgeTable::shard_of(edge);
+    std::unique_lock<std::shared_mutex> lock(_edges.shard_mutex(shard));
+    Edge *record = _edges._find_locked(shard, edge);
+    if (record == nullptr) {
+        return GdiStatus::error_uid;
+    }
+    auto it = record->_properties.find(name);
+    if (it != record->_properties.end()) {
+        it->second = std::move(value);
+    } else {
+        record->_properties.emplace(name, std::move(value));
+    }
+    record->mark_dirty();
+    return GdiStatus::ok;
+}
+
+GdiStatus Graph::edge_remove_properties(kimix::Guid const &edge,
+                                        kimix::span<PropNameId const> names) {
+    if (!_check_writer()) {
+        return GdiStatus::error_state;
+    }
+    size_t const shard = EdgeTable::shard_of(edge);
+    std::unique_lock<std::shared_mutex> lock(_edges.shard_mutex(shard));
+    Edge *record = _edges._find_locked(shard, edge);
+    if (record == nullptr) {
+        return GdiStatus::error_uid;
+    }
+    for (auto name : names) {
+        // Removing an absent property is not an error (GDI RemoveProperties).
+        record->_properties.erase(name);
+    }
+    record->mark_dirty();
+    return GdiStatus::ok;
+}
+
+bool Graph::edge_properties(kimix::Guid const &edge, PropertyList &out) const {
+    size_t const shard = EdgeTable::shard_of(edge);
+    std::shared_lock<std::shared_mutex> lock(_edges.shard_mutex(shard));
+    Edge const *record = _edges._find_locked(shard, edge);
+    if (record == nullptr) {
+        return false;
+    }
+    copy_bag(record->_properties, out);
+    return true;
+}
+
+bool Graph::edge_property(kimix::Guid const &edge, PropNameId name,
+                          PropertyValue &out) const {
+    return _edges.property(edge, name, out);
+}
+
+bool Graph::edge_record(kimix::Guid const &edge, EdgeRecord &out) const {
+    return _edges.record(edge, out);
+}
+
+bool Graph::edge_endpoints(kimix::Guid const &edge, kimix::Guid &origin,
+                           kimix::Guid &target) const {
+    return _edges.endpoints(edge, origin, target);
+}
+
+void Graph::incident_edges(kimix::Guid const &vertex, EdgeOrientation orientation,
+                           kimix::vector<EdgeId> &out) const {
+    out.clear();
+    Shard const &shard = _shards[_shard_of(vertex)];
+    std::shared_lock<std::shared_mutex> lock(shard.mutex);
+    Vertex const *record = shard._find(vertex);
+    if (record == nullptr) {
+        return;
+    }
+    // One list scan per requested direction: the link list already IS the
+    // orientation, which is why an oriented read needs no incidence check.
+    if (orientation == EdgeOrientation::outgoing || orientation == EdgeOrientation::both) {
+        out.reserve(record->_out_links.size() + record->_in_links.size());
+        for (auto const &link : record->_out_links) {
+            out.push_back(link.edge);
+        }
+    }
+    if (orientation == EdgeOrientation::incoming || orientation == EdgeOrientation::both) {
+        out.reserve(record->_out_links.size() + record->_in_links.size());
+        for (auto const &link : record->_in_links) {
+            out.push_back(link.edge);
+        }
+    }
+}
+
+bool Graph::has_edge(kimix::Guid const &origin, kimix::Guid const &target) const {
+    Shard const &shard = _shards[_shard_of(origin)];
+    std::shared_lock<std::shared_mutex> lock(shard.mutex);
+    Vertex const *record = shard._find(origin);
+    if (record == nullptr) {
+        return false;
+    }
+    return _has_out_edge_locked(record, target);
+}
+
+bool Graph::has_incident_edges(kimix::Guid const &vertex, EdgeOrientation orientation) const {
+    Shard const &shard = _shards[_shard_of(vertex)];
+    std::shared_lock<std::shared_mutex> lock(shard.mutex);
+    Vertex const *record = shard._find(vertex);
+    if (record == nullptr) {
+        return false;
+    }
+    if ((orientation == EdgeOrientation::outgoing || orientation == EdgeOrientation::both) &&
+        !record->_out_links.empty()) {
+        return true;
+    }
+    if ((orientation == EdgeOrientation::incoming || orientation == EdgeOrientation::both) &&
+        !record->_in_links.empty()) {
+        return true;
+    }
+    return false;
+}
+
+kimix::vector<kimix::Guid> Graph::take_removed_vertices() {
+    kimix::vector<kimix::Guid> out;
+    out.swap(_removed_vertices);
+    return out;
+}
+
+kimix::vector<EdgeId> Graph::take_removed_edges() {
+    kimix::vector<EdgeId> out;
+    out.swap(_removed_edges);
+    return out;
+}
+
+void Graph::restore_removed_vertex(kimix::Guid const &guid) {
+    auto it = std::find(_removed_vertices.begin(), _removed_vertices.end(), guid);
+    if (it != _removed_vertices.end()) {
+        _removed_vertices.erase(it);
+    }
+}
+
+void Graph::restore_removed_edge(EdgeId const &edge) {
+    auto it = std::find(_removed_edges.begin(), _removed_edges.end(), edge);
+    if (it != _removed_edges.end()) {
+        _removed_edges.erase(it);
+    }
+}
+
+kimix::vector<kimix::Guid> Graph::vertex_guids() const {
+    kimix::vector<kimix::Guid> out;
+    for (auto const &shard : _shards) {
+        std::shared_lock<std::shared_mutex> lock(shard.mutex);
+        out.reserve(out.size() + shard.vertices.size());
+        for (auto const &entry : shard.vertices) {
+            out.push_back(entry.first);
+        }
+    }
+    return out;
+}
+
+kimix::vector<EdgeId> Graph::edge_ids() const {
+    kimix::vector<EdgeId> out;
+    for (size_t shard_index = 0; shard_index < kEdgeShardCount; ++shard_index) {
+        std::shared_lock<std::shared_mutex> lock(_edges.shard_mutex(shard_index));
+        _edges.ids_of_shard(shard_index, out);
+    }
+    return out;
+}
+
+void Graph::edge_restore_payload(EdgeId const &edge, kimix::span<const LabelId> labels,
+                                 PropertyList const &properties) {
+    size_t const shard = EdgeTable::shard_of(edge);
+    std::unique_lock<std::shared_mutex> lock(_edges.shard_mutex(shard));
+    Edge *record = _edges._find_locked(shard, edge);
+    if (record == nullptr) {
+        return;
+    }
+    record->_labels.clear();
+    for (auto label : labels) {
+        record->_labels.push_back(label);
+    }
+    record->_properties.clear();
+    for (auto const &entry : properties) {
+        record->_properties.emplace(entry.name, entry.value);
+    }
+    record->mark_dirty();
+}
+
+kimix::vector<EdgeRecord> Graph::dirty_edges() const {
+    return _edges.dirty_edges();
+}
+
+bool Graph::link_counts(kimix::Guid const &guid, size_t &outgoing, size_t &incoming) const {
+    Shard const &shard = _shards[_shard_of(guid)];
+    std::shared_lock<std::shared_mutex> lock(shard.mutex);
+    Vertex const *record = shard._find(guid);
+    if (record == nullptr) {
+        return false;
+    }
+    outgoing = record->_out_links.size();
+    incoming = record->_in_links.size();
+    return true;
 }
 
 } // namespace kimix::graph_db

@@ -41,6 +41,8 @@
 #pragma once
 
 #include <graph_db/graph.h>
+#include <graph_db/property.h>
+#include <graph_db/status.h>
 #include <graph_db/utils.h>
 #include <graph_db/vertex.h>
 
@@ -55,10 +57,43 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
+#include <ostream>
 #include <random>
 #include <system_error>
 #include <utility>
+
+// ---------------------------------------------------------------------------
+// Printers for the scoped enums
+// ---------------------------------------------------------------------------
+// Boost.UT formats both operands of a failed `eq(...)`, which needs an
+// operator<< in the enum's own namespace (ADL). Declaring them here — once, for
+// every graph_db suite — keeps the assertions readable as `eq(status, ...)`
+// instead of a cast soup. Test-only: the library never prints an enum.
+namespace kimix::graph_db {
+
+inline std::ostream &operator<<(std::ostream &os, GdiStatus status) {
+    return os << status_name(status) << " (" << static_cast<int32_t>(status) << ")";
+}
+
+inline std::ostream &operator<<(std::ostream &os, GdiOp op) {
+    return os << op_name(op) << " (" << static_cast<int>(op) << ")";
+}
+
+inline std::ostream &operator<<(std::ostream &os, PropertyKind kind) {
+    return os << property_kind_name(kind) << " (" << static_cast<int>(kind) << ")";
+}
+
+inline std::ostream &operator<<(std::ostream &os, GdiDataType type) {
+    return os << data_type_name(type) << " (" << static_cast<int>(type) << ")";
+}
+
+inline std::ostream &operator<<(std::ostream &os, GdiContainerType type) {
+    return os << container_type_name(type) << " (" << static_cast<int>(type) << ")";
+}
+
+} // namespace kimix::graph_db
 
 namespace kimix::graph_db::test {
 

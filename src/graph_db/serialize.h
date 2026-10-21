@@ -177,8 +177,11 @@
  */
 #pragma once
 
+#include "edge.h"
 #include "graph_db_api.h"
 #include "graph.h"
+#include "schema.h"
+#include "status.h"
 #include "utils.h"
 #include "vertex.h"
 
@@ -221,6 +224,37 @@ struct KIMIX_GRAPH_DB_API GraphSerializeStats {
     // Whole-call wall-clock time.
     double save_ms{0.0};
     double load_ms{0.0};
+
+    // --- format negotiation (P0) -------------------------------------------
+    // Outcome of the call as a status code. `ok` for every ordinary save/load;
+    // error_bad_file when the store's meta record announces a format this build
+    // cannot read (nothing is materialized in that case — a partial load of a
+    // newer store would be worse than a refusal);
+    // error_io when the storage is not open.
+    GdiStatus status{GdiStatus::ok};
+    // Format version this load/write saw: 1 when the store carried no meta
+    // record (a v1 store), kFormatVersion for a store this build wrote.
+    uint32_t format_version{0};
+    // True when a load read a v1 store and migrated it in memory: the vertices
+    // come from "GDB1" records with no key, no labels, no properties, and their
+    // dependency guids became edges with synthesized, deterministic ids.
+    bool migrated_from_v1{false};
+    // Edges materialized from a v1 dependency list (no edge record existed).
+    size_t synthesized_edge_count{0};
+    // Schema tables restored by this load (0 for a v1 store).
+    size_t restored_label_count{0};
+    size_t restored_property_type_count{0};
+    // Edges written / loaded by this call (a save writes the dirty ones).
+    size_t saved_edge_count{0};
+    size_t loaded_edge_count{0};
+    // Tombstones written by this save: an entity that was deleted since the last
+    // save is stored as an EMPTY value under its key (a save is a write
+    // transaction and cannot remove a key), and the loader treats an empty value
+    // as "gone". Without them a reload would resurrect the deleted entity.
+    size_t deleted_vertex_count{0};
+    size_t deleted_edge_count{0};
+    // Tombstones read (and skipped) by this load.
+    size_t tombstone_count{0};
 };
 
 /*
@@ -258,6 +292,22 @@ public:
      */
     GraphSerializeStats save_incremental(Graph &graph);
 
+    // The schema whose labels / property types are written alongside the records
+    // (borrowed; may be null, in which case the two "s/" tables are not written).
+    // A full save always writes them; an incremental save only when the schema's
+    // version differs from the one in the store's meta record.
+    void set_schema(Schema *schema) noexcept { _schema = schema; }
+    [[nodiscard]] Schema *schema() const noexcept { return _schema; }
+
+    // The metadata a save writes into "meta/root" (format version, store uuid,
+    // timestamps, schema version, id counters, graph name). A caller that owns a
+    // Schema hands its counters over here so a reload continues the id spaces;
+    // the Database does. When no meta has been set the serializer writes a
+    // default one (fresh store uuid, kFormatVersion) on its first save that has
+    // anything to write, so a store is never left half-versioned.
+    void set_meta(MetaRecord const &meta) { _meta = meta; }
+    [[nodiscard]] MetaRecord const &meta() const noexcept { return _meta; }
+
     // Compacted snapshot of the whole store into `target` (checkpoint).
     [[nodiscard]] bool copy_to(kimix::filesystem::path const &target) const noexcept {
         return _cold.copy_to(target);
@@ -268,10 +318,17 @@ public:
     }
 
 private:
-    // The shared pipeline behind save() and save_incremental().
-    GraphSerializeStats _write(Graph &graph);
+    // The shared pipeline behind save() and save_incremental(). `full` decides
+    // whether the meta record is written even when nothing else is.
+    GraphSerializeStats _write(Graph &graph, bool full);
 
     ColdStorage &_cold;
+    Schema *_schema{nullptr};
+    MetaRecord _meta{};
+    // The meta record of the call in flight (written in the same transaction as
+    // the records it describes) and whether it still has to go out.
+    MetaRecord _pending_meta{};
+    bool _meta_dirty{false};
     GraphSerializeStats _last_stats{};
 };
 
@@ -296,7 +353,10 @@ public:
      * problem and never fails because of a corrupt record: both are skipped and
      * counted. It returns empty stats only when the store is not open.
      */
-    GraphSerializeStats load(ColdStorage &cold, Graph &graph);
+    // `schema` (optional) receives the store's label / property-type tables, so a
+    // reload keeps its names and its id spaces. Without one the ids in the
+    // records are still restored verbatim (they are just un-nameable).
+    GraphSerializeStats load(ColdStorage &cold, Graph &graph, Schema *schema = nullptr);
 
     [[nodiscard]] GraphSerializeStats const &last_stats() const noexcept {
         return _last_stats;

@@ -1,0 +1,556 @@
+// Test for first-class edges (src/graph_db/edge.*, Graph::edge_*, Database edge
+// commands) — GDI §2.4 / §2.14.
+//
+// This test covers:
+// - edge identity: create -> endpoints -> free -> error_uid on a second free;
+// - PARALLEL edges between one ordered pair: three edges, three adjacency links,
+//   one neighbour from a neighbour read, and freeing one leaves two;
+// - direction: directed vs undirected x {outgoing, incoming, both} as an exact
+//   table (an undirected edge is incident in both directions);
+// - endpoint mutation: moving the origin moves the adjacency and nothing else,
+//   creating and collapsing a self loop;
+// - the self-loop option (refused when allow_self_edges is off);
+// - cascade: a vertex with two outgoing and two incoming edges loses all four
+//   when it is freed, and the neighbours' adjacency is clean;
+// - persistence: edge ids, direction, endpoints, labels and properties survive a
+//   save/load round trip, and an incremental save of one changed edge writes one
+//   record;
+// - the LEGACY connect/connect_bulk contract (one edge per ordered pair, no self
+//   loops, duplicate refusal) is unchanged by the new model.
+#include "ut/ut.hpp"
+
+#include "graph_db_test_util.h"
+
+#include <core/kimix_core.h> // umbrella first: it fixes the winsock2.h order
+#include <core/fiber.h>
+
+#include <graph_db/database.h>
+#include <graph_db/edge.h>
+#include <graph_db/graph_db.h>
+#include <graph_db/status.h>
+
+#include <core/guid.h>
+#include <core/stl/string.h>
+#include <core/stl/vector.h>
+
+#include <algorithm>
+#include <cstddef>
+#include <utility>
+
+using namespace boost::ut;
+using namespace boost::ut::literals;
+using namespace kimix;
+using graph_db::Database;
+using graph_db::EdgeBulkRow;
+using graph_db::EdgeDirectionType;
+using graph_db::EdgeOrientation;
+using graph_db::EdgePage;
+using graph_db::EdgeRecord;
+using graph_db::GdiDataType;
+using graph_db::GdiStatus;
+using graph_db::Graph;
+using graph_db::GraphSerializeStats;
+using graph_db::LabelId;
+using graph_db::NamedPropertyList;
+using graph_db::PropNameId;
+using graph_db::PropertyValue;
+using graph_db::VertexCreateResult;
+using graph_db::VertexKeyView;
+using graph_db::VertexPage;
+namespace gtest = kimix::graph_db::test;
+
+namespace {
+
+inline VertexKeyView view_of(LabelId label, kimix::vector<std::byte> const &bytes) {
+    return VertexKeyView{label, kimix::span<const std::byte>{bytes.data(), bytes.size()}};
+}
+
+// A fixture with the labels/property types the edge cases need.
+struct fixture {
+    Database db;
+    LabelId node{};
+    LabelId link{};
+    PropNameId weight{};
+
+    fixture() {
+        expect(eq(db.schema().create_label("node", node), GdiStatus::ok));
+        expect(eq(db.schema().create_label("link", link), GdiStatus::ok));
+        graph_db::PropertyTypeInfo info;
+        info.name = "weight";
+        info.data = GdiDataType::double_;
+        expect(eq(db.create_property_type(info, weight), GdiStatus::ok));
+    }
+
+    Guid vertex(kimix::string_view external) {
+        auto const bytes = gtest::to_bytes(external);
+        VertexCreateResult created;
+        expect(eq(db.create_vertex(view_of(node, bytes), {}, nullptr, created), GdiStatus::ok));
+        return created.uid;
+    }
+};
+
+// The edge ids incident to `uid` in one orientation, sorted, for exact matrix
+// comparisons.
+kimix::vector<kimix::string> incident_text(Database const &db, Guid const &uid,
+                                           EdgeOrientation orientation) {
+    kimix::vector<Guid> ids;
+    db.graph().incident_edges(uid, orientation, ids);
+    return gtest::sorted_guid_text(ids);
+}
+
+} // namespace
+
+int main(int argc, char *argv[]) {
+    boost::ut::detail::cfg::parse_arg_with_fallback(argc, const_cast<const char **>(argv));
+
+    kimix::fiber::scheduler sched{4u};
+
+    "edge_identity"_test = [] {
+        fixture f;
+        Guid const a = f.vertex("a");
+        Guid const b = f.vertex("b");
+        Guid edge;
+        expect(eq(f.db.edge_create(a, b, EdgeDirectionType::directed, {}, nullptr, edge),
+                  GdiStatus::ok));
+        expect(static_cast<bool>(edge)) << "a fresh edge gets a real uid";
+
+        Guid origin;
+        Guid target;
+        expect(eq(f.db.get_edge_endpoints(edge, origin, target), GdiStatus::ok));
+        expect(origin == a);
+        expect(target == b);
+
+        EdgeRecord record;
+        expect(f.db.graph().edge_record(edge, record));
+        expect(record.id == edge);
+        expect(record.origin == a);
+        expect(record.target == b);
+        expect(record.direction == EdgeDirectionType::directed);
+        expect(!record.is_self_loop());
+
+        expect(eq(f.db.edge_free(edge), GdiStatus::ok));
+        expect(eq(f.db.edge_free(edge), GdiStatus::error_uid))
+            << "a second free reports ErrorUid";
+        expect(eq(f.db.graph().edges().size(), size_t{0}));
+        expect(!f.db.graph().edge_record(edge, record));
+        // The endpoints are untouched by an edge removal.
+        expect(f.db.graph().contains(a));
+        expect(f.db.graph().contains(b));
+        expect(incident_text(f.db, a, EdgeOrientation::both).empty());
+    };
+
+    "edge_parallel_multi_edges"_test = [] {
+        fixture f;
+        Guid const a = f.vertex("a");
+        Guid const b = f.vertex("b");
+
+        kimix::vector<Guid> edges;
+        for (int i = 0; i < 3; ++i) {
+            Guid edge;
+            expect(eq(f.db.edge_create(a, b, EdgeDirectionType::directed, {}, nullptr, edge),
+                      GdiStatus::ok));
+            edges.push_back(edge);
+        }
+        // Three adjacency entries on each side, three distinct ids.
+        kimix::vector<Guid> out_ids;
+        f.db.graph().incident_edges(a, EdgeOrientation::outgoing, out_ids);
+        expect(eq(out_ids.size(), size_t{3})) << "parallel edges are three edges";
+        kimix::vector<Guid> in_ids;
+        f.db.graph().incident_edges(b, EdgeOrientation::incoming, in_ids);
+        expect(eq(in_ids.size(), size_t{3}));
+
+        // A neighbour read collapses them to ONE neighbour.
+        VertexPage page;
+        expect(eq(f.db.get_neighbor_vertices(a, graph_db::Constraint{},
+                                             EdgeOrientation::outgoing, 0, page),
+                  GdiStatus::ok));
+        expect(eq(page.total_count, size_t{1}))
+            << "multi-edges do not multiply neighbours (reachability is unchanged)";
+        // The edge read returns all three.
+        EdgePage edge_page;
+        expect(eq(f.db.get_edges_of_vertex(a, graph_db::Constraint{},
+                                           EdgeOrientation::outgoing, 0, edge_page),
+                  GdiStatus::ok));
+        expect(eq(edge_page.total_count, size_t{3}));
+
+        // Freeing ONE leaves two.
+        expect(eq(f.db.edge_free(edges[1]), GdiStatus::ok));
+        expect(eq(f.db.graph().edges().size(), size_t{2}));
+        expect(eq(f.db.count_neighbors(a, graph_db::Constraint{},
+                                       EdgeOrientation::outgoing, page.total_count),
+                  GdiStatus::ok));
+        expect(eq(page.total_count, size_t{1}));
+        f.db.graph().incident_edges(a, EdgeOrientation::outgoing, out_ids);
+        expect(eq(out_ids.size(), size_t{2}));
+    };
+
+    "edge_direction_and_orientation_matrix"_test = [] {
+        fixture f;
+        Guid const hub = f.vertex("hub");
+        Guid const out = f.vertex("out");
+        Guid const in = f.vertex("in");
+        Guid const both = f.vertex("both");
+
+        Guid out_edge;
+        Guid in_edge;
+        Guid both_edge;
+        expect(eq(f.db.edge_create(hub, out, EdgeDirectionType::directed, {}, nullptr, out_edge),
+                  GdiStatus::ok));
+        expect(eq(f.db.edge_create(in, hub, EdgeDirectionType::directed, {}, nullptr, in_edge),
+                  GdiStatus::ok));
+        expect(eq(f.db.edge_create(hub, both, EdgeDirectionType::undirected, {}, nullptr,
+                                   both_edge),
+                  GdiStatus::ok));
+
+        // Outgoing: the hub is the origin (the directed one and the undirected one).
+        auto const outgoing = incident_text(f.db, hub, EdgeOrientation::outgoing);
+        auto const expected_outgoing = gtest::sorted_guid_text(
+            kimix::vector<Guid>{out_edge, both_edge});
+        expect(outgoing == expected_outgoing);
+
+        // Incoming: the hub is the target.
+        auto const incoming = incident_text(f.db, hub, EdgeOrientation::incoming);
+        auto const expected_incoming = gtest::sorted_guid_text(kimix::vector<Guid>{in_edge});
+        expect(incoming == expected_incoming);
+
+        // Both: the union.
+        auto const all = incident_text(f.db, hub, EdgeOrientation::both);
+        auto const expected_all =
+            gtest::sorted_guid_text(kimix::vector<Guid>{out_edge, in_edge, both_edge});
+        expect(all == expected_all);
+
+        // An undirected edge still has an origin/target, and INCIDENCE follows those
+        // endpoints exactly like the reference backend's IsIncident (which does not
+        // special-case the direction flag): the edge above is outgoing for the hub
+        // and incoming for `both`, never both at once.
+        Guid origin;
+        Guid target;
+        expect(eq(f.db.get_edge_endpoints(both_edge, origin, target), GdiStatus::ok));
+        expect(origin == hub);
+        expect(target == both);
+
+        // Toggling the direction changes no adjacency, only the flag.
+        expect(eq(f.db.set_edge_direction(out_edge, EdgeDirectionType::undirected), GdiStatus::ok));
+        EdgeRecord record;
+        expect(f.db.graph().edge_record(out_edge, record));
+        expect(record.direction == EdgeDirectionType::undirected);
+        expect(incident_text(f.db, hub, EdgeOrientation::outgoing) == expected_outgoing)
+            << "direction is a property of the edge, not of the adjacency";
+        expect(eq(f.db.set_edge_direction(out_edge, static_cast<EdgeDirectionType>(7)),
+                  GdiStatus::error_edge_orientation));
+    };
+
+    "edge_endpoint_mutation"_test = [] {
+        fixture f;
+        Guid const a = f.vertex("a");
+        Guid const b = f.vertex("b");
+        Guid const c = f.vertex("c");
+        Guid edge;
+        expect(eq(f.db.edge_create(a, b, EdgeDirectionType::directed, {}, nullptr, edge),
+                  GdiStatus::ok));
+
+        // Move the origin a -> c: a's outgoing list loses it, c's gains it, b only
+        // keeps its incoming link.
+        expect(eq(f.db.set_edge_origin(edge, c), GdiStatus::ok));
+        Guid origin;
+        Guid target;
+        expect(eq(f.db.get_edge_endpoints(edge, origin, target), GdiStatus::ok));
+        expect(origin == c);
+        expect(target == b);
+        expect(incident_text(f.db, a, EdgeOrientation::outgoing).empty());
+        expect(eq(incident_text(f.db, c, EdgeOrientation::outgoing).size(), size_t{1}));
+        expect(eq(incident_text(f.db, b, EdgeOrientation::incoming).size(), size_t{1}));
+
+        // Move the target b -> a.
+        expect(eq(f.db.set_edge_target(edge, a), GdiStatus::ok));
+        expect(eq(f.db.get_edge_endpoints(edge, origin, target), GdiStatus::ok));
+        expect(origin == c);
+        expect(target == a);
+        expect(incident_text(f.db, b, EdgeOrientation::incoming).empty());
+        expect(eq(incident_text(f.db, a, EdgeOrientation::incoming).size(), size_t{1}));
+
+        // A missing endpoint is ErrorVertex and moves nothing.
+        Guid const ghost{true};
+        expect(eq(f.db.set_edge_origin(edge, ghost), GdiStatus::error_vertex));
+        expect(eq(f.db.get_edge_endpoints(edge, origin, target), GdiStatus::ok));
+        expect(origin == c) << "a refused move leaves the edge where it was";
+
+        // Self loop: c -> c, which collapses both links onto one vertex.
+        expect(eq(f.db.set_edge_target(edge, c), GdiStatus::ok));
+        expect(eq(f.db.get_edge_endpoints(edge, origin, target), GdiStatus::ok));
+        expect(origin == c);
+        expect(target == c);
+        expect(eq(incident_text(f.db, c, EdgeOrientation::outgoing).size(), size_t{1}));
+        expect(eq(incident_text(f.db, c, EdgeOrientation::incoming).size(), size_t{1}));
+        expect(incident_text(f.db, a, EdgeOrientation::both).empty());
+        expect(eq(f.db.graph().edges().size(), size_t{1}));
+    };
+
+    "edge_self_loop_option"_test = [] {
+        fixture f;
+        Guid const a = f.vertex("a");
+
+        graph_db::GraphOptions options;
+        options.allow_self_edges = false;
+        f.db.set_options(options);
+        Guid blocked;
+        expect(eq(f.db.edge_create(a, a, EdgeDirectionType::directed, {}, nullptr, blocked),
+                  GdiStatus::error_edge))
+            << "allow_self_edges = false refuses the loop";
+
+        options.allow_self_edges = true;
+        f.db.set_options(options);
+        Guid allowed;
+        expect(eq(f.db.edge_create(a, a, EdgeDirectionType::directed, {}, nullptr, allowed),
+                  GdiStatus::ok));
+        expect(eq(f.db.graph().edges().size(), size_t{1}));
+        // A self loop is ONE adjacency entry on each side of the same vertex.
+        expect(eq(incident_text(f.db, a, EdgeOrientation::both).size(), size_t{2}))
+            << "the loop is its own incoming and outgoing edge";
+    };
+
+    "edge_cascade_free_vertex"_test = [] {
+        fixture f;
+        Guid const victim = f.vertex("victim");
+        Guid const out1 = f.vertex("out1");
+        Guid const out2 = f.vertex("out2");
+        Guid const in1 = f.vertex("in1");
+        Guid const in2 = f.vertex("in2");
+
+        kimix::vector<Guid> edges;
+        for (auto const &target : {out1, out2}) {
+            Guid edge;
+            expect(eq(f.db.edge_create(victim, target, EdgeDirectionType::directed, {}, nullptr,
+                                       edge),
+                      GdiStatus::ok));
+            edges.push_back(edge);
+        }
+        for (auto const &source : {in1, in2}) {
+            Guid edge;
+            expect(eq(f.db.edge_create(source, victim, EdgeDirectionType::directed, {}, nullptr,
+                                       edge),
+                      GdiStatus::ok));
+            edges.push_back(edge);
+        }
+        expect(eq(f.db.graph().edges().size(), size_t{4}));
+
+        expect(eq(f.db.free_vertex(victim), GdiStatus::ok)) << "FreeVertex cascades";
+        expect(eq(f.db.graph().edges().size(), size_t{0})) << "every incident edge is gone";
+        for (auto const &edge : edges) {
+            EdgeRecord record;
+            expect(!f.db.graph().edge_record(edge, record))
+                << "a cascaded edge is not addressable any more";
+            expect(eq(f.db.edge_free(edge), GdiStatus::error_uid));
+        }
+        // The neighbours' adjacency is clean.
+        for (auto const &other : {out1, out2, in1, in2}) {
+            expect(incident_text(f.db, other, EdgeOrientation::both).empty());
+            expect(f.db.graph().contains(other));
+        }
+    };
+
+    "edge_persistence_round_trip"_test = [] {
+        gtest::temp_dir_guard dir;
+        expect(dir.ok());
+        if (!dir.ok()) {
+            return;
+        }
+        Guid a;
+        Guid b;
+        Guid edge;
+        {
+            Database db;
+            expect(eq(db.open(dir.path()), GdiStatus::ok));
+            LabelId node{};
+            LabelId link{};
+            expect(eq(db.schema().create_label("node", node), GdiStatus::ok));
+            expect(eq(db.schema().create_label("link", link), GdiStatus::ok));
+            graph_db::PropertyTypeInfo info;
+            info.name = "weight";
+            info.data = GdiDataType::double_;
+            PropNameId weight{};
+            expect(eq(db.create_property_type(info, weight), GdiStatus::ok));
+
+            auto const a_bytes = gtest::to_bytes("a");
+            auto const b_bytes = gtest::to_bytes("b");
+            VertexCreateResult created_a;
+            VertexCreateResult created_b;
+            expect(eq(db.create_vertex(view_of(node, a_bytes), {}, nullptr, created_a),
+                      GdiStatus::ok));
+            expect(eq(db.create_vertex(view_of(node, b_bytes), {}, nullptr, created_b),
+                      GdiStatus::ok));
+            a = created_a.uid;
+            b = created_b.uid;
+            LabelId const labels[]{link};
+            graph_db::PropertyList properties;
+            graph_db::PropertyEntry entry;
+            entry.name = weight;
+            entry.value = PropertyValue::make_double(0.75);
+            properties.push_back(entry);
+            expect(eq(db.edge_create(a, b, EdgeDirectionType::undirected,
+                                     kimix::span<const LabelId>{labels, 1}, &properties, edge),
+                      GdiStatus::ok));
+            expect(eq(db.persist(/*full=*/true), GdiStatus::ok));
+
+            // One changed edge -> exactly one incremental record.
+            expect(eq(db.set_edge_direction(edge, EdgeDirectionType::directed), GdiStatus::ok));
+            GraphSerializeStats stats;
+            bool const incremental = true;
+            expect(eq(db.persist(!incremental, &stats), GdiStatus::ok));
+            expect(eq(stats.saved_count, size_t{0})) << "no vertex record changed";
+            expect(eq(stats.saved_edge_count, size_t{1})) << "only the changed edge is written";
+        }
+
+        Database restored;
+        expect(eq(restored.open(dir.path()), GdiStatus::ok));
+        EdgeRecord record;
+        expect(restored.graph().edge_record(edge, record)) << "the edge id survived";
+        expect(record.origin == a);
+        expect(record.target == b);
+        expect(record.direction == EdgeDirectionType::directed) << "the update was persisted";
+        expect(eq(record.labels.size(), size_t{1}));
+        NamedPropertyList properties;
+        expect(eq(restored.get_edge_properties(edge, properties), GdiStatus::ok));
+        expect(eq(properties.size(), size_t{1}));
+        expect(properties[0].name == kimix::string{"weight"});
+        expect(properties[0].value.as_double() == 0.75);
+        kimix::vector<kimix::string> labels;
+        expect(eq(restored.get_edge_labels(edge, labels), GdiStatus::ok));
+        expect(eq(labels.size(), size_t{1}));
+        expect(labels[0] == kimix::string{"link"});
+        // Adjacency was rebuilt from the edge records.
+        expect(eq(incident_text(restored, a, EdgeOrientation::outgoing).size(), size_t{1}));
+        expect(eq(incident_text(restored, b, EdgeOrientation::incoming).size(), size_t{1}));
+    };
+
+    "edge_and_vertex_deletion_survive_a_reload"_test = [] {
+        // A save is a WRITE transaction and cannot remove a key, so the serializer
+        // stores an EMPTY value (a tombstone) under a deleted entity's key. Without
+        // that the next load would resurrect it — this test is the guard.
+        gtest::temp_dir_guard dir;
+        expect(dir.ok());
+        if (!dir.ok()) {
+            return;
+        }
+        LabelId node{};
+        Guid kept;
+        Guid doomed_edge;
+        Guid doomed_vertex;
+        {
+            Database db;
+            expect(eq(db.open(dir.path()), GdiStatus::ok));
+            expect(eq(db.schema().create_label("node", node), GdiStatus::ok));
+            auto const a_bytes = gtest::to_bytes("a");
+            auto const b_bytes = gtest::to_bytes("b");
+            auto const c_bytes = gtest::to_bytes("c");
+            VertexCreateResult a;
+            VertexCreateResult b;
+            VertexCreateResult c;
+            expect(eq(db.create_vertex(view_of(node, a_bytes), {}, nullptr, a), GdiStatus::ok));
+            expect(eq(db.create_vertex(view_of(node, b_bytes), {}, nullptr, b), GdiStatus::ok));
+            expect(eq(db.create_vertex(view_of(node, c_bytes), {}, nullptr, c), GdiStatus::ok));
+            Guid ab;
+            Guid bc;
+            expect(eq(db.edge_create(a.uid, b.uid, EdgeDirectionType::directed, {}, nullptr, ab),
+                      GdiStatus::ok));
+            expect(eq(db.edge_create(b.uid, c.uid, EdgeDirectionType::directed, {}, nullptr, bc),
+                      GdiStatus::ok));
+            expect(eq(db.persist(/*full=*/true), GdiStatus::ok));
+            kept = bc;
+            doomed_edge = ab;
+            doomed_vertex = c.uid;
+
+            // Delete one edge and one vertex, then save incrementally.
+            expect(eq(db.edge_free(ab), GdiStatus::ok));
+            expect(eq(db.free_vertex(c.uid), GdiStatus::ok)) << "this cascades the bc edge";
+            GraphSerializeStats stats;
+            bool const full = false;
+            expect(eq(db.persist(full, &stats), GdiStatus::ok));
+            expect(eq(stats.deleted_edge_count, size_t{2}))
+                << "the freed edge and the cascaded one are both tombstoned";
+            expect(eq(stats.deleted_vertex_count, size_t{1}));
+        }
+        Database restored;
+        expect(eq(restored.open(dir.path()), GdiStatus::ok));
+        EdgeRecord record;
+        expect(!restored.graph().edge_record(doomed_edge, record))
+            << "a deleted edge must not come back";
+        expect(!restored.graph().edge_record(kept, record));
+        expect(!restored.graph().contains(doomed_vertex))
+            << "a deleted vertex must not come back";
+        expect(restored.last_stats().tombstone_count >= 3)
+            << "the loader recognised the empty values as tombstones, not as corrupt records";
+        expect(eq(restored.last_stats().skipped_count, size_t{0}))
+            << "a tombstone is not a corrupt record";
+        // The surviving endpoint is intact and has no dangling adjacency.
+        kimix::vector<Guid> incident;
+        restored.graph().incident_edges(doomed_vertex, EdgeOrientation::both, incident);
+        expect(incident.empty());
+    };
+
+    "edge_legacy_connect_contract_unchanged"_test = [] {
+        // The container API keeps its epoch-1..3 semantics even though edges are
+        // now objects: one directed edge per ordered pair, no self loop, and the
+        // same EdgeOutcome vocabulary.
+        Graph graph;
+        auto *a = graph.create_vertex(gtest::to_bytes("a"));
+        auto *b = graph.create_vertex(gtest::to_bytes("b"));
+        expect(a != nullptr);
+        expect(b != nullptr);
+        expect(graph.connect(a->guid(), b->guid()));
+        expect(!graph.connect(a->guid(), b->guid())) << "a second edge is refused";
+        expect(!graph.connect(a->guid(), a->guid())) << "a self loop is refused";
+        expect(eq(graph.dependencies(a->guid()).size(), size_t{1}));
+        expect(eq(graph.dependents(b->guid()).size(), size_t{1}));
+        expect(eq(graph.edges().size(), size_t{1})) << "the edge is a record too";
+
+        kimix::vector<graph_db::EdgeOutcome> outcomes(4, graph_db::EdgeOutcome::created);
+        kimix::vector<graph_db::EdgeRequest> batch;
+        batch.push_back(graph_db::EdgeRequest{a->guid(), b->guid()});   // duplicate
+        batch.push_back(graph_db::EdgeRequest{b->guid(), a->guid()});   // new
+        batch.push_back(graph_db::EdgeRequest{a->guid(), a->guid()});   // self
+        Guid const ghost{true};
+        batch.push_back(graph_db::EdgeRequest{a->guid(), ghost});       // missing target
+        size_t const created = graph.connect_bulk(
+            kimix::span<graph_db::EdgeRequest const>{batch.data(), batch.size()},
+            kimix::span<graph_db::EdgeOutcome>{outcomes.data(), outcomes.size()});
+        expect(eq(created, size_t{1}));
+        expect(outcomes[0] == graph_db::EdgeOutcome::duplicate_edge);
+        expect(outcomes[1] == graph_db::EdgeOutcome::created);
+        expect(outcomes[2] == graph_db::EdgeOutcome::self_edge);
+        expect(outcomes[3] == graph_db::EdgeOutcome::missing_target);
+        expect(graph.disconnect(a->guid(), b->guid()));
+        expect(!graph.disconnect(a->guid(), b->guid()));
+        // a -> b was just disconnected; the b -> a edge created by connect_bulk
+        // is what remains, so reachability runs the other way round.
+        expect(!graph.has_path(a->guid(), b->guid()));
+        expect(graph.has_path(b->guid(), a->guid()));
+    };
+
+    "edge_lookup_errors"_test = [] {
+        fixture f;
+        Guid const a = f.vertex("a");
+        Guid const ghost{true};
+        Guid edge;
+        expect(eq(f.db.edge_create(a, ghost, EdgeDirectionType::directed, {}, nullptr, edge),
+                  GdiStatus::error_vertex))
+            << "a missing endpoint is ErrorVertex";
+        expect(eq(f.db.edge_create(ghost, a, EdgeDirectionType::directed, {}, nullptr, edge),
+                  GdiStatus::error_vertex));
+        // A label id that is not registered.
+        LabelId const unregistered{4242};
+        LabelId const labels[]{unregistered};
+        expect(eq(f.db.edge_create(a, a, EdgeDirectionType::directed,
+                                   kimix::span<const LabelId>{labels, 1}, nullptr, edge),
+                  GdiStatus::error_label));
+        // Every read of an unknown uid is ErrorUid.
+        Guid origin;
+        Guid target;
+        expect(eq(f.db.get_edge_endpoints(ghost, origin, target), GdiStatus::error_uid));
+        NamedPropertyList properties;
+        expect(eq(f.db.get_edge_properties(ghost, properties), GdiStatus::error_uid));
+        kimix::vector<kimix::string> labels_out;
+        expect(eq(f.db.get_edge_labels(ghost, labels_out), GdiStatus::error_uid));
+        expect(eq(f.db.add_edge_label(ghost, f.link), GdiStatus::error_uid));
+    };
+}

@@ -80,6 +80,8 @@ void Vertex::touch() {
 // ---------------------------------------------------------------------------
 
 bool Vertex::depends_on(kimix::Guid const &guid) const noexcept {
+    // The maintained projection, not the link list: both hold one entry per
+    // outgoing EDGE, so a parallel edge is found the same way.
     return std::find(_depending_guids.begin(), _depending_guids.end(), guid) !=
            _depending_guids.end();
 }
@@ -90,8 +92,10 @@ void Vertex::reserve_links(size_t outgoing, size_t incoming) {
     // or move an element out of it.
     _depending.reserve(outgoing);
     _depending_guids.reserve(outgoing);
+    _out_links.reserve(outgoing);
     _depended.reserve(incoming);
     _depended_guids.reserve(incoming);
+    _in_links.reserve(incoming);
 }
 
 kimix::vector<Vertex *> Vertex::depending() const {
@@ -112,68 +116,257 @@ kimix::vector<Vertex *> Vertex::depended() const {
     return out;
 }
 
-void Vertex::_add_depending(Vertex *other) {
-    if (other == nullptr) {
-        return;
-    }
-    if (_depending.insert(other).second) {
-        _depending_guids.push_back(other->guid());
-    }
-}
-
-bool Vertex::_add_depending_if_absent(Vertex *other) {
-    if (other == nullptr) {
-        return false;
-    }
-    if (!_depending.insert(other).second) {
-        return false;
-    }
-    _depending_guids.push_back(other->guid());
-    return true;
-}
-
-void Vertex::_remove_depending(Vertex *other) {
-    if (other == nullptr) {
-        return;
-    }
-    if (_depending.erase(other) == 0) {
-        return;
-    }
-    auto const &guid = other->guid();
-    auto it = std::find(_depending_guids.begin(), _depending_guids.end(), guid);
-    if (it != _depending_guids.end()) {
-        _depending_guids.erase(it);
-    }
-}
-
-void Vertex::_add_depended(Vertex *other) {
-    if (other == nullptr) {
-        return;
-    }
-    if (_depended.insert(other).second) {
-        _depended_guids.push_back(other->guid());
-    }
-}
-
-void Vertex::_remove_depended(Vertex *other) {
-    if (other == nullptr) {
-        return;
-    }
-    if (_depended.erase(other) == 0) {
-        return;
-    }
-    auto const &guid = other->guid();
-    auto it = std::find(_depended_guids.begin(), _depended_guids.end(), guid);
-    if (it != _depended_guids.end()) {
-        _depended_guids.erase(it);
-    }
-}
-
 void Vertex::_clear_links() noexcept {
     _depending.clear();
     _depended.clear();
     _depending_guids.clear();
     _depended_guids.clear();
+    _out_links.clear();
+    _in_links.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Edge links (caller holds this vertex's shard UNIQUE lock)
+// ---------------------------------------------------------------------------
+
+void Vertex::_add_out_link(kimix::Guid const &edge, Vertex *neighbour) {
+    kimix::Guid const neighbour_guid = neighbour != nullptr ? neighbour->guid() : kimix::Guid{};
+    _out_links.push_back(EdgeLink{edge, neighbour_guid});
+    _depending_guids.push_back(neighbour_guid);
+    if (neighbour != nullptr) {
+        _depending.insert(neighbour);
+    }
+}
+
+void Vertex::_add_in_link(kimix::Guid const &edge, Vertex *neighbour) {
+    kimix::Guid const neighbour_guid = neighbour != nullptr ? neighbour->guid() : kimix::Guid{};
+    _in_links.push_back(EdgeLink{edge, neighbour_guid});
+    _depended_guids.push_back(neighbour_guid);
+    if (neighbour != nullptr) {
+        _depended.insert(neighbour);
+    }
+}
+
+bool Vertex::_remove_out_link(kimix::Guid const &edge, Vertex *neighbour) {
+    for (size_t i = 0; i < _out_links.size(); ++i) {
+        if (_out_links[i].edge != edge) {
+            continue;
+        }
+        kimix::Guid const neighbour_guid = _out_links[i].neighbour;
+        _out_links.erase(_out_links.begin() + static_cast<ptrdiff_t>(i));
+        for (size_t k = 0; k < _depending_guids.size(); ++k) {
+            if (_depending_guids[k] == neighbour_guid) {
+                _depending_guids.erase(_depending_guids.begin() + static_cast<ptrdiff_t>(k));
+                break;
+            }
+        }
+        if (neighbour != nullptr) {
+            // Multi-edges: the neighbour only leaves the resolved set when its
+            // LAST parallel edge is gone, which is what keeps the set a true
+            // "distinct neighbours" view for traversals.
+            bool const still_linked =
+                std::any_of(_out_links.begin(), _out_links.end(),
+                            [&neighbour_guid](EdgeLink const &link) {
+                                return link.neighbour == neighbour_guid;
+                            });
+            if (!still_linked) {
+                _depending.erase(neighbour);
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+bool Vertex::_remove_in_link(kimix::Guid const &edge, Vertex *neighbour) {
+    for (size_t i = 0; i < _in_links.size(); ++i) {
+        if (_in_links[i].edge != edge) {
+            continue;
+        }
+        kimix::Guid const neighbour_guid = _in_links[i].neighbour;
+        _in_links.erase(_in_links.begin() + static_cast<ptrdiff_t>(i));
+        for (size_t k = 0; k < _depended_guids.size(); ++k) {
+            if (_depended_guids[k] == neighbour_guid) {
+                _depended_guids.erase(_depended_guids.begin() + static_cast<ptrdiff_t>(k));
+                break;
+            }
+        }
+        if (neighbour != nullptr) {
+            bool const still_linked =
+                std::any_of(_in_links.begin(), _in_links.end(),
+                            [&neighbour_guid](EdgeLink const &link) {
+                                return link.neighbour == neighbour_guid;
+                            });
+            if (!still_linked) {
+                _depended.erase(neighbour);
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Typed payload: labels and properties (vertex lock)
+// ---------------------------------------------------------------------------
+
+bool Vertex::add_property(PropNameId name, PropertyValue value) {
+    VertexUniqueLock guard(_mutex);
+    if (_properties.find(name) != _properties.end()) {
+        return false;
+    }
+    _properties.emplace(name, std::move(value));
+    _dirty.store(true, std::memory_order_release);
+    return true;
+}
+
+bool Vertex::set_property(PropNameId name, PropertyValue value) {
+    VertexUniqueLock guard(_mutex);
+    auto it = _properties.find(name);
+    if (it == _properties.end()) {
+        return false;
+    }
+    it->second = std::move(value);
+    _dirty.store(true, std::memory_order_release);
+    return true;
+}
+
+bool Vertex::put_property(PropNameId name, PropertyValue value) {
+    VertexUniqueLock guard(_mutex);
+    auto it = _properties.find(name);
+    bool const replaced = it != _properties.end();
+    if (replaced) {
+        it->second = std::move(value);
+    } else {
+        _properties.emplace(name, std::move(value));
+    }
+    _dirty.store(true, std::memory_order_release);
+    return replaced;
+}
+
+size_t Vertex::remove_properties(kimix::span<PropNameId const> names) {
+    VertexUniqueLock guard(_mutex);
+    size_t removed = 0;
+    for (auto name : names) {
+        auto it = _properties.find(name);
+        if (it == _properties.end()) {
+            continue; // GDI: removing an absent property is not an error
+        }
+        _properties.erase(it);
+        ++removed;
+    }
+    if (removed != 0) {
+        _dirty.store(true, std::memory_order_release);
+    }
+    return removed;
+}
+
+bool Vertex::has_property(PropNameId name) const {
+    VertexSharedLock guard(const_cast<kimix::shared_atomic_mutex &>(_mutex));
+    return _properties.find(name) != _properties.end();
+}
+
+bool Vertex::property(PropNameId name, PropertyValue &out) const {
+    VertexSharedLock guard(const_cast<kimix::shared_atomic_mutex &>(_mutex));
+    auto it = _properties.find(name);
+    if (it == _properties.end()) {
+        return false;
+    }
+    out = it->second;
+    return true;
+}
+
+void Vertex::properties(PropertyList &out) const {
+    VertexSharedLock guard(const_cast<kimix::shared_atomic_mutex &>(_mutex));
+    out.clear();
+    out.reserve(_properties.size());
+    for (auto const &entry : _properties) {
+        PropertyEntry item;
+        item.name = entry.first;
+        item.value = entry.second;
+        out.push_back(std::move(item));
+    }
+}
+
+PropertyList Vertex::property_list() const {
+    PropertyList out;
+    properties(out);
+    return out;
+}
+
+size_t Vertex::property_count() const {
+    VertexSharedLock guard(const_cast<kimix::shared_atomic_mutex &>(_mutex));
+    return _properties.size();
+}
+
+bool Vertex::add_label(LabelId label) {
+    VertexUniqueLock guard(_mutex);
+    if (std::find(_labels.begin(), _labels.end(), label) != _labels.end()) {
+        return false;
+    }
+    _labels.push_back(label);
+    _dirty.store(true, std::memory_order_release);
+    return true;
+}
+
+bool Vertex::remove_label(LabelId label) {
+    VertexUniqueLock guard(_mutex);
+    auto it = std::find(_labels.begin(), _labels.end(), label);
+    if (it == _labels.end()) {
+        return false;
+    }
+    _labels.erase(it);
+    _dirty.store(true, std::memory_order_release);
+    return true;
+}
+
+bool Vertex::has_label(LabelId label) const {
+    VertexSharedLock guard(const_cast<kimix::shared_atomic_mutex &>(_mutex));
+    return std::find(_labels.begin(), _labels.end(), label) != _labels.end();
+}
+
+void Vertex::labels(kimix::vector<LabelId> &out) const {
+    VertexSharedLock guard(const_cast<kimix::shared_atomic_mutex &>(_mutex));
+    out = _labels;
+}
+
+void Vertex::assign_payload(LabelId key_label, kimix::span<const std::byte> external_id,
+                            kimix::span<const LabelId> labels, PropertyList const &properties) {
+    _key_label = key_label;
+    _external_id = ExternalId::from_bytes(external_id);
+    _labels.clear();
+    for (auto label : labels) {
+        if (label != kNoLabel) {
+            _labels.push_back(label);
+        }
+    }
+    _properties.clear();
+    for (auto const &entry : properties) {
+        _properties.emplace(entry.name, entry.value);
+    }
+}
+
+void Vertex::restore_payload(kimix::span<const LabelId> labels,
+                             PropertyList const &properties) {
+    VertexUniqueLock guard(_mutex);
+    _labels.clear();
+    for (auto label : labels) {
+        if (label != kNoLabel) {
+            _labels.push_back(label);
+        }
+    }
+    _properties.clear();
+    for (auto const &entry : properties) {
+        _properties.emplace(entry.name, entry.value);
+    }
+    _dirty.store(true, std::memory_order_release);
+}
+
+VertexKey Vertex::key() const {
+    VertexKey out;
+    out.label = _key_label;
+    out.external_id = _external_id;
+    return out;
 }
 
 // ---------------------------------------------------------------------------

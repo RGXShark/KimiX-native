@@ -1,0 +1,272 @@
+/*
+ * schema.h — the schema registry of kimix-graph-db (GDI §2.5).
+ *
+ * One Schema per Database holds the three registries the GDI command layer
+ * addresses by NAME and the entities address by ID:
+ *
+ *   labels         name <-> LabelId          (Create/Find/GetAll/Update/Free)
+ *   property types name <-> PropNameId + the (container, dtype, count)
+ *                  declaration                 (Create/Find/GetAll/Update/Free)
+ *   constraints    ConstraintId -> AND-ed list of label/property conditions
+ *
+ * IDS ARE DENSE AND NEVER RECYCLED. Allocating an id is ++counter, so a freed
+ * name leaves a dead id behind forever; that is what makes a stale id in an
+ * entity's label set (or in a saved record) a detectable error instead of a
+ * silent alias of a new name. Both counters are persisted in the meta record, so
+ * a save/load cycle continues the space instead of restarting it.
+ *
+ * RENAME IS O(1) ON ENTITIES by construction: entities store ids, the registry
+ * stores names. Renaming therefore rewrites one name table entry and touches no
+ * vertex and no edge — the opposite of the C# reference backend, which has to
+ * walk every entity because it stores strings. Freeing IS O(n) on entities and
+ * deliberately so: the caller (Database) walks the graph and strips the id.
+ *
+ * CONCURRENCY. One std::shared_mutex guards all three registries. It is LEVEL 1
+ * of the database's lock hierarchy (see graph.h / README.md): a caller may hold
+ * no other database lock when it takes this one, and every method below releases
+ * it before returning. No method here calls back into the graph, which is what
+ * keeps that rule trivially true.
+ *
+ * Example:
+ *   kimix::graph_db::Schema schema;
+ *   kimix::graph_db::LabelId person{};
+ *   schema.create_label("person", person);
+ *   kimix::graph_db::PropertyTypeInfo info;
+ *   info.name = "age";
+ *   info.data = kimix::graph_db::GdiDataType::int64;
+ *   kimix::graph_db::PropNameId age{};
+ *   schema.create_property_type(info, age);
+ */
+#pragma once
+
+#include "graph_db_api.h"
+#include "property.h"
+#include "status.h"
+
+#include <core/guid.h>
+#include <core/memory.h>
+#include <core/stl/string.h>
+#include <core/stl/unordered_map.h>
+#include <core/stl/vector.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <shared_mutex>
+
+namespace kimix::graph_db {
+
+// ---------------------------------------------------------------------------
+// Constraints
+// ---------------------------------------------------------------------------
+
+// One condition of a Constraint: a label membership test (Equal/NotEqual only,
+// any other op is error_op) or a property comparison (any GdiOp, evaluated by
+// property.h's evaluate()).
+struct KIMIX_GRAPH_DB_API ConstraintCondition {
+    enum class Kind : uint8_t {
+        label = 0,
+        property = 1,
+    };
+
+    Kind kind{Kind::label};
+    LabelId label{kNoLabel};
+    PropNameId property{kNoPropName};
+    GdiOp op{GdiOp::equal};
+    PropertyValue value;
+    // Array length a property condition applies to (GDI's count); 1 for a
+    // scalar declaration. Participates in the comparison only for array types.
+    uint32_t count{1};
+
+    [[nodiscard]] bool is_label() const noexcept { return kind == Kind::label; }
+    [[nodiscard]] bool is_property() const noexcept { return kind == Kind::property; }
+
+    static ConstraintCondition on_label(LabelId label, GdiOp op = GdiOp::equal) noexcept;
+    static ConstraintCondition on_property(PropNameId property, GdiOp op, PropertyValue value,
+                                           uint32_t count = 1) noexcept;
+};
+
+// An AND-ed list of conditions: the only structured filter the GDI read
+// commands accept. An empty constraint matches everything.
+struct KIMIX_GRAPH_DB_API Constraint {
+    kimix::vector<ConstraintCondition> conditions;
+
+    [[nodiscard]] bool empty() const noexcept { return conditions.empty(); }
+    [[nodiscard]] size_t size() const noexcept { return conditions.size(); }
+    [[nodiscard]] Constraint with(ConstraintCondition condition) const;
+};
+
+// Handle of a registered constraint. 0 is never a valid id.
+using ConstraintId = uint32_t;
+inline constexpr ConstraintId kNoConstraint = 0;
+
+struct KIMIX_GRAPH_DB_API ConstraintHandle {
+    ConstraintId id{kNoConstraint};
+
+    [[nodiscard]] bool valid() const noexcept { return id != kNoConstraint; }
+    [[nodiscard]] bool operator==(ConstraintHandle const &other) const noexcept {
+        return id == other.id;
+    }
+    [[nodiscard]] bool operator!=(ConstraintHandle const &other) const noexcept {
+        return id != other.id;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Registry persistence
+// ---------------------------------------------------------------------------
+
+// One label table entry ("s/labels"). Ids are written verbatim: the dense space
+// must survive a save/load cycle, otherwise a stored entity's label id would
+// address a different name after a reload.
+struct KIMIX_GRAPH_DB_API LabelTableEntry {
+    LabelId id{kNoLabel};
+    kimix::string name;
+};
+
+// Codec of the "s/labels" record. Decoding is total (truncated/garbage buffers
+// are a `false`, never a crash) and preserves entry order.
+[[nodiscard]] KIMIX_GRAPH_DB_API size_t
+encoded_label_table_size(kimix::vector<LabelTableEntry> const &entries) noexcept;
+KIMIX_GRAPH_DB_API void encode_label_table(kimix::vector<LabelTableEntry> const &entries,
+                                           kimix::vector<std::byte> &out);
+[[nodiscard]] KIMIX_GRAPH_DB_API bool
+decode_label_table(kimix::span<const std::byte> bytes,
+                   kimix::vector<LabelTableEntry> &out) noexcept;
+
+// Codec of the "s/proptypes" record (same shape, PropertyTypeInfo entries).
+[[nodiscard]] KIMIX_GRAPH_DB_API size_t
+encoded_property_type_table_size(PropertyTypeList const &entries) noexcept;
+KIMIX_GRAPH_DB_API void encode_property_type_table(PropertyTypeList const &entries,
+                                                   kimix::vector<std::byte> &out);
+[[nodiscard]] KIMIX_GRAPH_DB_API bool
+decode_property_type_table(kimix::span<const std::byte> bytes, PropertyTypeList &out) noexcept;
+
+// ---------------------------------------------------------------------------
+// Schema
+// ---------------------------------------------------------------------------
+
+class KIMIX_GRAPH_DB_API Schema : public kimix::IOperatorNewBase {
+public:
+    Schema() noexcept = default;
+    Schema(Schema const &) = delete;
+    Schema &operator=(Schema const &) = delete;
+    Schema(Schema &&) = delete;
+    Schema &operator=(Schema &&) = delete;
+    ~Schema() noexcept = default;
+
+    // --- labels -------------------------------------------------------------
+
+    // Register `name`. error_empty_name for a blank name, error_name_exists when
+    // the name is taken. On success `out` holds the new id.
+    [[nodiscard]] GdiStatus create_label(kimix::string_view name, LabelId &out);
+    // Look up a name without creating it. False when unknown.
+    [[nodiscard]] bool find_label(kimix::string_view name, LabelId &out) const;
+    // Resolve a name, creating it when `auto_create` is set. This is the
+    // GraphOptions::auto_create_schema path used by every write that takes a
+    // label name.
+    [[nodiscard]] GdiStatus resolve_label(kimix::string_view name, bool auto_create,
+                                          LabelId &out);
+    // Every registered label, ordered by id (= registration order: stable and
+    // deterministic, and the order the C# backend's GetAllLabels produces).
+    [[nodiscard]] kimix::vector<LabelId> all_labels() const;
+    // Rename, keeping the id (and therefore every entity) untouched.
+    [[nodiscard]] GdiStatus rename_label(LabelId id, kimix::string_view new_name);
+    // Unregister. The caller MUST strip the id from every entity (Database does).
+    // Refuses (error_label) an unknown id and (error_state) a label that is still
+    // the key label of a live vertex — the Database checks that before calling.
+    [[nodiscard]] GdiStatus free_label(LabelId id);
+    // Name of a label, copied. Empty when the id is unknown/dead.
+    [[nodiscard]] kimix::string label_name(LabelId id) const;
+    [[nodiscard]] bool has_label(LabelId id) const;
+    [[nodiscard]] size_t label_count() const;
+
+    // --- property types -----------------------------------------------------
+
+    [[nodiscard]] GdiStatus create_property_type(PropertyTypeInfo const &info,
+                                                 PropNameId &out);
+    [[nodiscard]] bool find_property_type(kimix::string_view name, PropNameId &out) const;
+    [[nodiscard]] GdiStatus resolve_property_type(kimix::string_view name, bool auto_create,
+                                                  PropertyTypeInfo const &declaration,
+                                                  PropNameId &out);
+    // Declaration of an id. name_id/name are always filled; the other fields are
+    // the registered declaration (single/int64/1 for an unknown id).
+    [[nodiscard]] PropertyTypeInfo property_type(PropNameId id) const;
+    [[nodiscard]] bool has_property_type(PropNameId id) const;
+    // Every declaration, SORTED BY NAME (deterministic; the C# side sorts too).
+    [[nodiscard]] PropertyTypeList all_property_types() const;
+    // Update a declaration. Renaming is free; changing container/dtype is
+    // refused with error_read_only_property_type when `values_exist` says a live
+    // entity still carries a value of this type (the Database decides that), and
+    // changing the count is refused the same way.
+    [[nodiscard]] GdiStatus update_property_type(PropNameId id, PropertyTypeInfo const &info,
+                                                 bool values_exist);
+    [[nodiscard]] GdiStatus free_property_type(PropNameId id);
+    [[nodiscard]] size_t property_type_count() const;
+
+    // --- constraints --------------------------------------------------------
+
+    [[nodiscard]] GdiStatus create_constraint(Constraint const &definition,
+                                              ConstraintHandle &out);
+    [[nodiscard]] GdiStatus add_label_condition(ConstraintHandle handle, LabelId label,
+                                                GdiOp op);
+    [[nodiscard]] GdiStatus add_property_condition(ConstraintHandle handle, PropNameId property,
+                                                   GdiOp op, PropertyValue value,
+                                                   uint32_t count = 1);
+    [[nodiscard]] GdiStatus free_constraint(ConstraintHandle handle);
+    // Definition of a handle, COPIED into `out` (a pointer into the registry
+    // could not outlive the lock the schema holds while answering). False when
+    // the handle is unknown/foreign.
+    [[nodiscard]] bool constraint(ConstraintHandle handle, Constraint &out) const;
+    [[nodiscard]] size_t constraint_count() const;
+
+    // --- persistence / versioning -------------------------------------------
+
+    // Monotone counter bumped by every registry mutation (create/rename/free/
+    // update). The meta record stores it so a load can tell whether the stored
+    // tables are stale relative to the meta record.
+    [[nodiscard]] uint32_t version() const noexcept;
+    // Explicit bump (a constraint edit does not change what a store must write,
+    // but a caller that mutates through a non-schema path can force one).
+    void bump_version() noexcept;
+
+    // Snapshot / restore for the save and load paths. restore() REPLACES the
+    // whole registry state and the two id counters.
+    void snapshot(kimix::vector<LabelTableEntry> &labels, PropertyTypeList &types,
+                  uint32_t &next_label_id, uint32_t &next_prop_name_id) const;
+    // Returns false (and leaves the registry untouched) when a table carries an
+    // impossible id (0, or a duplicate), which is what a corrupt "s/" record
+    // looks like.
+    // Re-register one label / property type with its EXACT id — the transaction
+    // rollback path (a free must be undoable to the same id, or every entity that
+    // referenced it would dangle). error_name_exists when the id or the name is
+    // taken again, error_argument for a zero id.
+    [[nodiscard]] GdiStatus restore_label(LabelTableEntry const &entry);
+    [[nodiscard]] GdiStatus restore_property_type(PropertyTypeInfo const &info);
+
+    [[nodiscard]] bool restore(kimix::vector<LabelTableEntry> const &labels,
+                               PropertyTypeList const &types,
+                               uint32_t next_label_id, uint32_t next_prop_name_id,
+                               uint32_t schema_version);
+
+private:
+    struct PropertyTypeSlot {
+        PropNameId id{kNoPropName};
+        PropertyTypeInfo info;
+    };
+
+    [[nodiscard]] LabelId _find_label_locked(kimix::string_view name) const;
+    [[nodiscard]] PropNameId _find_property_type_locked(kimix::string_view name) const;
+
+    mutable std::shared_mutex _mutex;
+    kimix::vector<LabelTableEntry> _labels;                    // dense, id order
+    kimix::unordered_map<kimix::string, LabelId, kimix::string_hash> _label_by_name;
+    kimix::vector<PropertyTypeSlot> _property_types;           // dense, id order
+    kimix::unordered_map<kimix::string, PropNameId, kimix::string_hash> _property_type_by_name;
+    kimix::unordered_map<ConstraintId, Constraint> _constraints;
+    LabelId _next_label_id{1};
+    PropNameId _next_prop_name_id{1};
+    ConstraintId _next_constraint_id{1};
+    uint32_t _version{0};
+};
+
+} // namespace kimix::graph_db

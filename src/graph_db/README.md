@@ -1,8 +1,11 @@
 # kimix-graph-db (`src/graph_db`)
 
 The graph database layer of KimixBase: an in-memory vertex/edge container with a
-two-level lock discipline, plus a parallel incremental serializer to LMDB cold
-storage and a dual-stage, cycle/corruption-tolerant loader.
+five-level lock hierarchy, a GDI-shaped backend facade on top of it (typed
+properties, labels, `(label, external_id)` keys, first-class edges, a schema,
+constraints, filtered/paged reads, transactions and a C ABI), plus a parallel
+incremental serializer to LMDB cold storage and a dual-stage,
+cycle/corruption-tolerant loader.
 
 Design authority: `graph_db_plan.md` (§3.1 data model, §3.2 concurrency, §3.3
 serialization format & disk layout, §3.4 error handling, §6 tests). The product
@@ -12,14 +15,18 @@ requirement it implements is `graph_db.md`.
 
 ## 1. Scope
 
-- **In scope**: the in-memory graph (`Graph`, `Vertex`), the on-disk record
-  format and key scheme, the LMDB cold store, incremental save, full save,
-  dual-stage load, checkpoint copies.
-- **Out of scope (later subtasks)**: the typed property model (a `PropertyValue`
-  tagged union, labels, `(label, external_id)` keys — `Vertex::_content` is a
-  deliberately opaque, already-serialized blob with a cached MD5 for now; see the
-  TODO on `Vertex::_content`), the read/write benchmarks and the optimization
-  epochs, sharded-cursor parallel loading, lazily hydrated content.
+- **In scope**: the in-memory graph (`Graph`, `Vertex`, `Edge`, `KeyIndex`), the
+  on-disk record format and key spaces, the LMDB cold store, incremental/full
+  save, dual-stage load, checkpoint copies, and the GDI layer: `PropertyValue` /
+  `PropertyBag`, labels, `(label, external_id)` keys with a uniqueness index, a
+  schema (labels / property types / constraints), oriented + constraint-filtered +
+  paged reads, transactions with an undo journal, and the C ABI
+  (`graph_c_api.h`). See `reports/gdi_alignment.md` for the command-by-command
+  alignment with `Semevia.GDI`.
+- **Out of scope (deferred, P9 in the plan)**: global vertex scans, native
+  multi-hop traversal, GDI-shaped shortest-path/BFS composites, global
+  aggregates and a named multi-graph catalog. The capability advertisement keeps
+  those flags honestly `false` (see `capability.h`).
 - **Dependency rule**: `kimix-core` only. Third-party code (LMDB, mimalloc) is
   reached through it, never by an `add_deps()` on a `src/ext` target.
 
@@ -33,6 +40,19 @@ requirement it implements is `graph_db.md`.
 | `vertex.h` / `vertex.cpp` | One vertex: guid, opaque content blob + cached MD5, dependency links in **both** forms (guid vectors = the serialized source of truth; `Vertex*` sets = the resolved in-memory form), an `alignas(64)` `kimix::shared_atomic_mutex` and the atomic dirty flag. Also the `VertexUniqueLock` / `VertexSharedLock` RAII adapters. |
 | graph.h / graph.cpp | The vertex container: a 64-way SHARDED vertex map (kGraphShardCount, one std::shared_mutex + one bucketed kimix::HashMap per shard), structural CRUD with a cascading remove_vertex (one shard lock at a time), connect / disconnect (endpoint shards, ascending order), connect_bulk (epoch 3: one endpoint resolution, one ascending lock set and one writer check for a whole edge batch), reserve_links, a version-keyed cached roots(), neighbors / dependencies / dependents plus the non-allocating AdjacencyBuffer / caller-span forms, cycle-safe BFS has_path / shortest_path (one shard lock per visit), dirty bookkeeping (mark_dirty / clear_dirty / dirty_vertices), the single-writer contract check. graph.h carries the full concurrency contract, the deadlock-freedom argument and the epoch-1/2/3 results. |
 | `serialize.h` / `serialize.cpp` | `GraphSerializer` (full + incremental save, `copy_to` checkpoint) and `GraphDeserializer` (dual-stage load), plus `GraphSerializeStats`. Details in §4 and §5. |
+| `edge.h` / `edge.cpp` | First-class edges: `EdgeId`, `Edge`, `EdgeLink`, `EdgeRecord`, `EdgeDirectionType` / `EdgeOrientation`, the sharded `EdgeTable` and the `"GDE2"` edge-record codec. |
+| `key.h` / `key.cpp` | `ExternalId` (16-byte SSO, arbitrary binary), `VertexKey` / `VertexKeyView` and the sharded `KeyIndex` (level 4). |
+| `status.h` / `status.cpp` | `GdiStatus`: the 63 GDI status codes with their pinned numeric values, names and messages. |
+| `property.h` / `property.cpp` | `PropertyKind` / `PropertyValue` / `PropertyBag`, the GDI type vocabulary and `evaluate()`, plus the record-level property codec. |
+| `schema.h` / `schema.cpp` | Label / property-type / constraint registries, rename, free, the `"s/"` table codecs and their restore path. |
+| `query.h` / `query.cpp` | `Page<T>` (the two-phase count/fetch shape) and the AND-ed constraint evaluation. |
+| `transaction.h` / `transaction.cpp` | The undo journal (`JournalEntry`) and the transaction state machine. |
+| `database.h` / `database.cpp` | `Database`: the GDI backend facade (one per session) — every command, its schema validation, its exact status code, the rollback replay and the save hooks. |
+| `capability.h` / `capability.cpp` | `Capability` (the honest advertisement) and `capability_name_diff`. |
+| `graph_db_options.h` | `GraphOptions` / `KeyMode`: key uniqueness policy, edge policy, journal cap, store map size, `persist_on_commit`, graph name. |
+| `graph_c_api.h` / `graph_c_api.cpp` | The C ABI (ASCII, C99-clean, no library allocation on read paths, two-phase buffers). |
+| `binary_le.h` | INTERNAL little-endian codec helpers shared by the record encoders (not part of the umbrella). |
+| `reports/gdi_alignment.md` | The `graph_report.md` §2.1–§2.16 checklist: what is closed, by which file, with which test. |
 | `xmake.lua` | The `kimix-graph-db` static target and its public include dirs / defines. |
 | `README.md` | This file (module overview + the benchmark table S3 fills in). |
 | `tests/unit/graph_db/graph_db_test_util.h` | Shared fixtures: byte helpers, `temp_dir_guard`, the known 6-vertex DAG, `build_layered_dag`, record/store hand-crafting helpers, raw-store snapshots, guid/adjacency comparison helpers. |
@@ -662,4 +682,143 @@ result. What epoch 4 would attack, in measured order:
    speed").
 None of those is a ≥5 % headline inside src/graph_db, so per the plan's stop rule
 the optimization loop is STOPPED at epoch 3: this is the final epoch. The next
-real step is a src/core sync-policy decision, not another src/graph_db epoch.
+real step is a src/core sync-policy decision, not another src/graph_db epoch./n
+---
+
+## 5b. GDI layer: lock hierarchy v2 (authoritative copy in `graph.h` + `database.h`)
+
+Epoch 4 added two shard families and a request-level schema, so the levels are now
+five, always acquired lowest-numbered first, and inside one level in ascending
+shard/index order:
+
+| Level | Lock | Guards | Taken by |
+|---|---|---|---|
+| 1 | `Schema::_mutex` (`shared_mutex`) | label / property-type / constraint registries | `Database` schema commands, `Schema::resolve_*` on a write |
+| 2 | vertex shards (`Graph::_shards[i]`) | the vertex map, `_out_links` / `_in_links`, the neighbour projections, the key fields | structural vertex/edge writes (unique), reads and traversals (shared) |
+| 3 | edge shards (`EdgeTable::_shards[i]`) | the edge map **and every edge's endpoints, direction, labels and properties** | edge CRUD and edge payload access |
+| 4 | key-index shards (`KeyIndex::_shards[i]`) | `(label, external_id) -> uid` | vertex create / free, `translate_vertex_id` |
+| 5 | leaf: `Vertex::_mutex` | content, labels, properties of one vertex | payload reads (shared) and writes (unique) |
+
+Rules that keep it deadlock-free, and that the code actually follows:
+
+- a structural write takes 2 -> 3 (or 2 -> 4) and never a level-5 lock while a
+  shard lock is held;
+- a payload write takes level 2 **shared only to resolve the guid, then releases
+  it**, and takes the leaf lock afterwards (`Database::add_property` and friends);
+- an edge payload write takes exactly one level-3 lock (an edge record is small, so
+  it is guarded by its shard rather than by a per-edge mutex — that is the memory
+  tradeoff documented in `edge.h`);
+- endpoint mutation is the one place that needs both: it takes the involved vertex
+  shards in ascending order (level 2) and then the edge's shard (level 3), so a
+  reader can never observe the record and the adjacency disagree;
+- `EdgeTable` and `KeyIndex` shard counts are `static_assert`ed equal to
+  `kGraphShardCount`, because one index order is easier to reason about than three.
+
+Because every structural write is single-writer by contract (unchanged), the
+multi-lock paths have at most one participant; the ascending order makes them safe
+anyway, and a 4-reader / 1-writer stress test (in `test_graph_db_read.cpp`) runs
+the filtered-read path against a live writer.
+
+## 5c. Key spaces and record formats (format 2)
+
+One LMDB database, partitioned by key prefix (`utils.h`). The loader makes ONE
+sequential scan and dispatches on the prefix, so an edge or schema record can
+never be mistaken for a vertex.
+
+| Key | Value |
+|---|---|
+| `"v/"` + 16B vertex guid | vertex record v2 (`"GDB2"`) |
+| `"e/"` + 16B edge uid | edge record (`"GDE2"`) |
+| `"s/labels"` | label table (`"GDS2"`) |
+| `"s/proptypes"` | property-type table (`"GDS2"`) |
+| `"meta/root"` | meta record (`"GDM2"`: format version, store uuid, both save timestamps, schema version, the two id counters, graph name) |
+| `"i/"` | reserved for future secondary indexes — never written |
+
+Vertex record v2 (`utils.h` has the byte layout):
+
+```
+[4B "GDB2"][16B guid][16B content MD5]
+[4B key label][4B n_labels][4B n_props][4B n_dep][4B n_depended][4B ext len][4B reserved]
+[ext id][n_labels x 4B][n_props x property entry]
+[n_dep x 16B][n_depended x 16B][content]
+```
+
+The two dependency tables are a **compatibility projection** of the edge set: the
+`"e/"` records are authoritative, and the loader only synthesizes an edge from a
+link that no edge record covers (which is exactly what a v1 store needs, and what
+keeps a hand-written store loadable). Properties are interned
+(`{4B name id, 1B kind, 1B dtype, 2B reserved, 4B count, 8B payload length,
+payload}`), so a rename is O(1) and a record stays small.
+
+**Deletions are tombstones.** A save is one LMDB write transaction and a write
+transaction cannot remove a key, so a deleted vertex or edge is stored as an EMPTY
+value under its key (counted in `deleted_vertex_count` / `deleted_edge_count`) and
+the loader treats an empty value as "gone" — silently, never as a corrupt record
+(`tombstone_count`). Without this a reload would resurrect everything deleted since
+the last save. The tombstone keys are never reclaimed; a `copy_to()` checkpoint of
+a heavily churned store keeps them, and compacting them is a later epoch.
+
+**Migration**: a store without `meta/root` is format 1. Its `"GDB1"` records load
+unchanged (no key, no labels, no properties; content preserved) and each
+dependency guid becomes a directed edge whose id is `MD5(origin ‖ target)` — so a
+v1 store loads to the SAME graph twice and a later save writes stable ids. A store
+that announces a format NEWER than `KIMIX_GRAPH_DB_FORMAT_VERSION` is refused with
+`error_bad_file` before anything is materialized.
+
+## 5d. Capability matrix (honest, per phase)
+
+| Flag | value | why |
+|---|---|---|
+| `supports_global_scan` | **false** | no vertex-iteration command (deferred P9) |
+| `supports_edge_by_stable_uid` | **true** | edge uids are records and survive save/load |
+| `supports_edge_property_read` | **true** | edges carry labels and properties |
+| `supports_native_multi_hop` | **false** (depth 0) | multi-hop is composed from neighbour reads (P9) |
+| `supports_global_aggregates` | **false** | P9 |
+| `supports_collective_transactions` | **true** | read-only scope; **no snapshot isolation** (single-writer store), documented in `transaction.h` |
+| `enforces_unique_external_ids` | **true** | the `KeyIndex` refuses a duplicate (`KeyMode::report_warning` is the warning path) |
+
+## 5e. Epoch 4 — first-class edges + the GDI layer
+
+What changed, and what it cost:
+
+- **Adjacency is per EDGE, not per neighbour**: `Vertex::_out_links` /
+  `_in_links` hold `EdgeLink{edge uid, neighbour uid}` (32 B) instead of a 16 B guid,
+  so a vertex's adjacency costs 2x the memory and the guid lists
+  (`_depending_guids` / `_depended_guids`) are kept as MAINTAINED projections
+  (updated in place on every link change) because `dependencies()` returns a const
+  reference and is called once per visited vertex by every traversal. Rebuilding a
+  projection lazily was rejected on that measurement.
+- **`connect()` / `connect_bulk()` now go through the edge table** (`_create_edge_locked`),
+  so the legacy contract (one directed edge per ordered pair, no self loops, the
+  same `EdgeOutcome` vocabulary) and the GDI model cannot drift. `test_graph_db.cpp`
+  passes UNMODIFIED as the regression gate.
+- **A vertex record no longer carries the adjacency authoritatively**, so an
+  edge-only change writes ONE edge record (`saved_edge_count`) and no vertex
+  record at all.
+- **One measured change to an existing suite**: `serialize_corrupt_record_is_skipped`
+  now expects TWO unresolvable edges instead of one, because an edge record
+  survives the loss of its endpoints' vertex records and is reported on its own
+  (the v1 model could not even see the second one). The v1 record format itself is
+  unchanged and still decodes.
+- **The cost, measured in release on this host** (same 100k / 1M stores as
+  epoch 3, so the numbers are comparable row by row):
+
+  | Row | epoch 3 | epoch 4 | delta | why |
+  |---|---|---|---|---|
+  | structural 1T create+connect | 881 ns | 1327 ns | **+51 %** | an edge is now an OBJECT: one `EdgeTable` shard insert, one link pair, plus the guid projections. The old path wrote two guid vectors and two pointer sets. |
+  | read 1T user op / find-only 1T | 3434 / 15.8 ns | 3197 / 17.6 ns | -7 % / +11 % (noise band) | the read path is unchanged: `dependencies()` still reads the maintained 16-byte projection. |
+  | content_update 32T | 14.9 ns | 10.7 ns | -28 % (favourable noise) | level-2 path untouched. |
+  | save 100k | 752 ms | 3236 ms | **+330 %** | two record families instead of one, and a v2 vertex record carries the key, the label/property tables AND the dependency projection (the compatibility promise documented in §5c). The 100k store is now 70.4 MB instead of ~? MB. |
+  | load 100k | 161 ms | 623 ms | **+287 %** | same cause on the read side, plus the per-record property/label decode. |
+  | incremental 1 % @100k | 68.5 ms | 100.5 ms | **+47 %** | same records, but now a save also sweeps the edge family's dirty set. |
+  | save/load 1M | 7950 / 3058 ms | 26305 / 9155 ms | same shape | linear in the record size, i.e. no accidental superlinearity. |
+
+  The honest conclusion: **the GDI data model costs roughly 3x on the bulk
+  save/load paths and 1.5x on the structural write path**, and it costs nothing on
+  reads. The two obvious levers for the next epoch, both requiring a format
+  decision rather than a code change, are (a) drop the dependency projection from
+  v2 records (the edge records are authoritative; the projection only earns its
+  bytes for v1 migration and for a hand-edited store) and (b) a compact property
+  encoding (varint payload lengths instead of 8-byte ones). Neither is done here
+  because both change the on-disk format that the migration tests pin.
+
