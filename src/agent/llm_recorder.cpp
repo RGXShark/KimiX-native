@@ -52,7 +52,7 @@ yyjson_mut_val *sort_value(yyjson_mut_doc *doc, yyjson_val *value) {
             e.val = sort_value(doc, item);
             entries.push_back(e);
         }
-        std::sort(entries.begin(), entries.end(), [](const entry &a, const entry &b) {
+        kimix::sort(entries.begin(), entries.end(), [](const entry &a, const entry &b) {
             const size_t alen = yyjson_get_len(a.key);
             const size_t blen = yyjson_get_len(b.key);
             const size_t n = alen < blen ? alen : blen;

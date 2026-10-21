@@ -73,7 +73,7 @@ yyjson_mut_val *sorted_copy(yyjson_val *val, yyjson_mut_doc *mdoc) {
                               static_cast<size_t>(yyjson_get_len(key))),
                 yyjson_obj_iter_get_val(key));
         }
-        std::sort(entries.begin(), entries.end(),
+        kimix::sort(entries.begin(), entries.end(),
                   [](const auto &a, const auto &b) { return a.first < b.first; });
         yyjson_mut_val *obj = yyjson_mut_obj(mdoc);
         for (auto &entry : entries) {

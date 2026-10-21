@@ -3583,7 +3583,7 @@ kimix::string serialize_node(const html_dom &dom, uint32_t node) {
         kimix::vector<size_t> order;
         order.reserve(nd->attrs.size());
         for (size_t i = 0; i < nd->attrs.size(); ++i) order.push_back(i);
-        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        kimix::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
             return nd->attrs[a].name < nd->attrs[b].name;
         });
         for (size_t idx : order) {

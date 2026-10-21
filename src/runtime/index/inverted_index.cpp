@@ -105,7 +105,7 @@ InvertedIndex::Segment InvertedIndex::build_segment_from_rows(
     }
     seg.postings.reserve(total_pl);
 
-    std::sort(rows.begin(), rows.end(),
+    kimix::sort(rows.begin(), rows.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
     for (auto& r : rows) {
         const uint32_t row = static_cast<uint32_t>(seg.term_keys.size());
@@ -250,7 +250,7 @@ kimix::span<const postings_entry> InvertedIndex::get_postings(kimix::string_view
         auto& pl = dit->second.postings;
         if (!dit->second.sorted) {
             if (pl.size() > 1) {
-                std::sort(pl.begin(), pl.end(), posting_less);
+                kimix::sort(pl.begin(), pl.end(), posting_less);
             }
             dit->second.sorted = true;
         }
@@ -340,7 +340,7 @@ void InvertedIndex::compact() {
                                                               end - start)});
         }
     }
-    std::sort(refs.begin(), refs.end(),
+    kimix::sort(refs.begin(), refs.end(),
               [](const TermRef& a, const TermRef& b) { return a.key < b.key; });
 
     kimix::vector<std::pair<kimix::string, kimix::vector<postings_entry>>> rows;
@@ -446,7 +446,7 @@ void InvertedIndex::write_blob(kimix::string& blob) const {
     for (const auto& kv : _doc_meta) {
         doc_ids.push_back(kv.first);
     }
-    std::sort(doc_ids.begin(), doc_ids.end());
+    kimix::sort(doc_ids.begin(), doc_ids.end());
     for (uint32_t id : doc_ids) {
         w.u32(id);
         w.u32(_doc_meta.at(id).length);
@@ -604,7 +604,7 @@ kimix::span<const postings_entry> InvertedIndex::merge_postings(kimix::string_vi
         auto& pl = dit->second.postings;
         if (!dit->second.sorted) {
             if (pl.size() > 1) {
-                std::sort(pl.begin(), pl.end(), posting_less);
+                kimix::sort(pl.begin(), pl.end(), posting_less);
             }
             dit->second.sorted = true;
         }
@@ -661,7 +661,7 @@ void InvertedIndex::build_segment_from_delta() {
     for (auto& kv : _delta) {
         auto& de = kv.second;
         if (!de.sorted && de.postings.size() > 1) {
-            std::sort(de.postings.begin(), de.postings.end(), posting_less);
+            kimix::sort(de.postings.begin(), de.postings.end(), posting_less);
         }
         de.sorted = true;
         rows.emplace_back(kv.first, std::move(de.postings));

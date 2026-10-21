@@ -1444,7 +1444,7 @@ fuzzy_location_result find_fuzzy_match(
     if (candidates.empty()) {
         return r;
     }
-    std::sort(candidates.begin(), candidates.end(),
+    kimix::sort(candidates.begin(), candidates.end(),
               [](const std::pair<size_t, double> &x,
                  const std::pair<size_t, double> &y) { return x.second > y.second; });
     if (candidates.size() == 1) {
@@ -2578,7 +2578,7 @@ kimix::string hashline_mismatch_message(
             display_lines.push_back(i);
         }
     }
-    std::sort(display_lines.begin(), display_lines.end());
+    kimix::sort(display_lines.begin(), display_lines.end());
     display_lines.erase(std::unique(display_lines.begin(), display_lines.end()),
                         display_lines.end());
 

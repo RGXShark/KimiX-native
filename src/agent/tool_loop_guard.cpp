@@ -136,7 +136,7 @@ yyjson_mut_val *mut_copy_sorted(yyjson_mut_doc *doc, yyjson_val *src) {
                                              yyjson_get_len(key)),
                                val);
         }
-        std::sort(pairs.begin(), pairs.end(),
+        kimix::sort(pairs.begin(), pairs.end(),
                   [](const auto &a, const auto &b) { return a.first < b.first; });
         for (const auto &p : pairs) {
             yyjson_mut_obj_add(obj, yyjson_mut_strncpy(doc, p.first.data(),

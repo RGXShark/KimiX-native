@@ -353,9 +353,9 @@ double sorensen_dice(kimix::string_view a, kimix::string_view b) noexcept {
                 bg[bn++] = pair_of(static_cast<unsigned char>(tb.bytes[i]),
                                    static_cast<unsigned char>(tb.bytes[i + 1]));
             }
-            std::sort(ag, ag + an);
+            kimix::sort(ag, ag + an);
             an = static_cast<size_t>(std::unique(ag, ag + an) - ag);
-            std::sort(bg, bg + bn);
+            kimix::sort(bg, bg + bn);
             bn = static_cast<size_t>(std::unique(bg, bg + bn) - bg);
             size_t intersection = 0;
             size_t ia = 0, ib = 0;
@@ -439,9 +439,9 @@ double ngram_overlap(kimix::string_view a, kimix::string_view b, uint32_t n) noe
             };
             make_ascii_grams(sa, ag, an);
             make_ascii_grams(tb, bg, bn);
-            std::sort(ag, ag + an);
+            kimix::sort(ag, ag + an);
             an = static_cast<size_t>(std::unique(ag, ag + an) - ag);
-            std::sort(bg, bg + bn);
+            kimix::sort(bg, bg + bn);
             bn = static_cast<size_t>(std::unique(bg, bg + bn) - bg);
             size_t intersection = 0;
             size_t ia = 0, ib = 0;

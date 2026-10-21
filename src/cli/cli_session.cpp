@@ -3022,7 +3022,7 @@ kimix::vector<session_info> session_store::list(const kimix::string &work_dir) {
             break;
         }
     }
-    std::sort(out.begin(), out.end(),
+    kimix::sort(out.begin(), out.end(),
               [](const session_info &a, const session_info &b) {
                   if (a.updated_at != b.updated_at) {
                       return a.updated_at > b.updated_at;

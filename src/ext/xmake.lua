@@ -68,6 +68,20 @@ target("kimix-xxhash")
 target_end()
 
 -- ============================================================================
+-- ============================================================================
+-- pdqsort (Orson Peters' pattern-defeating quicksort, vendored copy as shipped
+-- by LuisaCompute) — header-only; kimix-core re-exports it through
+-- core/stl/pdqsort.h, consumers call it via `pdqsort(begin, end)`.
+-- ============================================================================
+target("kimix-pdqsort")
+    set_kind("headeronly")
+    on_load(function(target)
+        target:add("includedirs", path.join(os.scriptdir(), "pdqsort"), {
+            public = true
+        })
+    end)
+target_end()
+
 -- pybind11 (Python binding) — header-only
 -- ============================================================================
 target("kimix-pybind11")

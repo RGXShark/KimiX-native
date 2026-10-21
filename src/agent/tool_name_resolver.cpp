@@ -510,7 +510,7 @@ kimix::vector<kimix::string> fuzzy_match_tool_name(
     }
     const kimix::vector<scored_match> &pool = !exact.empty() ? exact : scored;
     kimix::vector<scored_match> sorted(pool.begin(), pool.end());
-    std::sort(sorted.begin(), sorted.end(),
+    kimix::sort(sorted.begin(), sorted.end(),
               [](const scored_match &a, const scored_match &b) {
                   if (a.ratio != b.ratio) {
                       return a.ratio > b.ratio;
@@ -910,7 +910,7 @@ ToolNameResolution resolve_tool_by_arguments(
     if (scored.empty()) {
         return out;
     }
-    std::sort(scored.begin(), scored.end(),
+    kimix::sort(scored.begin(), scored.end(),
               [](const fit &a, const fit &b) { return a.score > b.score; });
     const fit &best = scored.front();
     const bool beats_second =

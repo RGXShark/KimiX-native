@@ -206,7 +206,7 @@ GraphSerializeStats GraphSerializer::_write(Graph &graph) {
     // clear-the-dirty-flag pass reads `dirty[]` / `written_hashes[]`, which stay
     // in collection order — and both are keyed by the same vertex either way.
     if (commands.size() > 1) {
-        std::sort(commands.begin(), commands.end(),
+        kimix::sort(commands.begin(), commands.end(),
                   [](kimix::LMDBWriteCommand const &lhs,
                      kimix::LMDBWriteCommand const &rhs) noexcept {
                       size_t const common = std::min(lhs.key.size(), rhs.key.size());

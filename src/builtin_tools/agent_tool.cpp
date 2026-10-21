@@ -336,7 +336,7 @@ void ag_pretty_object(const ToolParams &obj, int32_t depth, kimix::string &out) 
     for (const auto &kv : obj.values) {
         keys.push_back(kv.first);
     }
-    std::sort(keys.begin(), keys.end());
+    kimix::sort(keys.begin(), keys.end());
     for (size_t i = 0; i < keys.size(); ++i) {
         ag_indent(out, depth + 1);
         ag_json_escape(keys[i], out);

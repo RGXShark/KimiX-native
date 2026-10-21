@@ -1296,7 +1296,7 @@ void collect_files(const kimix::string &root_str, kimix::string_view work_dir,
               }
               entries.push_back(dit->path());
           }
-          std::sort(entries.begin(), entries.end());
+          kimix::sort(entries.begin(), entries.end());
           for (const fs::path &entry_path : entries) {
               // Skip hidden dirs (.git etc.) and hidden files at every depth.
               const kimix::string fname = kimix::to_string(entry_path.filename());
@@ -1368,7 +1368,7 @@ void claim_order(const kimix::vector<walk_entry> &files,
         sized[i].size = files[i].size_hint;
         sized[i].index = static_cast<uint32_t>(i);
     }
-    std::sort(sized.begin(), sized.end(),
+    kimix::sort(sized.begin(), sized.end(),
               [](const sized_index &a, const sized_index &b) noexcept {
                   if (a.size != b.size) {
                       return a.size > b.size; // longest job first
@@ -1548,7 +1548,7 @@ tool_status run_grep(const grep_options &opts, kimix::span<const kimix::string> 
             merged.push_back(std::move(blk));
         }
     }
-    std::sort(merged.begin(), merged.end(),
+    kimix::sort(merged.begin(), merged.end(),
               [](const ge::file_block &a, const ge::file_block &b) noexcept {
                   return a.index < b.index;
               });

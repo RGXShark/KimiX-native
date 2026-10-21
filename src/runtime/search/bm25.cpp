@@ -107,7 +107,7 @@ void top_k(kimix::span<const double> scores, uint32_t k,
     }
     // heap holds the k best in heap order — emit them sorted
     // (score desc, doc asc) like the previous partial_sort result.
-    std::sort(heap.begin(), heap.end(), [](const score_doc& a, const score_doc& b) noexcept {
+    kimix::sort(heap.begin(), heap.end(), [](const score_doc& a, const score_doc& b) noexcept {
         if (a.score != b.score) {
             return a.score > b.score;
         }

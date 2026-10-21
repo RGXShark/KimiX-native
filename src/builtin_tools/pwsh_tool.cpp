@@ -926,7 +926,7 @@ self_kill_result detect_self_kill_ex(
         names.push_back(lower_copy(name));
       }
     }
-    std::sort(names.begin(), names.end());
+    kimix::sort(names.begin(), names.end());
     st.names = std::move(names);
   }
 
@@ -958,7 +958,7 @@ self_kill_result detect_self_kill_ex(
     for (const word_match &m : find_word_opt_exe(text, "tskill")) {
       matches.push_back(m);
     }
-    std::sort(matches.begin(), matches.end(),
+    kimix::sort(matches.begin(), matches.end(),
               [](const word_match &a, const word_match &b) {
                 return a.begin < b.begin;
               });
@@ -1016,7 +1016,7 @@ self_kill_result detect_self_kill_ex(
   // 2. taskkill (safety.py 660-675).
   {
     kimix::vector<word_match> matches = find_word_opt_exe(text, "taskkill");
-    std::sort(matches.begin(), matches.end(),
+    kimix::sort(matches.begin(), matches.end(),
               [](const word_match &a, const word_match &b) {
                 return a.begin < b.begin;
               });
@@ -1135,7 +1135,7 @@ self_kill_result detect_self_kill_ex(
     for (const word_match &m : find_word_opt_exe(text, "killall")) {
       matches.push_back({m, false});
     }
-    std::sort(matches.begin(), matches.end(),
+    kimix::sort(matches.begin(), matches.end(),
               [](const tagged &a, const tagged &b) {
                 return a.match.begin < b.match.begin;
               });

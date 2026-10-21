@@ -1720,7 +1720,7 @@ kimix::string top_dirs_summary(kimix::span<const walk_entry> entries,
     if (counts.empty()) {
         return {};
     }
-    std::sort(counts.begin(), counts.end(),
+    kimix::sort(counts.begin(), counts.end(),
               [](const std::pair<kimix::string, size_t> &a,
                  const std::pair<kimix::string, size_t> &b) {
                   if (a.second != b.second) {

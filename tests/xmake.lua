@@ -81,10 +81,16 @@ end
 test_proj("test_kimix_core", "unit/core/test_kimix_core.cpp")
 
 test_proj("test_stl_allocator", "unit/core/test_stl_allocator.cpp")
+test_proj("test_stl_functional", "unit/core/test_stl_functional.cpp")
 test_proj("test_stl_string", "unit/core/test_stl_string.cpp")
 test_proj("test_stl_vector", "unit/core/test_stl_vector.cpp")
 test_proj("test_stl_hash", "unit/core/test_stl_hash.cpp")
 test_proj("test_stl_filesystem", "unit/core/test_stl_filesystem.cpp")
+-- kimix::sort (pdqsort) dispatch + correctness; the perf comparison against
+-- std::sort is the env-gated benchmark on the next line.
+test_proj("test_stl_pdqsort", "unit/core/test_stl_pdqsort.cpp")
+-- Env-gated pdqsort vs std::sort benchmark (runs nothing unless KIMIX_PDQSORT_BENCH=1).
+test_proj("test_stl_pdqsort_bench", "unit/core/test_pdqsort_bench.cpp")
 test_proj("test_platform", "unit/core/test_platform.cpp")
 test_proj("test_basic_types", "unit/core/test_basic_types.cpp")
 test_proj("test_pool", "unit/core/test_pool.cpp")

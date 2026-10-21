@@ -146,7 +146,7 @@ size_t td_lcs_len(kimix::string_view a, kimix::string_view b) {
 // preprocessing).
 kimix::string td_sorted_tokens_key(kimix::string_view s) {
     kimix::vector<kimix::string> toks = td_split_ws(td_lower(s));
-    std::sort(toks.begin(), toks.end());
+    kimix::sort(toks.begin(), toks.end());
     return td_join(toks, " ");
 }
 
@@ -769,7 +769,7 @@ kimix::vector<kimix::string> td_mixed_fields(const ToolParams *params) {
             mixed.push_back(name);
         }
     }
-    std::sort(mixed.begin(), mixed.end());
+    kimix::sort(mixed.begin(), mixed.end());
     return mixed;
 }
 
@@ -1338,7 +1338,7 @@ find_duplicate_titles(kimix::span<const todo_item> items) {
         }
     }
     kimix::vector<kimix::string> out(dups.begin(), dups.end());
-    std::sort(out.begin(), out.end());
+    kimix::sort(out.begin(), out.end());
     return out;
 }
 

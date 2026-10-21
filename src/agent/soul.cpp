@@ -1101,7 +1101,7 @@ kimix::vector<kimix::llm::Tool> KimiSoul::tool_definitions() const {
     // pointer registered) before "pwsh" is constructed.
     kimix::vector<builtin_tools::ToolMeta> metas =
         builtin_tools::ToolRegistry::instance().all();
-    std::sort(metas.begin(), metas.end(),
+    kimix::sort(metas.begin(), metas.end(),
               [](const builtin_tools::ToolMeta &a,
                  const builtin_tools::ToolMeta &b) { return a.name < b.name; });
     for (const builtin_tools::ToolMeta &meta : metas) {

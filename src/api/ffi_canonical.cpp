@@ -248,7 +248,7 @@ canon_result canon_emit(byte_vector &out, const yyjson_val *v, std::size_t depth
             members.push_back(canon_member{yyjson_get_str(key), yyjson_get_len(key), val});
         }
 
-        std::sort(members.begin(), members.end(), canon_key_less);
+        kimix::sort(members.begin(), members.end(), canon_key_less);
         for (std::size_t i = 1; i < members.size(); ++i) {
             if (canon_key_equal(members[i - 1], members[i])) {
                 return canon_result::k_invalid; // duplicate key: see header

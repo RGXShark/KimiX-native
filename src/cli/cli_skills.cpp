@@ -423,7 +423,7 @@ kimix::vector<skill_info> discover_skills(const kimix::vector<kimix::string> &ro
         clisk_discover_in_root(root, clisk_scope_for(root, cwd), claimed, skills);
     }
     // sorted(skills, key=lambda s: s.name) - ASCII name order.
-    std::sort(skills.begin(), skills.end(),
+    kimix::sort(skills.begin(), skills.end(),
               [](const skill_info &a, const skill_info &b) { return a.name < b.name; });
     return skills;
 }
@@ -447,7 +447,7 @@ kimix::string format_skills_for_prompt(const kimix::vector<skill_info> &skills) 
         if (bucket.empty()) {
             continue;
         }
-        std::sort(bucket.begin(), bucket.end(),
+        kimix::sort(bucket.begin(), bucket.end(),
                   [](const skill_info *a, const skill_info *b) { return a->name < b->name; });
         kimix::string section = kimix::string("### ") + heading;
         for (const skill_info *skill : bucket) {

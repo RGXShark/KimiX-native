@@ -1135,7 +1135,7 @@ kimix::string format_media_tag(kimix::string_view tag, kimix::span<const std::pa
     if (attrs.empty()) return kimix::format("<{}>", tag);
 
     kimix::vector<std::pair<kimix::string, kimix::string>> sorted(attrs.begin(), attrs.end());
-    std::sort(sorted.begin(), sorted.end(),
+    kimix::sort(sorted.begin(), sorted.end(),
               [](const auto &a, const auto &b) { return a.first < b.first; });
 
     kimix::vector<kimix::string> rendered;

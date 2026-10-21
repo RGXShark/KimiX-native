@@ -129,7 +129,7 @@ void sort_obj_recursive(yyjson_mut_doc* doc, yyjson_mut_val* obj) {
             ++count;
         }
 
-        std::sort(pairs, pairs + count,
+        kimix::sort(pairs, pairs + count,
                   [](const pair_t& a, const pair_t& b) {
                       const size_t common =
                           a.key_len < b.key_len ? a.key_len : b.key_len;

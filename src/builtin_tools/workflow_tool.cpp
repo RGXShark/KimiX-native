@@ -356,7 +356,7 @@ wf_snapshot_files(kimix::string_view root) {
             out.emplace_back(std::move(rel_text), std::move(content));
         }
     }
-    std::sort(out.begin(), out.end(),
+    kimix::sort(out.begin(), out.end(),
               [](const auto &a, const auto &b) { return a.first < b.first; });
     return out;
 }
@@ -619,7 +619,7 @@ tool_error parse_params(const ToolParams *params, workflow_params &out) {
             for (const auto &kv : obj->values) {
                 keys.push_back(kv.first);
             }
-            std::sort(keys.begin(), keys.end());
+            kimix::sort(keys.begin(), keys.end());
             for (const kimix::string &key : keys) {
                 const ValueElement *value = obj->get(key);
                 if (value == nullptr || !value->is_string()) {
@@ -759,7 +759,7 @@ kimix::string validate_uniqueness(kimix::span<const kimix::string> prompts) {
     }
     // Python renders a set literal; the iteration order of a str set is
     // unspecified, so the duplicates are sorted for a deterministic message.
-    std::sort(duplicates.begin(), duplicates.end());
+    kimix::sort(duplicates.begin(), duplicates.end());
     kimix::vector<kimix::string> rendered;
     rendered.reserve(duplicates.size());
     for (const kimix::string &d : duplicates) {
@@ -1403,7 +1403,7 @@ workspace_hooks native_workspace_hooks() {
                 rels.push_back(kv.first);
             }
         }
-        std::sort(rels.begin(), rels.end());
+        kimix::sort(rels.begin(), rels.end());
         auto lookup = [](const kimix::vector<std::pair<kimix::string, kimix::string>> &set,
                          kimix::string_view key) -> const kimix::string * {
             for (const auto &kv : set) {

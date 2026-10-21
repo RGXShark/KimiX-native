@@ -28,7 +28,7 @@ target("kimix-core")
     -- kimix-marl backs the header-only core/fiber.h (fiber scheduler, events,
     -- wait groups, parallel for): its objects are archived on demand, so a
     -- consumer that never includes <core/fiber.h> links none of them.
-    add_deps("mimalloc", "kimix-xxhash", "kimix-yyjson", "kimix-pybind11", "kimix-marl")
+    add_deps("mimalloc", "kimix-xxhash", "kimix-yyjson", "kimix-pybind11", "kimix-marl", "kimix-pdqsort")
     kimix_set_pcxxheader("core/pch.h")
     _config_project({batch_size = 8, project_kind = "static"})
     on_load(function(target)

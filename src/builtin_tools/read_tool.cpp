@@ -1300,7 +1300,7 @@ bool render_cpu_profile(kimix::string_view json_text, kimix::string &out) {
             self_nodes.push_back(i);
         }
     }
-    std::sort(self_nodes.begin(), self_nodes.end(), [&arena](size_t a, size_t b) {
+    kimix::sort(self_nodes.begin(), self_nodes.end(), [&arena](size_t a, size_t b) {
         if (arena[a].self_micros != arena[b].self_micros) {
             return arena[a].self_micros > arena[b].self_micros;
         }
@@ -1323,7 +1323,7 @@ bool render_cpu_profile(kimix::string_view json_text, kimix::string &out) {
     // stack to avoid deep recursion on large profiles.
     if (root_idx != SIZE_MAX) {
         kimix::vector<size_t> child_order = arena[root_idx].children;
-        std::sort(child_order.begin(), child_order.end(),
+        kimix::sort(child_order.begin(), child_order.end(),
                   [&arena](size_t a, size_t b) {
                       if (arena[a].total_micros != arena[b].total_micros) {
                           return arena[a].total_micros > arena[b].total_micros;
@@ -1357,7 +1357,7 @@ bool render_cpu_profile(kimix::string_view json_text, kimix::string &out) {
             kimix::string indent(static_cast<size_t>(f.depth) * 2, ' ');
             lines.push_back(indent + rd_cpu_label(node));
             kimix::vector<size_t> kids = node.children;
-            std::sort(kids.begin(), kids.end(), [&arena](size_t a, size_t b) {
+            kimix::sort(kids.begin(), kids.end(), [&arena](size_t a, size_t b) {
                 if (arena[a].total_micros != arena[b].total_micros) {
                     return arena[a].total_micros > arena[b].total_micros;
                 }
@@ -1373,7 +1373,7 @@ bool render_cpu_profile(kimix::string_view json_text, kimix::string &out) {
         // No root: top 20 by total time from self_nodes ordering is not what
         // the reference does — it re-sorts by total_micros.
         kimix::vector<size_t> by_total = self_nodes;
-        std::sort(by_total.begin(), by_total.end(), [&arena](size_t a, size_t b) {
+        kimix::sort(by_total.begin(), by_total.end(), [&arena](size_t a, size_t b) {
             if (arena[a].total_micros != arena[b].total_micros) {
                 return arena[a].total_micros > arena[b].total_micros;
             }
@@ -1707,7 +1707,7 @@ bool render_sample_profile(kimix::string_view text, kimix::string &out) {
             active.push_back(i);
         }
     }
-    std::sort(active.begin(), active.end(), [&counts](size_t a, size_t b) {
+    kimix::sort(active.begin(), active.end(), [&counts](size_t a, size_t b) {
         if (counts[a] != counts[b]) {
             return counts[a] > counts[b];
         }

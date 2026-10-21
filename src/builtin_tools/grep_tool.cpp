@@ -2041,7 +2041,7 @@ tool_status sensitive_file_warning(kimix::span<const kimix::string> paths, bool 
             names.push_back(std::move(name));
         }
     }
-    std::sort(names.begin(), names.end());
+    kimix::sort(names.begin(), names.end());
     kimix::string file_list;
     for (size_t i = 0; i < names.size() && i < 5u; i++) {
         if (i > 0) {

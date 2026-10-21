@@ -221,7 +221,7 @@ void SymmetricDeleteIndex::expand(kimix::string_view query, uint32_t max_edits,
 
     // Deterministic ordering: (score desc, term asc). The reference returns
     // arbitrary set order — documented deviation.
-    std::sort(result.begin(), result.end(),
+    kimix::sort(result.begin(), result.end(),
               [](const fuzzy_candidate& a, const fuzzy_candidate& b) {
                   if (a.score != b.score) {
                       return a.score > b.score;

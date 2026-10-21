@@ -36,7 +36,7 @@ BudgetReminderProvider::BudgetReminderProvider(kimix::vector<double> warn_ratios
     : _warn_ratios(std::move(warn_ratios)),
       _wall_clock_seconds(wall_clock_seconds < 0 ? 0 : wall_clock_seconds),
       _clock(clock ? std::move(clock) : kimix::function<double()>(steady_monotonic_seconds)) {
-    std::sort(_warn_ratios.begin(), _warn_ratios.end());
+    kimix::sort(_warn_ratios.begin(), _warn_ratios.end());
     _warned_levels.assign(_warn_ratios.size(), false);
 }
 

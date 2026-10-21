@@ -225,7 +225,7 @@ bool ir_looks_whole_quoted(const Node &word) {
 }
 
 bool ir_spans_tile(SourceSpan span, kimix::vector<SourceSpan> children) {
-    std::sort(children.begin(), children.end(), [](const SourceSpan &a, const SourceSpan &b) { return a.start < b.start; });
+    kimix::sort(children.begin(), children.end(), [](const SourceSpan &a, const SourceSpan &b) { return a.start < b.start; });
     size_t cursor = span.start;
     for (const SourceSpan &child : children) {
         if (child.start < cursor) {
