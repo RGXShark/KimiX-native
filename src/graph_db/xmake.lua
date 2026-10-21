@@ -49,11 +49,9 @@ target("kimix-graph-db")
     -- "graph_db.h" (documented in graph_db.h's own example).
     add_includedirs(".", { public = true })
     add_deps("kimix-core")
-    -- kimix-core is built with KIMIX_CORE_EXPORT_DLL (so runtime_py.pyd
-    -- re-exports core API such as hash64); a consumer of this static archive
-    -- keeps plain references and links the static core copy. Public: the
-    -- dependents (tests) must define it too.
-    add_defines("KIMIX_CORE_STATIC", { public = true })
+    -- No KIMIX_CORE_STATIC (and no public propagation of it): KIMIX_CORE_API
+    -- resolves as dllimport against kimix-core.dll, both here and for this
+    -- archive's dependents (the tests).
     -- Static linkage of this library's own symbols: KIMIX_GRAPH_DB_API
     -- expands to nothing (src/graph_db/graph_db_api.h).
     add_defines("KIMIX_GRAPH_DB_STATIC", { public = true })

@@ -50,10 +50,9 @@ local function test_proj(name, source, callable)
         add_files(source)
         add_includedirs("./")
         add_deps("kimix-core")
-        -- kimix-core is built with KIMIX_CORE_EXPORT_DLL (so runtime_py.pyd
-        -- re-exports core API like hash64); tests keep plain references and
-        -- link the static copy through kimix-core.
-        add_defines("KIMIX_CORE_STATIC")
+        -- No KIMIX_CORE_STATIC: KIMIX_CORE_API resolves as dllimport and the test
+        -- binary links kimix-core.dll (the single mi_* heap lives there too). All
+        -- targets share bin/<mode>, so the loader resolves it without a PATH hack.
         -- The Boost.UT harness runs a test body only inside
         -- `#if defined(__cpp_exceptions)` (tests/ut/ut.hpp, runner::
         -- on(events::test<...>) wraps `test()` in try/catch and has no
@@ -111,6 +110,11 @@ test_proj("test_hash_map", "unit/core/test_hash_map.cpp")
 -- unit/ext
 test_proj("test_yyjson", "unit/ext/test_yyjson.cpp")
 test_proj("test_xxhash", "unit/ext/test_xxhash.cpp")
+-- unit/ext (vendored Lua 5.5.1 as the shared `lua` target: C API, error
+-- handling, C callbacks, GC/allocator stress over the mimalloc-backed luaL_alloc)
+test_proj("test_lua", "unit/ext/test_lua.cpp", function()
+    add_deps("lua")
+end)
 test_proj("test_pybind11", "unit/ext/test_pybind11.cpp")
 test_proj("test_mbedtls", "unit/ext/test_mbedtls.cpp", function()
     add_deps("kimix-llm", "kimix-mbedtls")

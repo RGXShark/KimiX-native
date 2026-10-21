@@ -7,9 +7,10 @@ Builds the project in release mode for x64 with:
   Linux:   GCC  via xmake (native on Linux, or through WSL when run on Windows)
 
 Then packages the result (``runtime_py.pyd`` on Windows / ``runtime_py.so`` on
-Linux, plus the loadable ``fts5_cjk`` SQLite extension, from ``bin/release``)
-into a ZIP archive named
-``kimix_base-<platform>-<arch>-<version>.zip``.
+Linux, plus the ``kimix-core`` shared library it links against dynamically,
+  from ``bin/release``) into a ZIP archive named
+  ``kimix_base-<platform>-<arch>-<version>.zip``.
+
 
 The archive is a plain ZIP (built with 7-Zip's `-tzip` / Deflate), NOT a 7z:
 the previous `.7z` release used the BCJ2 + LZMA2 filters that `py7zr` cannot
@@ -146,8 +147,17 @@ class Config:
     # Artifacts packaged into the archive (relative to RELEASE_DIR).
     # Windows ships the CPython extension under its native .pyd name; Linux
     # must use the .so suffix (CPython on Linux only imports *.so modules).
-    ARTIFACTS_WINDOWS: ClassVar[tuple[str, ...]] = ("runtime_py.pyd",)
-    ARTIFACTS_LINUX: ClassVar[tuple[str, ...]] = ("runtime_py.so",)
+    # kimix-core is the shared base library (it carries the single mimalloc
+    # heap) that runtime_py now links dynamically, so its dll/.so ships next
+    # to the module in the same archive.
+    ARTIFACTS_WINDOWS: ClassVar[tuple[str, ...]] = (
+        "runtime_py.pyd",
+        "kimix-core.dll",
+    )
+    ARTIFACTS_LINUX: ClassVar[tuple[str, ...]] = (
+        "runtime_py.so",
+        "libkimix-core.so",
+    )
 
     @staticmethod
     def artifacts_for(platform: str) -> tuple[str, ...]:
@@ -500,14 +510,19 @@ def _drop_foreign_extension(platform: str) -> None:
     publish.py would package the wrong binary (or trip package()'s magic
     guard). Deleting every foreign-magic output first forces a real relink.
 
-    All three output names are considered in BOTH directions: the Linux
+    All output names are considered in BOTH directions: the Linux
     ``after_link`` step also leaves an importable ``runtime_py.so`` copy and a
     ``libruntime_py.so`` symlink behind, which are just as foreign on the
     Windows side (and vice versa) and used to linger in ``bin/release`` after a
-    mixed-platform publish run.
+    mixed-platform publish run. The same applies to the kimix-core shared
+    library (``kimix-core.dll`` / ``libkimix-core.so``) that runtime_py links
+    against dynamically.
     """
     want = "pe" if platform == "windows" else "elf"
-    for name in ("runtime_py.pyd", "runtime_py.so", "libruntime_py.so"):
+    for name in (
+        "runtime_py.pyd", "runtime_py.so", "libruntime_py.so",
+        "kimix-core.dll", "libkimix-core.so",
+    ):
         path = Path(Config.RELEASE_DIR) / name
         if not (path.is_file() or path.is_symlink()):
             continue
@@ -738,7 +753,8 @@ def _verify_artifact(platform: str, archive: str, version: str) -> bool:
     is reported as "not verified" but not as a failure (the archive listing and
     the magic-byte guard still apply).
     """
-    artifact = Config.artifacts_for(platform)[0]
+    artifacts = Config.artifacts_for(platform)
+    artifact = artifacts[0]
     # Absolute paths: the probe runs with cwd=verify_dir, so relative ones would
     # be resolved twice (verify_dir/verify_dir/probe.py).
     verify_dir = (
@@ -749,11 +765,15 @@ def _verify_artifact(platform: str, archive: str, version: str) -> bool:
     verify_dir.mkdir(parents=True, exist_ok=True)
 
     sevenz = find_7z()
+    # Extract EVERY packaged artifact: runtime_py dynamically links
+    # kimix-core, so both files must sit side by side for the import probe.
     extract = subprocess.run(
-        [sevenz, "e", str(Path(archive).resolve()), f"-o{verify_dir}", artifact, "-y"],
+        [sevenz, "e", str(Path(archive).resolve()), f"-o{verify_dir}",
+         *artifacts, "-y"],
         capture_output=True, text=True,
     )
-    if extract.returncode != 0 or not (verify_dir / artifact).is_file():
+    missing = [a for a in artifacts if not (verify_dir / a).is_file()]
+    if extract.returncode != 0 or missing:
         _print(
             f"Could not extract {artifact} from {archive}:\n"
             f"{(extract.stdout or '') + (extract.stderr or '')}",
@@ -779,9 +799,16 @@ def _verify_artifact(platform: str, archive: str, version: str) -> bool:
         out = ((result.stdout or "") + (result.stderr or "")).strip()
         rc = result.returncode
     elif Config.IS_LINUX:
+        # runtime_py.so's NEEDED entry is libkimix-core.so; the archive's
+        # library sits next to the module in verify_dir, so point the loader
+        # there (cwd is not on the default search path).
+        env = dict(os.environ)
+        env["LD_LIBRARY_PATH"] = (
+            str(verify_dir) + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+        )
         result = subprocess.run(
             [sys.executable, str(probe)], cwd=str(verify_dir),
-            capture_output=True, text=True,
+            capture_output=True, text=True, env=env,
         )
         out = ((result.stdout or "") + (result.stderr or "")).strip()
         rc = result.returncode
@@ -791,7 +818,9 @@ def _verify_artifact(platform: str, archive: str, version: str) -> bool:
         # Bytes, not text: WSL relays raw diagnostic bytes on stderr.
         result = subprocess.run(
             [Config.WSL_EXE, "bash", "-lc",
-             f"cd {shlex.quote(inner)} && python3 {shlex.quote(inner_probe)}"],
+             f"cd {shlex.quote(inner)}"
+             f" && LD_LIBRARY_PATH={shlex.quote(inner)}"
+             f" python3 {shlex.quote(inner_probe)}"],
             capture_output=True,
         )
         out = (

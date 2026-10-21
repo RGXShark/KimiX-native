@@ -152,8 +152,14 @@ target_end()
 -- ============================================================================
 -- marl (fibers + work-stealing scheduler) — vendored at src/ext/marl
 -- (https://github.com/LuisaGroup/marl.git, same fork + pin as
--- C:/dev/compute/src/ext/marl, commit 4ed34cc). Built as the static lib
--- "kimix-marl"; the C++ sources are the single manual-unity TU
+  -- C:/dev/compute/src/ext/marl, commit 4ed34cc). Built as an OBJECT
+  -- target (like mimalloc): its objects are merged into kimix-core, so the
+  -- fiber scheduler and its thread_local state exist exactly ONCE per process.
+  -- A static archive would be re-linked privately into every consumer dll/exe
+  -- (each getting its own copy of marl's thread_local Scheduler::bound slot),
+  -- which breaks fiber scheduling across the kimix-core.dll boundary
+  -- (observed: deterministic test_fiber failure). The C++ sources are the
+  -- single manual-unity TU
 -- src/build.marl.cpp, which #includes debug/memory/scheduler/thread/trace.cpp
 -- and - on _WIN32 only - osfiber_windows.cpp (the Windows Fiber API:
 -- CreateFiberEx/SwitchToFiber, kernel32, already on the default link line). On
@@ -175,11 +181,11 @@ target_end()
 --     to nothing, which is exactly what an archived object wants.
 -- ============================================================================
 local marl_dir = path.join(os.scriptdir(), "marl")
-target("kimix-marl")
-    _config_project({
-        project_kind = "static"
-    })
-    -- Linked into the runtime_py shared module: Linux requires -fPIC objects.
+  target("kimix-marl")
+      _config_project({
+          project_kind = "object"
+      })
+      -- Merged into kimix-core (shared): Linux requires -fPIC objects.
     if is_plat("linux") then
         add_cxflags("-fPIC", {public = true})
         -- osfiber_asm_<arch>.S carries no .note.GNU-stack section, so without
@@ -241,6 +247,83 @@ target("kimix-mbedtls")
         if target:is_plat("windows") then
             target:add("defines", "_CRT_SECURE_NO_WARNINGS")
             target:add("syslinks", "ws2_32", "crypt32", {public = true})
+        end
+    end)
+target_end()
+
+-- ============================================================================
+-- Lua (5.5.x, vendored at src/ext/lua) — built as the SHARED library `lua`
+-- (lua.dll / liblua.so) exporting the plain C API (LUA_API) for FFI consumers.
+-- Every *.c in the tree is compiled except lua.c (the standalone interpreter
+-- main()), onelua.c (the single-TU distribution that #includes the others) and
+-- ltests.c (Lua's internal test harness, gated by LUA_LIB + ltests.h). Three
+-- guarded edits to the vendored sources carry the kimix wiring (see luaconf.h
+-- and lauxlib.c); a stock build that defines none of them is unaffected:
+--   * KIMIX_LUA_BUILD_SHARED (private, building this dll): luaconf.h emits
+--     __declspec(dllexport) on Windows / visibility("default") elsewhere on
+--     LUA_API (LUALIB_API and LUAMOD_API alias it).
+--   * KIMIX_LUA_USE_SHARED (public, consumers): dllimport on Windows, plain
+--     extern elsewhere — FFI/native consumers just need the declarations.
+-- * KIMIX_LUA_USE_MIMALLOC (private): lauxlib.c's default allocator
+-- luaL_alloc (what luaL_newstate passes to lua_newstate) routes through
+-- mi_free/mi_realloc, so a Lua state shares the kimix mimalloc heap.
+-- The two guarded source edits live as uncommitted changes inside the
+-- src/ext/lua submodule (pinned at upstream 8cb93bad); their exported diff
+-- is kept at src/ext/lua.kimix.patch — re-apply it after a submodule update.
+-- The mimalloc include dir + the MI_SHARED_LIB import declarations arrive
+-- transitively through kimix-core (this target's only dependency), matching
+-- the project rule that third-party deps are declared on kimix-core, never
+-- pulled directly.
+-- ============================================================================
+local lua_dir = path.join(os.scriptdir(), "lua")
+target("lua")
+    _config_project({
+        batch_size = 8,
+        project_kind = "shared",
+        rtti = false,
+        enable_exception = false
+    })
+    -- All library sources; the interpreter, single-TU and internal-test files
+    -- are excluded explicitly so a glob never drags in a main() or a duplicate
+    -- copy of every symbol.
+    add_files(path.join(lua_dir, "*.c"))
+    remove_files(path.join(lua_dir, "lua.c"),
+                 path.join(lua_dir, "onelua.c"),
+                 path.join(lua_dir, "ltests.c"))
+    -- Public: consumers need lua.h / lauxlib.h / lualib.h (and luaconf.h).
+    add_includedirs(lua_dir, {
+        public = true
+    })
+    add_headerfiles(path.join(lua_dir, "lua.h"),
+                    path.join(lua_dir, "luaconf.h"),
+                    path.join(lua_dir, "lauxlib.h"),
+                    path.join(lua_dir, "lualib.h"))
+    -- mimalloc (mi_free/mi_realloc) and its include dir + MI_SHARED_LIB import
+    -- declarations come transitively through kimix-core, per the project rule.
+    add_deps("kimix-core")
+    -- Building this dll: dllexport/visibility branch + the mimalloc allocator.
+    add_defines("KIMIX_LUA_BUILD_SHARED", "KIMIX_LUA_USE_MIMALLOC")
+    -- Consumers: dllimport/extern branch for the C API.
+    add_defines("KIMIX_LUA_USE_SHARED", {
+        public = true
+    })
+    on_load(function(target)
+        if target:is_plat("windows") then
+            -- C stdio/str functions (fopen, getenv, ...) otherwise warn as
+            -- "deprecated" under MSVC; loadlib.c uses LoadLibraryExA.
+            target:add("defines", "_CRT_SECURE_NO_WARNINGS")
+        elseif target:is_plat("linux") then
+            -- loadlib.c uses dlopen/dlsym/dlclose (-ldl); lmathlib.c uses the
+            -- libm math functions (-lm); loslib.c's system()/clock_gettime and
+            -- the pthread-backed scheduler hooks need -lpthread.
+            target:add("syslinks", "dl", "m", "pthread", {
+                public = true
+            })
+            -- liblua.so NEEDEDs libkimix-core.so; an $ORIGIN RUNPATH lets a
+            -- consumer resolve the transitive dep without LD_LIBRARY_PATH
+            -- (RUNPATH is not transitive, so the consumer's own $ORIGIN does
+            -- not cover it).
+            target:add("rpathdirs", "$ORIGIN")
         end
     end)
 target_end()

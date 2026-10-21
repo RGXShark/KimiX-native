@@ -52,12 +52,13 @@
 -- kimix-sqlite3).  The sqlite3 include directory arrives through the
 -- kimix-sqlite3 target's public includedirs.
 --
--- Heap ownership: the mimalloc objects live INSIDE this DLL (MI_SHARED_LIB /
--- MI_SHARED_LIB_EXPORT are propagated by the mimalloc target, so the mi_*
--- definitions are compiled into kimix_api and every buffer the FFI hands out is
--- allocated from that single heap).  A caller must therefore free FFI buffers
--- with kimix_mem_free() / kimix_yyjson_str_free() / kimix_vec_*() and never
--- with the C runtime malloc/free pair of its own module.
+-- Heap ownership: the mimalloc objects live in kimix-core.dll /
+-- libkimix-core.so, which this library links and imports (MI_SHARED_LIB is
+-- propagated by the mimalloc target through kimix-core, so the mi_* names are
+-- dllimport references resolved from kimix-core, and every buffer the FFI hands
+-- out is allocated from that single shared heap).  A caller must therefore free
+-- FFI buffers with kimix_mem_free() / kimix_yyjson_str_free() / kimix_vec_*() and
+-- never with the C runtime malloc/free pair of its own module.
 --
 -- Feature switch: --kimix_enable_api=false.  It is a FILE-LEVEL skip:
 -- src/xmake.lua does not even includes("api") then, so this target and its
@@ -76,8 +77,10 @@ target("kimix_api")
     -- <api/ffi_*.h> and core as <core/dll_export.h>, and a dependent target gets
     -- the same spelling.
     add_includedirs("..", {public = true})
-    -- The static archives this library links (kimix-core, mimalloc objects) are
-    -- compiled with -fPIC for exactly that reason (see src/xmake.lua).
+    -- The remaining static archive this library links (kimix-sqlite3) is
+    -- compiled with -fPIC for exactly that reason -- it ends up inside this
+    -- shared image. kimix-core is now a shared library (PIC by definition), so
+    -- it is no longer part of this DLL.
     if is_plat("linux") then
         add_cxflags("-fPIC", {public = true})
     end
@@ -93,11 +96,10 @@ target("kimix_api")
         -- A dlopen/LoadLibrary user compiles the headers with KIMIX_API_STATIC
         -- instead to get plain extern declarations.
         target:add("defines", "KIMIX_API_EXPORT_DLL")
-        -- kimix-core is consumed as the static copy that lives inside this DLL
-                  -- (same convention as kimix-test and the unit tests), and
-        -- publicly so a dependent target keeps resolving core as a static copy
-        -- rather than as an import of this library's re-exports.
-        target:add("defines", "KIMIX_CORE_STATIC", {public = true})
+        -- No KIMIX_CORE_STATIC (and no public propagation of it): the core code
+        -- no longer lives inside this DLL. kimix_api links kimix-core.dll and
+        -- imports the core surface plus the mi_* heap from it, so a dependent
+        -- target must likewise resolve KIMIX_CORE_API as dllimport.
         if target:is_plat("windows") then
             target:add("defines", "NOMINMAX", "_CRT_SECURE_NO_WARNINGS", {public = true})
         end
