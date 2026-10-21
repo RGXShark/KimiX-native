@@ -1,10 +1,18 @@
 -- Kimix library
 target("kimix-core")
-    set_kind("static")
-    -- The static archives are linked into the runtime_py shared module; on
-    -- Linux every object linked into a shared library must be -fPIC.
-    if is_plat("linux") then
-        add_cxflags("-fPIC", {public = true})
+    set_kind("shared")
+    -- Export the FULL C++ surface, not just the handful of KIMIX_CORE_API marks.
+    -- MSVC gives a shared target an empty export table unless something marks the
+    -- symbols, and only ~29 declarations across 11 of the 33 core headers carry
+    -- KIMIX_CORE_API (the STL wrappers in core/stl/* are not marked, yet their
+    -- out-of-line members are used by every consumer). The rule generates a .def
+    -- from the object files and passes it to the linker, so everything defined in
+    -- this library becomes importable. It asserts a shared target (true here),
+    -- and it is a no-op outside Windows -- gcc/clang already export every symbol
+    -- by default, so gating it to the MSVC platform is both sufficient and
+    -- intentional.
+    if is_plat("windows") then
+        add_rules("utils.symbols.export_all")
     end
     add_files("core/*.cpp")
     add_files("core/stl/*.cpp")       -- NEW: stl implementations
@@ -21,16 +29,22 @@ target("kimix-core")
     add_includedirs(".", {public = true})
     -- Dependency rule: all third-party deps are declared HERE (on kimix-core)
     -- only; every other target depends on kimix-core and never on a third-party
-    -- target directly. mimalloc's static.c.obj is archived into this lib and its
-    -- mi_* symbols are exported again by runtime_py.pyd (shared heap); native
-    -- tests import them from the pyd instead of pulling static.c.obj, because
-    -- kimix-core API like hash64 is ALSO re-exported by the pyd.
+    -- target directly. mimalloc stays an `object` target archived into this
+    -- shared library, so the ONE mi_* heap lives inside kimix-core.dll /
+    -- libkimix-core.so and every consumer (runtime_py, lua, kimix_api, the tests)
+    -- imports it from there instead of embedding its own copy -- that single heap
+    -- is what makes kimix::string / kimix::vector values handed across a dll
+    -- boundary free in the right allocator. Consumers get the MI_SHARED_LIB
+    -- dllimport declarations transitively from the mimalloc target's public
+    -- defines, and KIMIX_CORE_API resolves to dllimport for them because they
+    -- define neither KIMIX_CORE_STATIC nor KIMIX_CORE_EXPORT_DLL
+    -- (src/core/dll_export.h).
     -- kimix-marl backs the header-only core/fiber.h (fiber scheduler, events,
-    -- wait groups, parallel for): its objects are archived on demand, so a
-    -- consumer that never includes <core/fiber.h> links none of them.
+    -- wait groups, parallel for): its objects are archived into this dll, so a
+    -- consumer never pulls them directly -- it calls the exported core API.
     add_deps("mimalloc", "kimix-xxhash", "kimix-yyjson", "kimix-pybind11", "kimix-marl", "kimix-pdqsort")
     kimix_set_pcxxheader("core/pch.h")
-    _config_project({batch_size = 8, project_kind = "static"})
+    _config_project({batch_size = 8, project_kind = "shared"})
     on_load(function(target)
         -- ================================================================
         -- Version header: generated from the single config file
@@ -70,13 +84,13 @@ target("kimix-core")
             io.writefile(version_h, version_h_content)
         end
         target:add("includedirs", gen_dir, {public = true})
-        -- kimix-core is compiled as an exported library: when linked into
-        -- runtime_py.pyd its KIMIX_CORE_API symbols (e.g. hash64) are exported,
-        -- so native test executables resolve them as pyd imports instead of
-        -- pulling kimix-core unity members (which would drag mimalloc's
-        -- static.c.obj into the link and collide with the mi_* imports).
-        -- Consumers define KIMIX_CORE_STATIC themselves (kimix-test, test_proj,
-        -- runtime_py) to keep plain references and link the static copy.
+        -- kimix-core IS the exported library: this target compiles the dll with
+        -- the dllexport/visibility branch, and the windows export_all rule above
+        -- carries the unmarked symbols (the STL wrappers) out too. Every consumer
+        -- links kimix-core.dll and resolves KIMIX_CORE_API as dllimport, because
+        -- it defines neither KIMIX_CORE_STATIC nor KIMIX_CORE_EXPORT_DLL
+        -- (src/core/dll_export.h). KIMIX_CORE_STATIC is kept as the escape hatch
+        -- for an external user that builds/links a static copy of the sources.
         target:add("defines", "KIMIX_CORE_EXPORT_DLL")
         if has_config('kimix_disable_win_message_box') and target:is_plat('windows') then
             target:add('defines', 'KIMIX_DISABLE_WIN_MESSAGE_BOX', {public = true})
@@ -113,7 +127,9 @@ if kimix_enable_tests then
     set_kind("binary")
     add_files("test/main.cpp")
     add_deps("kimix-core")
-    add_defines("KIMIX_CORE_STATIC")
+    -- No KIMIX_CORE_STATIC: KIMIX_CORE_API resolves as dllimport and the binary
+    -- links kimix-core.dll (every target shares bin/<mode>, so the loader finds
+    -- it without a PATH change).
     _config_project({batch_size = 8})
 
     add_tests("basic", {
@@ -164,8 +180,9 @@ end
         -- below); KIMIX_RUNTIME_EXPORT_DLL makes them dllexport (so runtime_py
         -- re-exports them and its pybind bindings resolve them as imports) and
         -- makes pwsh_tool's calls plain references resolved from this lib. This
-                  -- keeps the unit tests independent of runtime_py (linking the pyd alongside
-        -- the static kimix-core copy would collide on mimalloc mi_*/hash64).
+                    -- keeps the unit tests independent of runtime_py (the runtime
+          -- kernels live in this static lib and are re-exported by the pyd, so a
+          -- test that links kimix-llm resolves them without the pyd).
       add_files("runtime/parse/shell_scanner.cpp", "runtime/tools/shell_safety.cpp")
       -- AgentSession embeds a kimix::runtime::index::HistoryIndex (the
       -- retrieve tool's in-memory index, gap D4), so the index kernels are
@@ -195,9 +212,9 @@ end
                -- SQLite context store (src/agent/context_db.*, the context_db.py
                -- port): amalgamation static lib, FTS5 enabled.
                "kimix-sqlite3")
-      add_defines("KIMIX_CORE_STATIC", "KIMIX_LLM_STATIC", "KIMIX_RUNTIME_EXPORT_DLL",
-                  {public = true})
-      _config_project({batch_size = 8, project_kind = "static"})
+        add_defines("KIMIX_LLM_STATIC", "KIMIX_RUNTIME_EXPORT_DLL",
+                    {public = true})
+        _config_project({batch_size = 8, project_kind = "static"})
   target_end()
 
 
@@ -283,7 +300,11 @@ target("runtime_py")
         end
         -- Export runtime symbols from this module; consumers see dllimport.
         target:add("defines", "KIMIX_RUNTIME_EXPORT_DLL")
-        target:add("defines", "KIMIX_CORE_STATIC", {public = true})
+        -- No KIMIX_CORE_STATIC (and no public propagation of it): the core code
+        -- is NOT compiled into this module any more -- runtime_py.pyd links
+        -- kimix-core.dll and imports both the KIMIX_CORE_API surface and the
+        -- single mi_* mimalloc heap from it. publish.py therefore ships
+        -- kimix-core.dll / libkimix-core.so next to runtime_py.
 
         -- Python interpreter discovery.  Windows keeps the original direct
         -- call (python is on PATH).  On Linux the bare name "python" usually

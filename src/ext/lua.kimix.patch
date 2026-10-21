@@ -1,0 +1,69 @@
+diff --git a/lauxlib.c b/lauxlib.c
+index 8620c8b3..34e73868 100644
+--- a/lauxlib.c
++++ b/lauxlib.c
+@@ -27,6 +27,10 @@
+ #include "lauxlib.h"
+ #include "llimits.h"
+ 
++#if defined(KIMIX_LUA_USE_MIMALLOC)	/* { */
++#include <mimalloc.h>	/* kimix: default allocator backed by mimalloc */
++#endif					/* } */
++
+ 
+ /*
+ ** {======================================================
+@@ -1061,12 +1065,21 @@ LUALIB_API const char *luaL_gsub (lua_State *L, const char *s,
+ 
+ void *luaL_alloc (void *ud, void *ptr, size_t osize, size_t nsize) {
+   UNUSED(ud); UNUSED(osize);
++#if defined(KIMIX_LUA_USE_MIMALLOC)				/* { */
++  if (nsize == 0) {
++  mi_free(ptr);
++  return NULL;
++  }
++  else
++  return mi_realloc(ptr, nsize);
++#else						/* }{ */
+   if (nsize == 0) {
+-    free(ptr);
+-    return NULL;
++ free(ptr);
++ return NULL;
+   }
+   else
+-    return realloc(ptr, nsize);
++ return realloc(ptr, nsize);
++#endif					/* } */
+ }
+ 
+ 
+diff --git a/luaconf.h b/luaconf.h
+index bdac085c..3961531d 100644
+--- a/luaconf.h
++++ b/luaconf.h
+@@ -302,7 +302,23 @@
+ ** the libraries, you may want to use the following definition (define
+ ** LUA_BUILD_AS_DLL to get it).
+ */
+-#if defined(LUA_BUILD_AS_DLL)	/* { */
++#if defined(KIMIX_LUA_BUILD_SHARED)	/* { */
++
++#if defined(_WIN32)
++#define LUA_API __declspec(dllexport)
++#else						/* }{ */
++#define LUA_API	extern __attribute__((visibility("default")))
++#endif						/* } */
++
++#elif defined(KIMIX_LUA_USE_SHARED)	/* { */
++
++#if defined(_WIN32)
++#define LUA_API __declspec(dllimport)
++#else						/* }{ */
++#define LUA_API		extern
++#endif						/* } */
++
++#elif defined(LUA_BUILD_AS_DLL)	/* { */
+ 
+ #if defined(LUA_CORE) || defined(LUA_LIB)	/* { */
+ #define LUA_API __declspec(dllexport)
