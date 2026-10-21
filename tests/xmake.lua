@@ -687,3 +687,22 @@ end)
             "unit/cli/test_subagent_bg_startup_stress.cpp", function()
       add_deps("kimix-llm", "kimix-cli")
   end)
+
+-- unit/graph_db -- the graph database (src/graph_db, kimix-graph-db).
+--
+-- S1 (in-memory container + LMDB cold-storage glue): test_graph_db is the real
+-- suite. The other two are registered with minimal placeholder suites so the
+-- build stays green until their subtasks land -- S2 fills in
+-- test_graph_db_serialize.cpp (round-trip / incremental / dual-stage /
+-- corruption) and S3 fills in test_graph_db_bench.cpp (read/write benchmarks
+-- over bench_util.h). Their test_proj lines need no change then, and neither
+-- does this comment.
+test_proj("test_graph_db", "unit/graph_db/test_graph_db.cpp", function()
+    add_deps("kimix-graph-db")
+end)
+test_proj("test_graph_db_serialize", "unit/graph_db/test_graph_db_serialize.cpp", function()
+    add_deps("kimix-graph-db")
+end)
+test_proj("test_graph_db_bench", "unit/graph_db/test_graph_db_bench.cpp", function()
+    add_deps("kimix-graph-db")
+end)

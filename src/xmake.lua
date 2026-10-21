@@ -219,6 +219,9 @@ includes("cli")
 if has_config("kimix_enable_api") then
     includes("api")
 end
+-- Include the graph database (src/graph_db): kimix-graph-db (static), the
+-- in-memory graph container + LMDB cold-storage glue (kimix-core only).
+includes("graph_db")
 
 
 

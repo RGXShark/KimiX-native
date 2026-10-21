@@ -1,6 +1,9 @@
 #include <core/shared_atomic_mutex.h>
 #include <core/stl/format.h>
 #include <core/intrin.h>
+// std::this_thread::yield() below: <thread> is not pulled in transitively by
+// the headers above on GCC/libstdc++ (MSVC happens to provide it).
+#include <thread>
 namespace kimix {
 
 shared_atomic_mutex::shared_atomic_mutex()

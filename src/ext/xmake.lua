@@ -24,7 +24,13 @@ target("mimalloc")
         add_defines("_CRT_SECURE_NO_WARNINGS")
     elseif is_plat("linux") then
         add_syslinks("pthread", "atomic", {public = true})
-        add_defines("MI_NO_THP")
+        -- MI_NO_THP must NOT be defined here: vendored mimalloc 3.6.0
+        -- (src/ext/mimalloc, prim/unix/prim.c) leaves a dangling `else` when
+        -- MI_NO_THP is combined with MADV_NOHUGEPAGE (always defined on Linux
+        -- glibc), so the unix primitive translation unit fails to compile.
+        -- The THP madvise path stays runtime-gated by mi_option_allow_thp
+        -- (default off) and MADV_NOHUGEPAGE prevention still applies, so
+        -- dropping the define does not change allocator behavior.
     else
         add_syslinks("pthread", {public = true})
     end

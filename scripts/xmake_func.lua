@@ -442,6 +442,30 @@ on_load(function(target)
     -- type dispatch uses a manual tag instead (a virtual tag getter or an
     -- explicit tag member) plus static_cast.
     local use_rtti = _get_or("rtti", false)
+    -- pybind11 3.x (src/ext/pybind11, third-party code we never modify) uses
+    -- typeid() unconditionally in its cast machinery (pytypes.h, detail/
+    -- descr.h), so the pybind11 binding targets must keep RTTI as well as
+    -- exceptions even when the project disables both.  Those are exactly the
+    -- kimix_exceptions_targets (runtime_py, test_pybind11).  MSVC compiles
+    -- typeid under /GR- so this only bites GCC/Clang, but apply it everywhere
+    -- for consistency.
+    if not use_rtti then
+        local keep_rtti = get_config("kimix_exceptions_targets")
+        local names = {}
+        if type(keep_rtti) == "table" then
+            names = keep_rtti
+        elseif type(keep_rtti) == "string" and #keep_rtti > 0 then
+            for name in keep_rtti:gmatch("[^,%s]+") do
+                table.insert(names, name)
+            end
+        end
+        for _, name in ipairs(names) do
+            if name == target:name() then
+                use_rtti = true
+                break
+            end
+        end
+    end
     if not empty_str(use_rtti) then
         if use_rtti then
             -- Enable RTTI
@@ -449,7 +473,7 @@ on_load(function(target)
                 tools = {"clang_cl", "cl"}
             })
             target:add("cxflags", "-frtti", {
-                tools = {"clang"}
+                tools = {"clang", "gcc"}
             })
         else
             -- Disable RTTI

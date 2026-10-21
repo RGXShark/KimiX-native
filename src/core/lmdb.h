@@ -149,12 +149,16 @@ public:
 
     [[nodiscard]] kimix::span<const std::byte> read(kimix::span<const std::byte> key) const noexcept;
     [[nodiscard]] kimix::span<const std::byte> read(kimix::string_view key) const noexcept {
-        return read(kimix::span{reinterpret_cast<std::byte const*>(key.data()), key.size()});
+        // The explicit template argument is required: CTAD through the alias
+        // template kimix::span breaks on GCC 13 (deduction lands on the
+        // array guide with extent npos -> hard error), so `kimix::span{...}`
+        // does not compile there even though MSVC and newer GCC accept it.
+        return read(kimix::span<const std::byte>{reinterpret_cast<std::byte const*>(key.data()), key.size()});
     }
 
     void write(kimix::span<const std::byte> key, kimix::span<const std::byte> value) const noexcept;
     void write(kimix::string_view key, kimix::span<const std::byte> value) const noexcept {
-        write(kimix::span{reinterpret_cast<std::byte const*>(key.data()), key.size()}, value);
+        write(kimix::span<const std::byte>{reinterpret_cast<std::byte const*>(key.data()), key.size()}, value);
     }
 
     void write_all(kimix::vector<LMDBWriteCommand>&& commands) const noexcept;
