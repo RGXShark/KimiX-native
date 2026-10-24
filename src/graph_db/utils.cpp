@@ -18,8 +18,9 @@
 
 #include "binary_le.h"
 
-#include <core/md5.h>
-#include <core/stl/string.h>
+  #include <core/md5.h>
+  #include <core/stl/hash.h>
+  #include <core/stl/string.h>
 
 #include <cstring>
 #include <utility>
@@ -156,10 +157,25 @@ kimix::optional<kimix::Guid> edge_from_key(kimix::span<const std::byte> key) noe
     return read_guid_bytes(key.data() + 2);
 }
 
-kimix::MD5 md5_of(kimix::span<const std::byte> bytes) noexcept {
-    return kimix::MD5{kimix::span<uint8_t const>{
-        reinterpret_cast<uint8_t const *>(bytes.data()), bytes.size()}};
-}
+  kimix::MD5 md5_of(kimix::span<const std::byte> bytes) noexcept {
+      return kimix::MD5{kimix::span<uint8_t const>{
+          reinterpret_cast<uint8_t const *>(bytes.data()), bytes.size()}};
+  }
+
+  kimix::MD5 content_digest_of(kimix::span<const std::byte> bytes, ContentDigest policy) noexcept {
+      if (policy == ContentDigest::xxh3) {
+          // XXH3-128 into the same 16-byte digest container, little-endian so
+          // the digest bytes are host-independent exactly like an MD5 digest.
+          // The hash is a change detector (compared against the value recorded
+          // at save time), not a signature, so the switch from MD5 loses
+          // nothing.
+          kimix::Hash128 const digest = kimix::hash128(bytes.data(), bytes.size());
+          return kimix::MD5{kimix::MD5::MD5Data{
+              detail::read_u64(reinterpret_cast<std::byte const *>(digest.data())),
+              detail::read_u64(reinterpret_cast<std::byte const *>(digest.data()) + 8)}};
+      }
+      return md5_of(bytes);
+  }
 
 // ---------------------------------------------------------------------------
 // Vertex record codec

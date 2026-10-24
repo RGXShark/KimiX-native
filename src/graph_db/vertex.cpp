@@ -9,7 +9,9 @@
  * shard (documented on each private helper in vertex.h). Nothing in this file
  * aborts, throws or allocates on a failure path.
  */
-#include "vertex.h"
+  #include "vertex.h"
+
+  #include "utils.h"
 
 #include <mimalloc.h>
 
@@ -30,11 +32,17 @@ Vertex::Vertex(kimix::Guid const &guid) noexcept
     : _guid(guid) {
 }
 
-Vertex::Vertex(kimix::Guid const &guid,
-               kimix::span<const std::byte> initial_content)
-    : _guid(guid) {
-    set_content(initial_content);
-}
+  Vertex::Vertex(kimix::Guid const &guid,
+                 kimix::span<const std::byte> initial_content)
+      : _guid(guid) {
+      set_content(initial_content);
+  }
+
+  Vertex::Vertex(kimix::Guid const &guid,
+                 kimix::span<const std::byte> initial_content, ContentDigest content_digest)
+      : _guid(guid), _content_digest(content_digest) {
+      set_content(initial_content);
+  }
 
 // ---------------------------------------------------------------------------
 // Content (vertex lock: shared for reads, unique for writes)
@@ -60,67 +68,45 @@ kimix::MD5 Vertex::content_hash() const {
     return _content_hash;
 }
 
-void Vertex::set_content(kimix::span<const std::byte> content) {
-    VertexUniqueLock guard(_mutex);
-    _content.assign(content.begin(), content.end());
-    _content_hash = kimix::MD5{kimix::span<uint8_t const>{
-        reinterpret_cast<uint8_t const *>(_content.data()), _content.size()}};
-    _dirty.store(true, std::memory_order_release);
-}
+  void Vertex::set_content(kimix::span<const std::byte> content) {
+      VertexUniqueLock guard(_mutex);
+      _content.assign(content.begin(), content.end());
+      _content_hash = content_digest_of(
+          kimix::span<const std::byte>{_content.data(), _content.size()}, _content_digest);
+      _dirty.store(true, std::memory_order_release);
+  }
 
-void Vertex::touch() {
-    VertexUniqueLock guard(_mutex);
-    _content_hash = kimix::MD5{kimix::span<uint8_t const>{
-        reinterpret_cast<uint8_t const *>(_content.data()), _content.size()}};
-    _dirty.store(true, std::memory_order_release);
-}
+  void Vertex::touch() {
+      VertexUniqueLock guard(_mutex);
+      _content_hash = content_digest_of(
+          kimix::span<const std::byte>{_content.data(), _content.size()}, _content_digest);
+      _dirty.store(true, std::memory_order_release);
+  }
 
 // ---------------------------------------------------------------------------
 // Dependencies
 // ---------------------------------------------------------------------------
 
 bool Vertex::depends_on(kimix::Guid const &guid) const noexcept {
-    // The maintained projection, not the link list: both hold one entry per
-    // outgoing EDGE, so a parallel edge is found the same way.
-    return std::find(_depending_guids.begin(), _depending_guids.end(), guid) !=
-           _depending_guids.end();
+    // The link list holds one entry per outgoing EDGE, so a parallel edge is
+    // found the same way a distinct-neighbour probe would find it.
+    return std::any_of(_out_links.begin(), _out_links.end(),
+                       [&guid](EdgeLink const &link) { return link.neighbour == guid; });
 }
 
 void Vertex::reserve_links(size_t outgoing, size_t incoming) {
     // Only ever grows: each reserve() is itself a no-op below the current
     // capacity, so a second call with a smaller count cannot shrink a container
     // or move an element out of it.
-    _depending.reserve(outgoing);
-    _depending_guids.reserve(outgoing);
     _out_links.reserve(outgoing);
-    _depended.reserve(incoming);
-    _depended_guids.reserve(incoming);
     _in_links.reserve(incoming);
 }
 
-kimix::vector<Vertex *> Vertex::depending() const {
-    kimix::vector<Vertex *> out;
-    out.reserve(_depending.size());
-    for (auto *vertex : _depending) {
-        out.push_back(vertex);
-    }
-    return out;
-}
 
-kimix::vector<Vertex *> Vertex::depended() const {
-    kimix::vector<Vertex *> out;
-    out.reserve(_depended.size());
-    for (auto *vertex : _depended) {
-        out.push_back(vertex);
-    }
-    return out;
-}
+
+
 
 void Vertex::_clear_links() noexcept {
-    _depending.clear();
-    _depended.clear();
-    _depending_guids.clear();
-    _depended_guids.clear();
     _out_links.clear();
     _in_links.clear();
 }
@@ -132,76 +118,33 @@ void Vertex::_clear_links() noexcept {
 void Vertex::_add_out_link(kimix::Guid const &edge, Vertex *neighbour) {
     kimix::Guid const neighbour_guid = neighbour != nullptr ? neighbour->guid() : kimix::Guid{};
     _out_links.push_back(EdgeLink{edge, neighbour_guid});
-    _depending_guids.push_back(neighbour_guid);
-    if (neighbour != nullptr) {
-        _depending.insert(neighbour);
-    }
 }
 
 void Vertex::_add_in_link(kimix::Guid const &edge, Vertex *neighbour) {
     kimix::Guid const neighbour_guid = neighbour != nullptr ? neighbour->guid() : kimix::Guid{};
     _in_links.push_back(EdgeLink{edge, neighbour_guid});
-    _depended_guids.push_back(neighbour_guid);
-    if (neighbour != nullptr) {
-        _depended.insert(neighbour);
-    }
 }
 
 bool Vertex::_remove_out_link(kimix::Guid const &edge, Vertex *neighbour) {
+    // The link list is the one adjacency representation (plan v3 §5.2):
+    // removing the entry removes everything there is to remove.
+    (void)neighbour; // kept in the signature: the caller resolves the endpoint
     for (size_t i = 0; i < _out_links.size(); ++i) {
-        if (_out_links[i].edge != edge) {
-            continue;
+        if (_out_links[i].edge == edge) {
+            _out_links.erase(_out_links.begin() + static_cast<ptrdiff_t>(i));
+            return true;
         }
-        kimix::Guid const neighbour_guid = _out_links[i].neighbour;
-        _out_links.erase(_out_links.begin() + static_cast<ptrdiff_t>(i));
-        for (size_t k = 0; k < _depending_guids.size(); ++k) {
-            if (_depending_guids[k] == neighbour_guid) {
-                _depending_guids.erase(_depending_guids.begin() + static_cast<ptrdiff_t>(k));
-                break;
-            }
-        }
-        if (neighbour != nullptr) {
-            // Multi-edges: the neighbour only leaves the resolved set when its
-            // LAST parallel edge is gone, which is what keeps the set a true
-            // "distinct neighbours" view for traversals.
-            bool const still_linked =
-                std::any_of(_out_links.begin(), _out_links.end(),
-                            [&neighbour_guid](EdgeLink const &link) {
-                                return link.neighbour == neighbour_guid;
-                            });
-            if (!still_linked) {
-                _depending.erase(neighbour);
-            }
-        }
-        return true;
     }
     return false;
 }
 
 bool Vertex::_remove_in_link(kimix::Guid const &edge, Vertex *neighbour) {
+    (void)neighbour; // kept in the signature: the caller resolves the endpoint
     for (size_t i = 0; i < _in_links.size(); ++i) {
-        if (_in_links[i].edge != edge) {
-            continue;
+        if (_in_links[i].edge == edge) {
+            _in_links.erase(_in_links.begin() + static_cast<ptrdiff_t>(i));
+            return true;
         }
-        kimix::Guid const neighbour_guid = _in_links[i].neighbour;
-        _in_links.erase(_in_links.begin() + static_cast<ptrdiff_t>(i));
-        for (size_t k = 0; k < _depended_guids.size(); ++k) {
-            if (_depended_guids[k] == neighbour_guid) {
-                _depended_guids.erase(_depended_guids.begin() + static_cast<ptrdiff_t>(k));
-                break;
-            }
-        }
-        if (neighbour != nullptr) {
-            bool const still_linked =
-                std::any_of(_in_links.begin(), _in_links.end(),
-                            [&neighbour_guid](EdgeLink const &link) {
-                                return link.neighbour == neighbour_guid;
-                            });
-            if (!still_linked) {
-                _depended.erase(neighbour);
-            }
-        }
-        return true;
     }
     return false;
 }

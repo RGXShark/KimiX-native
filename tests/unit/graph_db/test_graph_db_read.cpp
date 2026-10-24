@@ -231,7 +231,82 @@ int main(int argc, char *argv[]) {
         expect(exists) << "the undirected edge is incident for c";
     };
 
-    "read_constraint_matrix"_test = [] {
+    "read_unfiltered_fast_path"_test = [] {
+      // Plan v3 §4.1: the unfiltered neighbourhood read answers from ONE shard
+      // SHARED lock snapshot of the anchor's adjacency projection (no per-edge
+      // endpoint round-trips, no per-neighbour record/label/property reads).
+      // Semantics must stay identical to the filtered walk: distinct neighbour
+      // guids, parallel edges collapsed, self loop counted once per side.
+      fixture f(4);
+      Guid const a = f.vertices[0];
+      Guid const b = f.vertices[1];
+      Guid const c = f.vertices[2];
+      Guid const d = f.vertices[3];
+      // a -> b twice (parallel), a -> c undirected, a -> a loop, b -> a back.
+      Guid e1;
+      Guid e2;
+      Guid e3;
+      Guid e4;
+      Guid e5;
+      expect(eq(f.db.edge_create(a, b, EdgeDirectionType::directed, {}, nullptr, e1),
+                GdiStatus::ok));
+      expect(eq(f.db.edge_create(a, b, EdgeDirectionType::directed, {}, nullptr, e2),
+                GdiStatus::ok)) << "parallel edges are allowed on this store";
+      expect(eq(f.db.edge_create(a, c, EdgeDirectionType::undirected, {}, nullptr, e3),
+                GdiStatus::ok));
+      expect(eq(f.db.edge_create(a, a, EdgeDirectionType::directed, {}, nullptr, e4),
+                GdiStatus::ok));
+      expect(eq(f.db.edge_create(b, a, EdgeDirectionType::directed, {}, nullptr, e5),
+                GdiStatus::ok));
+      // The fixture hub also links hub -> a and hub -> every other vertex.
+      size_t count = 0;
+      expect(eq(f.db.count_neighbors(a, Constraint{}, EdgeOrientation::outgoing, count),
+                GdiStatus::ok));
+      // out: b (two parallel edges collapse), c (undirected), the loop = 3.
+      expect(eq(count, size_t{3}));
+      expect(eq(f.db.count_neighbors(a, Constraint{}, EdgeOrientation::incoming, count),
+                GdiStatus::ok));
+      // in: hub, b, the loop = 3 (the undirected a -> c edge is OUTGOING for
+      // a by the record's endpoints, exactly like the incidence matrix).
+      expect(eq(count, size_t{3}));
+      expect(eq(f.db.count_neighbors(a, Constraint{}, EdgeOrientation::both, count),
+                GdiStatus::ok));
+      // distinct union: {hub, b, c, a} = 4.
+      expect(eq(count, size_t{4}));
+      // The cap>0 page returns the same distinct set with the real total.
+      VertexPage page;
+      expect(eq(f.db.get_neighbor_vertices(a, Constraint{}, EdgeOrientation::outgoing, 10, page),
+                GdiStatus::ok));
+      expect(eq(page.total_count, size_t{3}));
+      expect(eq(page.items.size(), size_t{3}));
+      // Every reported neighbour exists (the projection only names live edges).
+      for (auto const &guid : page.items) {
+          expect(f.db.graph().contains(guid));
+      }
+      // The unfiltered read sees a mutation immediately (no stale counter cache).
+      Guid e6;
+      expect(eq(f.db.edge_create(a, d, EdgeDirectionType::directed, {}, nullptr, e6),
+                GdiStatus::ok));
+      expect(eq(f.db.count_neighbors(a, Constraint{}, EdgeOrientation::outgoing, count),
+                GdiStatus::ok));
+      expect(eq(count, size_t{4})) << "d joins the outgoing neighbourhood";
+      // Removing an edge updates the count the same way.
+      expect(eq(f.db.edge_free(e1), GdiStatus::ok));
+      expect(eq(f.db.count_neighbors(a, Constraint{}, EdgeOrientation::outgoing, count),
+                GdiStatus::ok));
+      expect(eq(count, size_t{4})) << "one parallel edge to b remains";
+      expect(eq(f.db.edge_free(e2), GdiStatus::ok));
+      expect(eq(f.db.count_neighbors(a, Constraint{}, EdgeOrientation::outgoing, count),
+                GdiStatus::ok));
+      expect(eq(count, size_t{3})) << "b is gone from the outgoing side";
+      // Unknown vertex: error_vertex on both the probe and the page.
+      Guid const missing = Guid{true};
+      expect(eq(f.db.count_neighbors(missing, Constraint{}, EdgeOrientation::outgoing, count),
+                GdiStatus::error_vertex));
+      expect(eq(f.db.get_neighbor_vertices(missing, Constraint{}, EdgeOrientation::both, 0, page),
+                GdiStatus::error_vertex));
+  };
+  "read_constraint_matrix"_test = [] {
         fixture f(10);
 
         // Label conditions: equal / not-equal over the explicit label set.

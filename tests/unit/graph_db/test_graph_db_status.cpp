@@ -199,15 +199,38 @@ int main(int argc, char *argv[]) {
             << "the (label, external_id) KeyIndex refuses a duplicate";
         expect(cap.supports_edge_by_stable_uid) << "edges carry a stable uid across save/load";
         expect(cap.supports_edge_property_read) << "edges carry properties";
-        expect(cap.supports_collective_transactions) << "a read-only scope is supported";
-        // The phase-2 gaps stay honest: the frontend validator rejects those
-        // commands today, so advertising them would make the adapter emit
-        // commands this backend cannot honour.
-        expect(!cap.supports_global_scan);
-        expect(!cap.supports_native_multi_hop);
-        expect(eq(cap.max_native_hop_depth, int32_t{0}));
-        expect(!cap.supports_global_aggregates);
+      expect(cap.supports_collective_transactions) << "a read-only scope is supported";
+      // G3 (plan v3 step 1.6): native multi-hop traversal is implemented
+      // (Graph::traverse_bfs + the bounded shortest_path, through Database,
+      // the C ABI and the kimix_graphdb_* re-exports); the advertised depth is
+      // the real bound the implementation validates against.
+      expect(cap.supports_native_multi_hop);
+      expect(eq(cap.max_native_hop_depth, int32_t{32}));
+        // G1/G4 (plan v3 Phase 2): the global scan (Graph::for_each_vertex,
+        // Database::scan_vertices) and the fiber-fan-out aggregates are
+        // implemented through the C ABI and the C# adapter; the flags are on
+        // and the mutation checks below keep them honest.
+        expect(cap.supports_global_scan);
+        expect(cap.supports_global_aggregates);
     };
+  "capability_multi_hop_cannot_silently_regress"_test = [] {
+      // Mutation check: flip the G3 flag (or the advertised depth) on a copy
+      // and assert the name diff catches exactly that — the same diff the C#
+      // Capability.Diff mirror computes, so a silent regression fails loudly
+      // on both sides of the seam.
+      Capability const live = graph_db::current_capability();
+      expect(live.supports_native_multi_hop) << "the suite starts from the advertised true";
+      Capability regressed = live;
+      regressed.supports_native_multi_hop = false;
+      auto diff = graph_db::capability_name_diff(live, regressed);
+      expect(eq(diff.size(), size_t{1}));
+      expect(same_text(diff[0], "supports_native_multi_hop"));
+      Capability shallow = live;
+      shallow.max_native_hop_depth = 0;
+      diff = graph_db::capability_name_diff(live, shallow);
+      expect(eq(diff.size(), size_t{1}));
+      expect(same_text(diff[0], "max_native_hop_depth"));
+  };
 
     "capability_diff_names_every_difference"_test = [] {
         Capability base = graph_db::current_capability();

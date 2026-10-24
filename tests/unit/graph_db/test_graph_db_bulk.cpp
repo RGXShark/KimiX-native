@@ -47,6 +47,7 @@ using graph_db::GdiStatus;
 using graph_db::GraphSerializeStats;
 using graph_db::LabelId;
 using graph_db::NamedPropertyList;
+using graph_db::PropertyEntry;
 using graph_db::PropNameId;
 using graph_db::PropertyTypeInfo;
 using graph_db::PropertyValue;
@@ -206,7 +207,53 @@ int main(int argc, char *argv[]) {
         expect(eq(f.db.graph().key_index().size(), size_t{0}));
     };
 
-    "bulk_create_edges_with_a_refused_row"_test = [] {
+          "bulk_vertices_inside_caller_transaction"_test = [] {
+          // Plan v3 §4.4 (the native bulk defect): create_vertices_bulk must be
+          // usable inside an explicitly open caller transaction. The old eager
+          // `Transaction local` was destroyed with its journal still open, and
+          // its destructor called Database::abort() — on the CALLER's
+          // transaction: the batch itself worked, but the caller's commit then
+          // answered ERR_TRANSACTION and every journal entry (the whole batch)
+          // was rolled back. The local scope is now built lazily, so with a
+          // caller tx open there is NO local object at all.
+          fixture f(0);
+          auto const make_rows = [&](kimix::string_view stem) {
+              kimix::vector<VertexBulkRow> made;
+              made.push_back(make_row(f.node, kimix::format("{}-a", stem)));
+              made.push_back(make_row(f.node, kimix::format("{}-b", stem)));
+              made.push_back(make_row(f.node, kimix::format("{}-c", stem)));
+              return made;
+          };
+          auto const run_batch = [&](kimix::vector<VertexBulkRow> const &rows) {
+              kimix::vector<VertexCreateResult> results;
+              kimix::vector<GdiStatus> statuses;
+              graph_db::BulkStats stats;
+              return f.db.create_vertices_bulk(
+                  kimix::span<VertexBulkRow const>{rows.data(), rows.size()},
+                  /*continue_on_error=*/false, results, &statuses, stats);
+          };
+          // COMMIT path: the batch lands and the CALLER's commit still works.
+          expect(eq(f.db.begin_transaction(), GdiStatus::ok));
+          expect(eq(run_batch(make_rows("commit")), GdiStatus::ok));
+          expect(eq(f.db.commit(), GdiStatus::ok)) << "the caller's transaction survived the batch";
+          expect(eq(f.db.graph().size(), size_t{3}));
+          // ABORT path: one journal entry per row means the caller's abort
+          // rolls the WHOLE batch back — the batch is atomic inside the caller.
+          expect(eq(f.db.begin_transaction(), GdiStatus::ok));
+          expect(eq(run_batch(make_rows("abort")), GdiStatus::ok));
+          expect(eq(f.db.graph().size(), size_t{6}));
+          expect(eq(f.db.abort(), GdiStatus::ok));
+          expect(eq(f.db.graph().size(), size_t{3})) << "the second batch rolled back whole";
+          // And the store is fully usable afterwards (no dangling tx state).
+          expect(eq(f.db.begin_transaction(), GdiStatus::ok));
+          VertexCreateResult single;
+          auto const bytes = gtest::to_bytes("after");
+          expect(eq(f.db.create_vertex(view_of(f.node, bytes), {}, nullptr, single),
+                    GdiStatus::ok));
+          expect(eq(f.db.commit(), GdiStatus::ok));
+          expect(eq(f.db.graph().size(), size_t{4}));
+      };
+      "bulk_create_edges_with_a_refused_row"_test = [] {
         fixture f(3);
         auto const guids = f.guids();
         kimix::vector<EdgeBulkRow> rows;
@@ -239,9 +286,49 @@ int main(int argc, char *argv[]) {
         expect(static_cast<bool>(edge_ids[0]));
     };
 
-    "guarded_delete"_test = [] {
-        fixture f(2);
-        auto const guids = f.guids();
+      // Create-time payloads through the bulk seam (plan v3 step 3.2): rows
+      // carry labels + properties, and an abort of the enclosing transaction
+      // removes the edges WITH their payloads.
+      "bulk_create_edges_with_properties_rolls_back"_test = [] {
+          fixture f(4);
+          auto const guids = f.guids();
+          kimix::vector<EdgeBulkRow> rows;
+          for (size_t i = 0; i + 1 < guids.size(); ++i) {
+              EdgeBulkRow row;
+              row.origin = guids[i];
+              row.target = guids[i + 1];
+              row.labels.push_back(f.link);
+              row.properties.push_back(PropertyEntry{f.age, PropertyValue::make_int64(
+                                                               static_cast<int64_t>(i * 10))});
+              rows.push_back(std::move(row));
+          }
+          expect(eq(f.db.begin_transaction(), GdiStatus::ok));
+          kimix::vector<Guid> edge_ids;
+          graph_db::BulkStats stats;
+          expect(eq(f.db.create_edges_bulk(kimix::span<EdgeBulkRow const>{rows.data(), rows.size()},
+                                           /*continue_on_error=*/false, edge_ids, nullptr,
+                                           stats),
+                    GdiStatus::ok));
+          expect(eq(stats.created, rows.size()));
+          expect(eq(edge_ids.size(), rows.size()));
+          // The payloads are visible inside the transaction.
+          for (size_t i = 0; i < edge_ids.size(); ++i) {
+              NamedPropertyList props;
+              expect(eq(f.db.get_edge_properties(edge_ids[i], props), GdiStatus::ok));
+              expect(eq(props.size(), size_t{1}));
+              expect(eq(props[0].name, kimix::string{"age"}));
+              expect(eq(props[0].value.as_int64(), static_cast<int64_t>(i * 10)));
+          }
+          expect(eq(f.db.abort(), GdiStatus::ok));
+          expect(eq(f.db.graph().edges().size(), size_t{0}))
+              << "abort removed the bulk-created edges";
+          expect(f.db.graph().dependencies(guids[0]).empty());
+          expect(f.db.graph().dependents(guids[3]).empty());
+      };
+
+      "guarded_delete"_test = [] {
+          fixture f(2);
+          auto const guids = f.guids();
 
         // A vertex with no edges deletes.
         Guid isolated;

@@ -210,13 +210,23 @@ its strict one-edge-per-ordered-pair, no-self-loop contract. Tests:
 ## §2.15 Store metadata / versioning — CLOSED
 
 `"meta/root"` (`"GDM2"`) is written by every full save and by an incremental save
-that writes anything: format version, store uuid, both save timestamps, schema
-version, the two id counters and the graph name. `KIMIX_GRAPH_DB_FORMAT_VERSION`
-is exported by `graph_db.h`; a store announcing a NEWER format is refused with
-`error_bad_file` before anything is materialized, and a store WITHOUT the record is
-a v1 store (loaded and migrated). Test: `test_graph_db_migrate.cpp`.
-
-## §2.16 Multi-graph / session object — CLOSED (single graph; the catalog seam exists)
+  `"meta/root"` (`"GDM2"`) is written by every full save and by an incremental save
+  that writes anything: format version, store uuid, both save timestamps, schema
+  version, the two id counters and the graph name. `KIMIX_GRAPH_DB_FORMAT_VERSION`
+  is exported by `graph_db.h`; a store announcing a NEWER format is refused with
+  `error_bad_file` before anything is materialized, and a store WITHOUT the record is
+  a v1 store (loaded and migrated). Test: `test_graph_db_migrate.cpp`.
+  **Content digest policy (plan v3 §4.5, ABI 6):** the vertex record's 16-byte
+  content hash is MD5 by default or XXH3-128 behind
+  `GraphOptions::content_digest` / `open_options.content_digest`. The choice is a
+  session option, NOT a format version: both algorithms fill the same field, the
+  loader recomputes the cached hash at materialization (so a store written under
+  one policy reads cleanly under the other, loaded vertices stay clean, and a
+  dirty vertex is saved under the graph's own policy — the post-write clear-dirty
+  comparison keeps matching). The meta record does not record the policy; the
+  hash is a change detector, never a signature. Equivalence test:
+  `test_graph_db_serialize.cpp` (`serialize_content_digest_policy_round_trip`).
+  ## §2.16 Multi-graph / session object — CLOSED (single graph; the catalog seam exists)
 
 `Database` is the session object the report asks for: it owns the graph, the
 schema, the cold store and the options, and it is what the C ABI wraps. A named

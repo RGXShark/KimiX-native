@@ -124,7 +124,8 @@ Vertex *Graph::create_vertex(kimix::span<const std::byte> initial_content) {
     // `new Vertex` picks Vertex's own over-aligned operator new (mimalloc), so
     // the cache-line aligned lock region is guaranteed; a unique_ptr built by
     // hand rather than kimix::make_unique keeps that choice explicit.
-    kimix::unique_ptr<Vertex> vertex{new Vertex(kimix::Guid{true}, initial_content)};
+          kimix::unique_ptr<Vertex> vertex{
+          new Vertex(kimix::Guid{true}, initial_content, _options.content_digest)};
     Vertex *raw = vertex.get();
     kimix::Guid guid = raw->guid();
     Shard &shard = _shards[_shard_of(guid)];
@@ -199,13 +200,10 @@ Graph::remove_vertex(kimix::Guid const &guid,
         if (!victim) {
             return nullptr;
         }
-        cascade.reserve(victim->_out_links.size() + victim->_in_links.size() +
-                        victim->_depending_guids.size() + victim->_depended_guids.size());
-        // The link lists are authoritative (one entry per EDGE, so parallel edges
-        // and self loops are covered exactly once each). The guid projections are
-        // collected as well, defensively: a vertex whose two forms disagreed
-        // would otherwise leave a dangling entry behind, and resolving a
-        // neighbour that no longer has the link is a no-op below.
+        cascade.reserve(victim->_out_links.size() + victim->_in_links.size());
+        // The link lists are authoritative: one entry per EDGE, so parallel
+        // edges and self loops are covered exactly once each (plan v3 §5.2 made
+        // them the single adjacency representation).
         for (auto const &link : victim->_out_links) {
             cascade.push_back(Cascade{link.edge, link.neighbour, true});
         }
@@ -316,7 +314,8 @@ GdiStatus Graph::create_vertex(VertexSpec const &spec, kimix::Guid &out_guid) {
         }
     }
 
-    kimix::unique_ptr<Vertex> vertex{new Vertex(kimix::Guid{true}, spec.content)};
+          kimix::unique_ptr<Vertex> vertex{
+          new Vertex(kimix::Guid{true}, spec.content, _options.content_digest)};
     if (keyed) {
         vertex->_set_key(spec.key_label, ExternalId::from_bytes(spec.external_id));
     }
@@ -916,7 +915,8 @@ bool Graph::update_content(kimix::Guid const &guid,
 // ---------------------------------------------------------------------------
 
 bool Graph::_is_root(Vertex const &vertex) noexcept {
-    return vertex._depended.empty() && vertex._depended_guids.empty();
+    // A root is a vertex nothing depends on: no incoming links.
+    return vertex._in_links.empty();
 }
 
 Vertex *Graph::find(kimix::Guid const &guid) const {
@@ -995,7 +995,13 @@ kimix::vector<kimix::Guid> Graph::_copy_adjacency(kimix::Guid const &guid,
     if (vertex == nullptr) {
         return out;
     }
-    out = outgoing ? vertex->_depending_guids : vertex->_depended_guids;
+    // The link list is the one adjacency representation (plan v3 §5.2); the
+    // guid view is its neighbour field, copied under the same single lock.
+    auto const &links = outgoing ? vertex->_out_links : vertex->_in_links;
+    out.reserve(links.size());
+    for (auto const &link : links) {
+        out.push_back(link.neighbour);
+    }
     return out;
 }
 
@@ -1016,7 +1022,7 @@ bool Graph::_read_adjacency(kimix::Guid const &guid, bool outgoing,
     if (vertex == nullptr) {
         return false;
     }
-    out._assign(outgoing ? vertex->_depending_guids : vertex->_depended_guids);
+    out._assign_links(outgoing ? vertex->_out_links : vertex->_in_links);
     return true;
 }
 
@@ -1028,10 +1034,32 @@ size_t Graph::_read_adjacency(kimix::Guid const &guid, bool outgoing,
     if (vertex == nullptr) {
         return 0;
     }
-    auto const &source = outgoing ? vertex->_depending_guids : vertex->_depended_guids;
+    auto const &source = outgoing ? vertex->_out_links : vertex->_in_links;
     size_t const copy = std::min(source.size(), out.size());
-    std::copy(source.begin(), source.begin() + copy, out.begin());
+    for (size_t i = 0; i < copy; ++i) {
+        out[i] = source[i].neighbour;
+    }
     return source.size();
+}
+
+bool Graph::_read_oriented_adjacency(kimix::Guid const &guid, EdgeOrientation orientation,
+                                     AdjacencyBuffer &out) const noexcept {
+    out._clear();
+    Shard const &shard = _shards[_shard_of(guid)];
+    std::shared_lock<std::shared_mutex> lock(shard.mutex);
+    Vertex *vertex = shard._find(guid);
+    if (vertex == nullptr) {
+        return false;
+    }
+    if (orientation == EdgeOrientation::both) {
+        // One lock, one snapshot: the undirected union's two halves are copied
+        // together (duplicates between them are the caller's dedup problem).
+        out._assign_two_links(vertex->_out_links, vertex->_in_links);
+    } else {
+        out._assign_links(orientation == EdgeOrientation::outgoing ? vertex->_out_links
+                                                                   : vertex->_in_links);
+    }
+    return true;
 }
 
 bool Graph::dependencies(kimix::Guid const &guid, AdjacencyBuffer &out) const noexcept {
@@ -1073,20 +1101,22 @@ kimix::vector<kimix::Guid> Graph::neighbors(kimix::Guid const &guid) const {
     if (vertex == nullptr) {
         return {};
     }
-    auto const &depending = vertex->_depending_guids;
-    auto const &depended = vertex->_depended_guids;
+    // Guid view of the one adjacency representation (plan v3 §5.2): the link
+    // lists' neighbour fields, same outgoing-first order the projections had.
+    auto const &depending = vertex->_out_links;
+    auto const &depended = vertex->_in_links;
     size_t const total = depending.size() + depended.size();
     if (total <= kStackDedup) {
         kimix::Guid deduped[kStackDedup];
         size_t count = 0;
-        for (auto const &other : depending) {
-            if (std::find(deduped, deduped + count, other) == deduped + count) {
-                deduped[count++] = other;
+        for (auto const &link : depending) {
+            if (std::find(deduped, deduped + count, link.neighbour) == deduped + count) {
+                deduped[count++] = link.neighbour;
             }
         }
-        for (auto const &other : depended) {
-            if (std::find(deduped, deduped + count, other) == deduped + count) {
-                deduped[count++] = other;
+        for (auto const &link : depended) {
+            if (std::find(deduped, deduped + count, link.neighbour) == deduped + count) {
+                deduped[count++] = link.neighbour;
             }
         }
         return kimix::vector<kimix::Guid>{deduped, deduped + count};
@@ -1095,14 +1125,14 @@ kimix::vector<kimix::Guid> Graph::neighbors(kimix::Guid const &guid) const {
     out.reserve(total);
     kimix::unordered_set<kimix::Guid> seen;
     seen.reserve(total);
-    for (auto const &other : depending) {
-        if (seen.insert(other).second) {
-            out.push_back(other);
+    for (auto const &link : depending) {
+        if (seen.insert(link.neighbour).second) {
+            out.push_back(link.neighbour);
         }
     }
-    for (auto const &other : depended) {
-        if (seen.insert(other).second) {
-            out.push_back(other);
+    for (auto const &link : depended) {
+        if (seen.insert(link.neighbour).second) {
+            out.push_back(link.neighbour);
         }
     }
     return out;
@@ -1257,6 +1287,169 @@ Graph::shortest_path(kimix::Guid const &from, kimix::Guid const &to) const {
     path.push_back(from);
     std::reverse(path.begin(), path.end());
     return path;
+}
+
+GdiStatus Graph::traverse_bfs(kimix::Guid const &start, Constraint const &constraint,
+                              EdgeOrientation orientation, int64_t cap_per_level,
+                              uint32_t max_depth, kimix::vector<TraversalVertex> &out) const {
+    out.clear();
+    if (cap_per_level < 1) {
+        return GdiStatus::error_argument;
+    }
+    if (max_depth < 1 || max_depth > kMaxNativeHopDepth) {
+        return GdiStatus::error_argument;
+    }
+    // The _resolve_constraint rule, validated here so the container API refuses
+    // a label ordering op exactly like the Database facade does (the facade
+    // re-runs it through _resolve_constraint, which is idempotent).
+    for (auto const &condition : constraint.conditions) {
+        if (condition.is_label() && condition.op != GdiOp::equal &&
+            condition.op != GdiOp::not_equal) {
+            return GdiStatus::error_op;
+        }
+    }
+    if (!contains(start)) {
+        return GdiStatus::error_vertex;
+    }
+    bool const filtered = !constraint.conditions.empty();
+    kimix::vector<TraversalVertex> result;
+    result.reserve(static_cast<size_t>(cap_per_level) + 1);
+    kimix::vector<kimix::Guid> frontier;
+    kimix::vector<kimix::Guid> next;
+    frontier.push_back(start);
+    result.push_back(TraversalVertex{start, kimix::Guid{}, 0});
+    // The has_path discipline: `discovery` (every guid ever enqueued, in order)
+    // doubles as the small-BFS visited set — a linear scan up to
+    // kLinearVisitedLimit, then the hash set primes from it. A 2-hop read with
+    // cap 100 rarely pays for a hash table.
+    kimix::vector<kimix::Guid> discovery;
+    discovery.reserve(64);
+    discovery.push_back(start);
+    VisitedSet visited;
+    visited.reserve(32);
+    AdjacencyBuffer adjacency;
+    kimix::vector<LabelId> candidate_labels;    // filtered path only, reused
+    uint32_t depth = 0;
+    while (!frontier.empty() && depth < max_depth) {
+        ++depth;
+        next.clear();
+        int64_t level_count = 0;
+        bool level_full = false; // per level: a full level still feeds the next one
+        for (size_t i = 0; i < frontier.size() && !level_full; ++i) {
+            kimix::Guid const current = frontier[i];
+            if (!_read_oriented_adjacency(current, orientation, adjacency)) {
+                continue; // removed between the enqueue and the visit
+            }
+            for (auto const &candidate : adjacency) {
+                if (level_count >= cap_per_level) {
+                    level_full = true; // the level stops expanding at its cap
+                    break;
+                }
+                if (visited.contains(discovery, candidate)) {
+                    continue;
+                }
+                if (filtered) {
+                    // §5.10: the filter applies to the discovered VERTEX, so a
+                    // failed candidate is not enqueued and its neighbourhood is
+                    // never visited.  Payload read under the candidate's leaf
+                    // SHARED lock (labels/properties take it internally); a
+                    // vanished endpoint is skipped like the composite's find().
+                    Vertex *vertex = _resolve(candidate);
+                    if (vertex == nullptr) {
+                        continue;
+                    }
+                    candidate_labels.clear();
+                    vertex->labels(candidate_labels);
+                    PropertyBag bag;
+                    PropertyList list = vertex->property_list();
+                    for (auto const &entry : list) {
+                        bag.emplace(entry.name, entry.value);
+                    }
+                    if (!matches(constraint, kimix::span<const LabelId>{candidate_labels.data(),
+                                                                        candidate_labels.size()},
+                                 bag)) {
+                        continue;
+                    }
+                }
+                discovery.push_back(candidate);
+                visited.insert(discovery, candidate);
+                result.push_back(TraversalVertex{candidate, current, depth});
+                next.push_back(candidate);
+                ++level_count;
+            }
+        }
+        frontier.swap(next);
+    }
+    out = std::move(result);
+    return GdiStatus::ok;
+}
+
+GdiStatus Graph::shortest_path(kimix::Guid const &from, kimix::Guid const &to,
+                               uint32_t max_depth, kimix::vector<kimix::Guid> &out) const {
+    out.clear();
+    if (max_depth < 1 || max_depth > kMaxNativeHopDepth) {
+        return GdiStatus::error_argument;
+    }
+    if (!contains(from) || !contains(to)) {
+        return GdiStatus::error_vertex;
+    }
+    if (from == to) {
+        out.push_back(from);
+        return GdiStatus::ok;
+    }
+    // The unbounded shortest_path's BFS, with a level counter: a frontier at
+    // max_depth is examined for `to` but not expanded past it.  Unreachable
+    // within the bound is an EMPTY result with status ok (GDI's "no path"
+    // answer is a nullable list, not an error).
+    kimix::vector<kimix::Guid> frontier;
+    frontier.push_back(from);
+    kimix::vector<kimix::Guid> next_frontier;
+    kimix::unordered_map<kimix::Guid, kimix::Guid> predecessor;
+    predecessor.reserve(32);
+    predecessor.emplace(from, from);
+    AdjacencyBuffer adjacency;
+    bool found = false;
+    uint32_t depth = 0;
+    while (!frontier.empty() && !found && depth < max_depth) {
+        ++depth;
+        next_frontier.clear();
+        for (auto const &current : frontier) {
+            if (!dependencies(current, adjacency)) {
+                continue;
+            }
+            for (auto const &next : adjacency) {
+                if (predecessor.find(next) != predecessor.end()) {
+                    continue;
+                }
+                predecessor.emplace(next, current);
+                if (next == to) {
+                    found = true;
+                    break;
+                }
+                next_frontier.push_back(next);
+            }
+            if (found) {
+                break;
+            }
+        }
+        frontier.swap(next_frontier);
+    }
+    if (!found) {
+        return GdiStatus::ok; // out stays empty
+    }
+    kimix::Guid cursor = to;
+    while (cursor != from) {
+        out.push_back(cursor);
+        auto it = predecessor.find(cursor);
+        if (it == predecessor.end()) {
+            out.clear();
+            return GdiStatus::ok; // defensive: cannot happen after `found`
+        }
+        cursor = it->second;
+    }
+    out.push_back(from);
+    std::reverse(out.begin(), out.end());
+    return GdiStatus::ok;
 }
 
 // ---------------------------------------------------------------------------

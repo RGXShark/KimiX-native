@@ -59,8 +59,15 @@ namespace kimix::graph_db {
 class Database;
 
 // One undo record. The `kind` says which payload member is meaningful; the
-// rollback in database.cpp switches on it. Everything a record owns is moved in,
-// so replaying it needs no lookup of the removed entity's old contents.
+// rollback in database.cpp switches on it. PLAN V3 §5.3: the entry is SLIM —
+// kind + uid inline (32 B), and everything a record owns lives behind a
+// unique_ptr<Fat> that is allocated ONLY for kinds that carry a payload. The
+// previous every-entry-carries-everything struct cost ~240 B per entry, and
+// the §8.1 per-command auto-transaction (one create per transaction, 300k
+// transactions per bulk edge build) multiplied that into tens of MB of
+// transient heap churn at the exact phase that sets the process memory peak.
+// Creates (vertex_created / edge_created / label_created /
+// property_type_created) need nothing but the uid and stay allocation-free.
 struct KIMIX_GRAPH_DB_API JournalEntry {
     enum class Kind : uint8_t {
         vertex_created = 0,      // undo: remove uid
@@ -77,20 +84,26 @@ struct KIMIX_GRAPH_DB_API JournalEntry {
         property_type_freed,     // undo: re-register info
     };
 
+    // The rollback payload. Moved in, so replaying it needs no lookup of the
+    // removed entity's old contents.
+    struct KIMIX_GRAPH_DB_API Fat {
+        kimix::Guid origin;              // edge_state / vertex_removed helpers
+        kimix::Guid target;
+        EdgeDirectionType direction{EdgeDirectionType::directed};
+        kimix::string name;              // label / property-type name
+        PropertyTypeInfo info;           // property_type_* payload
+        kimix::vector<LabelId> labels;   // vertex_payload / edge_state payload
+        PropertyList properties;         // vertex_payload / edge_state payload
+        kimix::unique_ptr<Vertex> vertex;                       // vertex_removed
+        kimix::vector<kimix::unique_ptr<Edge>> removed_edges;   // vertex_removed (cascade)
+        kimix::unique_ptr<Edge> edge;                           // edge_removed
+    };
+
     Kind kind{Kind::vertex_created};
     kimix::Guid uid;                 // vertex or edge id
-    kimix::Guid origin;              // edge_state / vertex_removed helpers
-    kimix::Guid target;
-    EdgeDirectionType direction{EdgeDirectionType::directed};
-    LabelId label{kNoLabel};
+    LabelId label{kNoLabel};         // label_* / property_type_* ids (inline: slim kinds need them)
     PropNameId property{kNoPropName};
-    kimix::string name;              // label / property-type name
-    PropertyTypeInfo info;           // property_type_* payload
-    kimix::vector<LabelId> labels;   // vertex_payload / edge_state payload
-    PropertyList properties;         // vertex_payload / edge_state payload
-    kimix::unique_ptr<Vertex> vertex;                       // vertex_removed
-    kimix::vector<kimix::unique_ptr<Edge>> removed_edges;   // vertex_removed (cascade)
-    kimix::unique_ptr<Edge> edge;                           // edge_removed
+    kimix::unique_ptr<Fat> fat;      // only for kinds that carry a payload
 
     // Rough heap footprint of this entry, for the journal cap. Exact enough to
     // bound a transaction; the plan only needs "does not grow without limit".

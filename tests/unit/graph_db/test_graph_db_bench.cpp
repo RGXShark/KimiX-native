@@ -71,9 +71,11 @@
 #include "graph_db_test_util.h"
 
 #include <core/kimix_core.h> // umbrella first among the core headers (winsock2 order)
+#include <core/clock.h>
 #include <core/fiber.h>
 #include <core/platform.h>
 
+#include <graph_db/database.h>
 #include <graph_db/graph.h>
 #include <graph_db/graph_db.h>
 #include <graph_db/serialize.h>
@@ -106,6 +108,7 @@ using graph_db::GraphSerializeStats;
 using graph_db::GraphSerializer;
 using graph_db::Vertex;
 namespace gtest = kimix::graph_db::test;
+using TraversalVertex = graph_db::Graph::TraversalVertex;
 
 namespace {
 
@@ -514,6 +517,274 @@ kimix::vector<size_t> thread_configs(size_t cores) {
 }
 
 // ---------------------------------------------------------------------------
+// GDI-SHAPED fixture (plan v3 step 0.2): the graphbench 50k x 300k dataset,
+// built ONCE through the Database facade (schema, keyed vertices, typed
+// properties, first-class labelled/propertied edges) — the same shapes
+// bench/graphbench drives through the whole Semevia.Gdi command layer. The
+// scenario loops below time ONLY the native facade calls, so a comparison with
+// the graphbench rows attributes the command-layer/FFI cost (plan step 0.5).
+// Edge shape is graphbench's: ring(+1), skip(+7,+113), hubs(%251,%1021),
+// scatter(*48271), filled to 6 targets per vertex.
+// ---------------------------------------------------------------------------
+
+constexpr size_t kGdiVertices = 50'000;
+constexpr size_t kGdiEdgesPerVertex = 6;
+constexpr size_t kGdiBioChars = 256;
+constexpr size_t kGdiReadOps = 20'000;
+constexpr size_t kGdiTwoHopAnchors = 1000;
+constexpr int64_t kGdiNeighborCap = 100;
+constexpr int64_t kGdiTwoHopL2Cap = 50;
+
+inline graph_db::PropertyTypeInfo gdi_type(kimix::string_view name,
+                                           graph_db::GdiDataType data) {
+    graph_db::PropertyTypeInfo info;
+    info.name = kimix::string{name};
+    info.data = data;
+    info.count = 1;
+    info.container = graph_db::GdiContainerType::single;
+    return info;
+}
+
+struct gdi_fixture {
+    graph_db::Database db;
+    graph_db::LabelId person{};
+    graph_db::LabelId link{};
+    graph_db::PropNameId prop_name{};
+    graph_db::PropNameId prop_age{};
+    graph_db::PropNameId prop_bio{};
+    graph_db::PropNameId prop_weight{};
+    graph_db::Constraint age_filter; // age >= 40 (the graphbench filter)
+    kimix::vector<kimix::Guid> vertices;
+    kimix::vector<kimix::Guid> anchors;
+    size_t edge_count{0};
+
+    gdi_fixture() {
+        expect(eq(db.create_label("Person", person), graph_db::GdiStatus::ok));
+        expect(eq(db.create_label("LINK", link), graph_db::GdiStatus::ok));
+        expect(eq(db.create_property_type(gdi_type("name", graph_db::GdiDataType::char_),
+                                          prop_name),
+                  graph_db::GdiStatus::ok));
+        expect(eq(db.create_property_type(gdi_type("age", graph_db::GdiDataType::int64_),
+                                          prop_age),
+                  graph_db::GdiStatus::ok));
+        expect(eq(db.create_property_type(gdi_type("bio", graph_db::GdiDataType::char_),
+                                          prop_bio),
+                  graph_db::GdiStatus::ok));
+        expect(eq(db.create_property_type(gdi_type("weight", graph_db::GdiDataType::int64_),
+                                          prop_weight),
+                  graph_db::GdiStatus::ok));
+
+        // The graphbench bio verbatim: the 24-char unit repeated 11x, truncated
+        // to 256 chars.
+        kimix::string bio;
+        while (bio.size() < kGdiBioChars) {
+            bio += "semivia-graph-bench-bio-";
+        }
+        bio.resize(kGdiBioChars);
+
+        kimix::vector<graph_db::LabelId> labels{person};
+        kimix::vector<std::byte> key_bytes;
+        graph_db::PropertyList props;
+        props.push_back({prop_name, graph_db::PropertyValue{}});
+        props.push_back({prop_age, graph_db::PropertyValue{}});
+        props.push_back({prop_bio, graph_db::PropertyValue{}});
+
+        vertices.reserve(kGdiVertices);
+        for (size_t i = 0; i < kGdiVertices; ++i) {
+            key_bytes = gtest::to_bytes(kimix::format("person-{}", i));
+            kimix::string const name = kimix::format("person {}", i);
+            props[0].value = graph_db::PropertyValue::make_string(name);
+            props[1].value =
+                graph_db::PropertyValue::make_int64(static_cast<int64_t>(i % 90));
+            props[2].value = graph_db::PropertyValue::make_string(bio);
+            graph_db::VertexCreateResult created;
+            expect(eq(db.create_vertex(graph_db::VertexKeyView{
+                                        person, kimix::span<const std::byte>{
+                                                    key_bytes.data(), key_bytes.size()}},
+                                     kimix::span<const graph_db::LabelId>{labels.data(),
+                                                                          labels.size()},
+                                     &props, created),
+                      graph_db::GdiStatus::ok));
+            vertices.push_back(created.uid);
+        }
+
+        // Edges: ring(+1), skip(+7,+113), hubs(%251,%1021), scatter(*48271+13),
+        // then a deterministic fill to exactly kGdiEdgesPerVertex targets —
+        // mirroring bench/graphbench/Program.cs::BuildEdgeTargets.
+        auto try_add = [](kimix::vector<size_t> &list, size_t self, size_t target) {
+            target %= kGdiVertices;
+            if (target == self) {
+                return;
+            }
+            for (auto const &existing : list) {
+                if (existing == target) {
+                    return;
+                }
+            }
+            list.push_back(target);
+        };
+        kimix::vector<graph_db::LabelId> edge_labels{link};
+        graph_db::PropertyList edge_props;
+        edge_props.push_back({prop_weight, graph_db::PropertyValue{}});
+        for (size_t i = 0; i < kGdiVertices; ++i) {
+            kimix::vector<size_t> targets;
+            targets.reserve(kGdiEdgesPerVertex);
+            try_add(targets, i, i + 1);
+            try_add(targets, i, i + 7);
+            try_add(targets, i, i + 113);
+            try_add(targets, i, i % 251);
+            try_add(targets, i, i % 1021);
+            try_add(targets, i, i * 48271 + 13);
+            while (targets.size() < kGdiEdgesPerVertex) {
+                try_add(targets, i, i * 31 + targets.size() * 7919);
+            }
+            edge_props[0].value =
+                graph_db::PropertyValue::make_int64(static_cast<int64_t>(i % 1000));
+            for (size_t const target : targets) {
+                kimix::Guid edge;
+                expect(eq(db.edge_create(vertices[i], vertices[target],
+                                         graph_db::EdgeDirectionType::directed,
+                                         kimix::span<const graph_db::LabelId>{
+                                             edge_labels.data(), edge_labels.size()},
+                                         &edge_props, edge),
+                          graph_db::GdiStatus::ok));
+                ++edge_count;
+            }
+        }
+
+        age_filter = age_filter.with(graph_db::ConstraintCondition::on_property(
+            prop_age, graph_db::GdiOp::greater_or_equal,
+            graph_db::PropertyValue::make_int64(40)));
+
+        std::mt19937 rng(42u);
+        anchors.reserve(kGdiTwoHopAnchors);
+        for (size_t i = 0; i < kGdiTwoHopAnchors; ++i) {
+            anchors.push_back(vertices[rng() % vertices.size()]);
+        }
+    }
+};
+
+gdi_fixture &gdi_data() {
+    static gdi_fixture fixture; // built once, on first use
+    return fixture;
+}
+
+// ---------------------------------------------------------------------------
+// GDI-shaped memory accounting (plan v3 step 0.3): staged fixture builds on
+// fresh Database objects, read through mimalloc's process counters (the heap
+// IS mimalloc — see the debug skill — so RSS deltas from mi_process_info are
+// the honest accounting unit). Each stage keeps the previous one ALIVE, so a
+// delta attributes bytes to exactly one entity family. Runs BEFORE the big
+// read fixture so no other live graph pollutes the numbers.
+// ---------------------------------------------------------------------------
+
+constexpr size_t kGdiMemSampleVertices = 50'000;
+constexpr size_t kGdiMemSampleEdgesPerVertex = 6;
+
+inline size_t mi_current_rss() noexcept {
+    size_t elapsed = 0, user = 0, system = 0, current = 0, peak = 0;
+    size_t commit = 0, peak_commit = 0, faults = 0;
+    mi_process_info(&elapsed, &user, &system, &current, &peak, &commit, &peak_commit,
+                    &faults);
+    return current;
+}
+
+// The GDI fixture's schema, shared shape with gdi_fixture (kept in sync by
+// hand: same labels, same four property types).
+inline bool gdi_create_schema(graph_db::Database &db, graph_db::LabelId &person,
+                              graph_db::LabelId &link, graph_db::PropNameId &name_id,
+                              graph_db::PropNameId &age_id, graph_db::PropNameId &bio_id,
+                              graph_db::PropNameId &weight_id) {
+    return db.create_label("Person", person) == graph_db::GdiStatus::ok &&
+           db.create_label("LINK", link) == graph_db::GdiStatus::ok &&
+           db.create_property_type(gdi_type("name", graph_db::GdiDataType::char_), name_id) ==
+               graph_db::GdiStatus::ok &&
+           db.create_property_type(gdi_type("age", graph_db::GdiDataType::int64_), age_id) ==
+               graph_db::GdiStatus::ok &&
+           db.create_property_type(gdi_type("bio", graph_db::GdiDataType::char_), bio_id) ==
+               graph_db::GdiStatus::ok &&
+           db.create_property_type(gdi_type("weight", graph_db::GdiDataType::int64_),
+                                   weight_id) == graph_db::GdiStatus::ok;
+}
+
+inline kimix::string const &gdi_bio_text() {
+    static kimix::string bio = [] {
+        kimix::string text;
+        while (text.size() < kGdiBioChars) {
+            text += "semivia-graph-bench-bio-";
+        }
+        text.resize(kGdiBioChars);
+        return text;
+    }();
+    return bio;
+}
+
+// Create `count` vertices of the fixture shape (Person label + name/age/bio),
+// keyed when `keyed` is true. Returns the created uids.
+inline kimix::vector<kimix::Guid> gdi_create_vertices(graph_db::Database &db,
+                                                       graph_db::LabelId person,
+                                                       graph_db::PropNameId name_id,
+                                                       graph_db::PropNameId age_id,
+                                                       graph_db::PropNameId bio_id,
+                                                       size_t count, bool keyed,
+                                                       size_t first_index) {
+    kimix::vector<graph_db::LabelId> labels{person};
+    kimix::vector<std::byte> key_bytes;
+    graph_db::PropertyList props;
+    props.push_back({name_id, graph_db::PropertyValue{}});
+    props.push_back({age_id, graph_db::PropertyValue{}});
+    props.push_back({bio_id, graph_db::PropertyValue{}});
+    kimix::vector<kimix::Guid> out;
+    out.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        size_t const index = first_index + i;
+        kimix::string const name = kimix::format("person {}", index);
+        props[0].value = graph_db::PropertyValue::make_string(name);
+        props[1].value =
+            graph_db::PropertyValue::make_int64(static_cast<int64_t>(index % 90));
+        props[2].value = graph_db::PropertyValue::make_string(gdi_bio_text());
+        graph_db::VertexKeyView key{};
+        if (keyed) {
+            key_bytes = gtest::to_bytes(kimix::format("person-{}", index));
+            key = graph_db::VertexKeyView{
+                person, kimix::span<const std::byte>{key_bytes.data(), key_bytes.size()}};
+        }
+        graph_db::VertexCreateResult created;
+        if (db.create_vertex(key, kimix::span<const graph_db::LabelId>{labels.data(),
+                                                                       labels.size()},
+                             &props, created) != graph_db::GdiStatus::ok) {
+            break;
+        }
+        out.push_back(created.uid);
+    }
+    return out;
+}
+
+// One [bench] memory row: `bytes` total, `per_unit` already divided.
+inline void print_memory_row(char const *name, double bytes, double per_unit,
+                             char const *unit) {
+    std::fprintf(stderr, "[bench] %-44s %12.0f B total %11.2f B/%s\n", name, bytes,
+                 per_unit, unit);
+}
+
+// Time `ops` calls of one GDI-shaped scenario with kimix::Clock: a 500-call
+// warmup (untimed), then the measured loop, printed as one [bench] row.
+template<typename Body>
+void gdi_rate(char const *name, size_t ops, char const *suffix, Body &&body) {
+    for (size_t i = 0; i < 500; ++i) {
+        body(i); // warmup: schema/shard/buffer state hot before the window
+    }
+    kimix::Clock clock;
+    uint64_t acc = 0;
+    for (size_t i = 0; i < ops; ++i) {
+        acc += body(i);
+    }
+    double const seconds = clock.toc() / 1000.0;
+    print_rate(name, static_cast<double>(ops), seconds, suffix);
+    kimix_bench::sink(acc);
+}
+
+// ---------------------------------------------------------------------------
 // SERIALIZATION pass: build -> full save (warmup + measured) -> dual-stage load
 // (warmup + measured) -> 1 % dirty -> incremental save. Prints its own [bench]
 // lines and returns the numbers so the caller can assert the exact counts.
@@ -698,6 +969,114 @@ int main(int argc, char *argv[]) {
                      kReachDepth, kReachNodeBudget, kContentPoolVertices, kStructuralOps,
                      kSerializeVertices, kSerializeLargeVertices, kReadSeconds);
         kimix_bench::sink(cpu.size());
+    };
+
+    // -----------------------------------------------------------------------
+    // 0. GDI-SHAPED MEMORY — staged builds read through mimalloc's process
+    //    counters (plan v3 step 0.3). Registered FIRST: a cold heap and no
+    //    other live graph, so each RSS delta attributes bytes to exactly one
+    //    entity family of the graphbench 50k/300k dataset shape.
+    // -----------------------------------------------------------------------
+    "bench_gdi_memory"_test = [] {
+        size_t const baseline = mi_current_rss();
+
+        // Stage 1: schema only (2 labels + 4 property types), twice — the
+        // second store is the unkeyed-vertex control, so its schema cost cancels.
+        graph_db::Database db_keyed;
+        graph_db::LabelId person{}, link{};
+        graph_db::PropNameId name_id{}, age_id{}, bio_id{}, weight_id{};
+        expect(gdi_create_schema(db_keyed, person, link, name_id, age_id, bio_id,
+                                 weight_id))
+            << "the keyed store's schema is created";
+        size_t const after_schema = mi_current_rss();
+
+        graph_db::Database db_unkeyed;
+        graph_db::LabelId person2{}, link2{};
+        graph_db::PropNameId name2{}, age2{}, bio2{}, weight2{};
+        expect(gdi_create_schema(db_unkeyed, person2, link2, name2, age2, bio2,
+                                 weight2))
+            << "the control store's schema is created";
+        size_t const control_schema = mi_current_rss();
+
+        // Stage 2: 50k keyed vertices (key index entry + labels + name/age/bio),
+        // INTERLEAVED with 50k unkeyed controls in small batches: a sequential
+        // build attributes one-time page-commit costs to whichever store goes
+        // second (measured: +1.3 kB/vertex phantom), alternating batches makes
+        // both pay symmetric costs, so keyed - unkeyed isolates the key entry.
+        kimix::vector<kimix::Guid> keyed;
+        keyed.reserve(kGdiMemSampleVertices);
+        size_t keyed_acc = 0;
+        size_t unkeyed_acc = 0;
+        constexpr size_t kMemoryBatch = 500;
+        for (size_t base = 0; base < kGdiMemSampleVertices; base += kMemoryBatch) {
+            size_t const rss0 = mi_current_rss();
+            auto keyed_batch = gdi_create_vertices(db_keyed, person, name_id, age_id,
+                                                   bio_id, kMemoryBatch, true, base);
+            size_t const rss1 = mi_current_rss();
+            auto unkeyed_batch = gdi_create_vertices(db_unkeyed, person2, name2, age2,
+                                                     bio2, kMemoryBatch, false, base);
+            size_t const rss2 = mi_current_rss();
+            keyed_acc += rss1 - rss0;
+            unkeyed_acc += rss2 - rss1;
+            keyed.insert(keyed.end(), keyed_batch.begin(), keyed_batch.end());
+            expect(eq(keyed_batch.size(), kMemoryBatch)) << "the keyed batch is complete";
+            expect(eq(unkeyed_batch.size(), kMemoryBatch))
+                << "the control batch is complete";
+        }
+        expect(eq(keyed.size(), kGdiMemSampleVertices)) << "every keyed vertex was created";
+        size_t const after_keyed = mi_current_rss();
+        size_t const after_unkeyed = after_keyed; // both stores' totals measured per-batch
+
+        // Stage 3: 6 edges per keyed vertex (record + both adjacency links +
+        // LINK label + weight property) — ring/skip targets suffice for bytes.
+        {
+            kimix::vector<graph_db::LabelId> edge_labels{link};
+            graph_db::PropertyList edge_props;
+            edge_props.push_back({weight_id, graph_db::PropertyValue{}});
+            size_t edges = 0;
+            for (size_t i = 0; i < keyed.size(); ++i) {
+                edge_props[0].value = graph_db::PropertyValue::make_int64(
+                    static_cast<int64_t>(i % 1000));
+                for (size_t k = 0; k < kGdiMemSampleEdgesPerVertex; ++k) {
+                    size_t const target = (i + 1 + k * 7) % keyed.size();
+                    kimix::Guid edge;
+                    if (db_keyed.edge_create(keyed[i], keyed[target],
+                                             graph_db::EdgeDirectionType::directed,
+                                             kimix::span<const graph_db::LabelId>{
+                                                 edge_labels.data(), edge_labels.size()},
+                                             &edge_props, edge) == graph_db::GdiStatus::ok) {
+                        ++edges;
+                    }
+                }
+            }
+            expect(eq(edges, kGdiMemSampleVertices * kGdiMemSampleEdgesPerVertex))
+                << "every staged edge was created";
+        }
+        size_t const after_edges = mi_current_rss();
+
+        double const schema_bytes = static_cast<double>(after_schema - baseline);
+        double const keyed_bytes = static_cast<double>(keyed_acc);
+        double const unkeyed_bytes = static_cast<double>(unkeyed_acc);
+        double const edge_bytes = static_cast<double>(after_edges - after_keyed);
+        double const n = static_cast<double>(kGdiMemSampleVertices);
+
+        print_memory_row("graphdb/gdi_memory/rss_baseline",
+                         static_cast<double>(baseline), 0.0, "—");
+        print_memory_row("graphdb/gdi_memory/schema", schema_bytes, schema_bytes, "schema");
+        print_memory_row("graphdb/gdi_memory/vertex_keyed", keyed_bytes,
+                         keyed_bytes / n, "vertex (key+labels+props)");
+        print_memory_row("graphdb/gdi_memory/vertex_unkeyed", unkeyed_bytes,
+                         unkeyed_bytes / n, "vertex (labels+props)");
+        print_memory_row("graphdb/gdi_memory/key_entry", keyed_bytes - unkeyed_bytes,
+                         (keyed_bytes - unkeyed_bytes) / n, "key");
+        print_memory_row("graphdb/gdi_memory/edge", edge_bytes,
+                         edge_bytes / (n * static_cast<double>(kGdiMemSampleEdgesPerVertex)),
+                         "edge (record+links+label+weight)");
+        double const projected = schema_bytes + keyed_bytes + edge_bytes;
+        std::fprintf(stderr,
+                     "[bench] %-44s %12.0f B projected full-dataset native store\n",
+                     "graphdb/gdi_memory/projected_50k_300k", projected);
+        kimix_bench::sink(static_cast<uint64_t>(projected) + keyed.size());
     };
 
     // -----------------------------------------------------------------------
@@ -921,6 +1300,177 @@ int main(int argc, char *argv[]) {
             print_rate(name.c_str(), static_cast<double>(result.total_ops),
                        result.seconds, suffix);
             kimix_bench::sink(result.total_ops + result.checksum);
+        }
+    };
+
+    // -----------------------------------------------------------------------
+    // 1b. GDI-SHAPED READS — the graphbench scenarios straight against the
+    //     native Database facade (plan v3 step 0.2): these rows are the native
+    //     per-call numbers the graphbench wall-clock rows are attributed
+    //     against (step 0.5).
+    // -----------------------------------------------------------------------
+    "bench_gdi_shaped"_test = [] {
+        gdi_fixture &data = gdi_data();
+        expect(eq(data.db.graph().size(), kGdiVertices))
+            << "the GDI fixture is fully built";
+        expect(eq(data.edge_count, kGdiVertices * kGdiEdgesPerVertex))
+            << "the GDI fixture edge count matches the graphbench shape";
+
+        uint32_t rng_state = 0x2545F491u;
+        auto next_random = [&rng_state]() noexcept {
+            uint32_t x = rng_state;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            rng_state = x != 0u ? x : 0x2545F491u;
+            return rng_state;
+        };
+        auto random_uid = [&data, &next_random]() noexcept {
+            return data.vertices[next_random() % data.vertices.size()];
+        };
+
+        // Cap-0 degree probe: the CountNeighborsCommand shape.
+        gdi_rate("graphdb/gdi/degree_probe", kGdiReadOps,
+                 "count_neighbors(uid, {}, outgoing) — the cap-0 probe shape",
+                 [&](size_t) -> uint64_t {
+                     size_t count = 0;
+                     if (data.db.count_neighbors(random_uid(), {},
+                                                 graph_db::EdgeOrientation::outgoing,
+                                                 count) != graph_db::GdiStatus::ok) {
+                         return 0;
+                     }
+                     return count;
+                 });
+
+        // Neighbour page: GetNeighborVerticesCommand cap=100, unfiltered.
+        gdi_rate("graphdb/gdi/neighbors_page100", kGdiReadOps,
+                 "get_neighbor_vertices(uid, {}, outgoing, cap=100)",
+                 [&](size_t) -> uint64_t {
+                     graph_db::VertexPage page;
+                     if (data.db.get_neighbor_vertices(random_uid(), {},
+                                                       graph_db::EdgeOrientation::outgoing,
+                                                       kGdiNeighborCap,
+                                                       page) != graph_db::GdiStatus::ok) {
+                         return 0;
+                     }
+                     return page.items.size() + page.total_count;
+                 });
+
+        // Property read-back: GetPropertiesOfVertexCommand (name + age + bio).
+        gdi_rate("graphdb/gdi/get_properties", kGdiReadOps,
+                 "get_properties(uid) — name + age + 256-char bio, names resolved",
+                 [&](size_t) -> uint64_t {
+                     graph_db::NamedPropertyList out;
+                     if (data.db.get_properties(random_uid(), out) !=
+                         graph_db::GdiStatus::ok) {
+                         return 0;
+                     }
+                     uint64_t acc = out.size();
+                     for (auto const &entry : out) {
+                         acc += entry.value.as_string().size();
+                     }
+                     return acc;
+                 });
+
+        // Constraint-filtered neighbour read: the read_filtered_neighbors shape.
+        gdi_rate("graphdb/gdi/filtered_neighbors100", kGdiReadOps,
+                 "get_neighbor_vertices(uid, age>=40, outgoing, cap=100)",
+                 [&](size_t) -> uint64_t {
+                     graph_db::VertexPage page;
+                     if (data.db.get_neighbor_vertices(random_uid(), data.age_filter,
+                                                       graph_db::EdgeOrientation::outgoing,
+                                                       kGdiNeighborCap,
+                                                       page) != graph_db::GdiStatus::ok) {
+                         return 0;
+                     }
+                     return page.items.size() + page.total_count;
+                 });
+
+      // Row-wise edge create WITH the per-command transaction bracket (plan v3
+      // §4.6): the insert_edges_rowwise native shape — begin → edge_create →
+      // commit per op, on random vertex pairs (the store tolerates the
+      // duplicates this adds).
+      gdi_rate("graphdb/gdi/edge_create_rowwise", kGdiReadOps,
+               "begin_tx; edge_create(a, b, LINK); commit_tx — the row-wise "
+               "auto-transaction shape",
+               [&](size_t) -> uint64_t {
+                   kimix::Guid const origin = random_uid();
+                   kimix::Guid target = random_uid();
+                   if (target == origin) {
+                       target = data.vertices[0];
+                   }
+                   graph_db::LabelId const labels[]{data.link};
+                   if (data.db.begin_transaction() != graph_db::GdiStatus::ok) {
+                       return 0;
+                   }
+                   kimix::Guid edge;
+                   graph_db::GdiStatus const status = data.db.edge_create(
+                       origin, target, graph_db::EdgeDirectionType::directed,
+                       kimix::span<const graph_db::LabelId>{labels, 1}, nullptr, edge);
+                   if (data.db.commit() != graph_db::GdiStatus::ok) {
+                       return 0;
+                   }
+                   return graph_db::is_error(status) ? 0 : 1;
+               });
+
+      // Native multi-hop (plan v3 step 1.12): ONE traverse_bfs call per
+      // anchor replaces the whole composite above — the same anchors, the
+      // same caps (100/level), depth 2, in a single facade call.
+      gdi_rate("graphdb/gdi/traverse_bfs", kGdiTwoHopAnchors,
+                 "db.traverse_bfs(anchor, {}, outgoing, cap=100, depth=2) — one "
+                 "native call per anchor",
+                 [&](size_t i) -> uint64_t {
+                     kimix::vector<TraversalVertex> walk;
+                     if (data.db.traverse_bfs(data.anchors[i % data.anchors.size()], {},
+                                              graph_db::EdgeOrientation::outgoing,
+                                              kGdiNeighborCap, 2, walk) !=
+                         graph_db::GdiStatus::ok) {
+                         return 0;
+                     }
+                     return walk.size();
+                 });
+
+        // 2-hop BFS: 1,000 anchors x cap 100, then every UNIQUE L1 vertex
+        // re-queried at cap 50 — the read_2hop_bfs shape, one native call per
+        // read, so the row is directly comparable to the engine-composite one.
+        {
+            graph_db::VertexPage page;
+            for (size_t i = 0; i < 50; ++i) {
+                data.db.get_neighbor_vertices(data.anchors[i % data.anchors.size()], {},
+                                              graph_db::EdgeOrientation::outgoing,
+                                              kGdiNeighborCap, page);
+            }
+            kimix::Clock clock;
+            kimix::vector<kimix::Guid> frontier;
+            frontier.reserve(kGdiTwoHopAnchors * 100);
+            for (auto const &anchor : data.anchors) {
+                if (data.db.get_neighbor_vertices(anchor, {},
+                                                  graph_db::EdgeOrientation::outgoing,
+                                                  kGdiNeighborCap,
+                                                  page) == graph_db::GdiStatus::ok) {
+                    frontier.insert(frontier.end(), page.items.begin(), page.items.end());
+                }
+            }
+            kimix::unordered_set<kimix::Guid> seen(frontier.begin(), frontier.end());
+            kimix::vector<kimix::Guid> followups(seen.begin(), seen.end());
+            size_t l2_reads = 0;
+            for (auto const &uid : followups) {
+                data.db.get_neighbor_vertices(uid, {}, graph_db::EdgeOrientation::outgoing,
+                                              kGdiTwoHopL2Cap, page);
+                ++l2_reads;
+            }
+            double const seconds = clock.toc() / 1000.0;
+            size_t const total_reads = data.anchors.size() + l2_reads;
+            char suffix[320];
+            std::snprintf(suffix, sizeof(suffix),
+                          "%zu anchors x cap %lld, then %zu unique L1 re-queried at cap "
+                          "%lld (%zu native reads total)",
+                          data.anchors.size(),
+                          static_cast<long long>(kGdiNeighborCap), followups.size(),
+                          static_cast<long long>(kGdiTwoHopL2Cap), total_reads);
+            print_rate("graphdb/gdi/2hop_bfs", static_cast<double>(total_reads), seconds,
+                       suffix);
+            kimix_bench::sink(frontier.size() + followups.size());
         }
     };
 

@@ -685,6 +685,56 @@ the optimization loop is STOPPED at epoch 3: this is the final epoch. The next
 real step is a src/core sync-policy decision, not another src/graph_db epoch./n
 ---
 
+### Plan v3 GDI epoch log (time-cost epochs, GDI-shaped rows)
+
+Plan v3 (`reports/plan_v3.md`) re-opened the epoch loop for the GDI command
+scenarios. Same discipline: release mode, min-of-N interleaved runs, a <5 %
+full re-run closes the epoch. Rows here, detail there.
+
+| machine | mode | epoch | metric | before | after | delta |
+|---|---|---|---|---:|---:|---:|
+| AMD Ryzen 9 7950X3D, 16C/32T, 64 GB | release | v3-4.1 | graphdb/gdi/degree_probe (native) | 3565.5 ns | 280.8 ns | 12.7x |
+| " | " | v3-4.1 | graphdb/gdi/neighbors_page100 (native) | 2916.2 ns | 277.4 ns | 10.5x |
+| " | " | v3-4.1 | BDN DegreeProbe (adapter, managed) | 2.31 us | 196.5 ns (0 B) | 11.8x |
+| " | " | v3-4.1 | BDN NeighborsPage100 (adapter) | 3.84 us | 433.8 ns | 8.9x |
+| " | " | v3-4.1 | read_degree_count (graphbench e2e) | 177.7k ops/s | 533,368 ops/s | 3.0x (target >=300k MET) |
+| " | " | v3-4.1 | read_neighbors_page (graphbench e2e) | 140.0k ops/s | 392,319 ops/s | 2.8x (target >=275k MET) |
+| " | " | v3-4.3 | BDN GetProperties (adapter, managed) | 623.6 ns | 300.3 ns (1008 B) | 2.08x |
+| " | " | v3-4.3 | read_properties (graphbench e2e) | 270.7k ops/s | 303,557 ops/s | +12 % (target >=340k residual owned by step 4.8: engine per-command overhead) |
+| " | " | v3-4.4 | BDN InsertVerticesBulk (adapter) | 3.08 us/row (2.3 KB) | 1.358 us/row (1010 B) | 2.27x |
+| " | " | v3-4.4 | insert_vertices_bulk (graphbench e2e) | 139.7k ops/s | 180,478 ops/s | 1.29x (target >=180k MET; inmemory parity 93.8 %) |
+| " | " | v3-4.5 | BDN InsertVerticesBulk XXH3 vs MD5 (A/B) | 1.358 us/row | 1.309 us/row | +3.6 % (below the 5 % stop rule; flag kept for content-heavy consumers, ABI 6) |
+| " | " | v3-4.6 | BDN InsertEdgesRowwise (adapter) | 1.32 us (448 B) | 1.202 us (168 B) | -9 % time, -62 % alloc |
+| " | " | v3-4.6 | BDN EdgeCrudCycle (adapter) | 1.58 us (744 B) | 1.419 us (464 B) | -10 % time, -38 % alloc |
+| " | " | v3-4.6 | insert_edges_rowwise (graphbench e2e) | 162.6k ops/s | 168.3k ops/s | +3.6 % (target >=220k residual owned by step 4.8: engine per-command overhead is 78 % of e2e) |
+| " | " | v3-4.6 | edge_crud_cycle (graphbench e2e) | 115.3k ops/s | 121.7k ops/s | +5.4 % (target >=165k residual owned by step 4.8) |
+| " | " | v3-4.8 | BDN engine reads (100-cmd buffer) | 88.9 KB | 62.4 KB | -30 % alloc (SingleOutputMap + per-batch CommandContext) |
+| " | " | v3-4.8 | BDN engine row-wise edges (100-cmd buffer) | 277.9 KB | 251.5 KB | -9.5 % alloc |
+| " | " | v3-4.8 | read_properties (graphbench e2e) | 270.7k ops/s | 338.1k ops/s | parity 98 % vs same-session inmemory (target >=340k referenced stale machine state) |
+| " | " | v3-4.8 | insert_edges_rowwise (graphbench e2e) | 162.6k ops/s | 175.4k ops/s | parity 84-94 %; residual = native write premium, lever recorded (journal slimming) |
+| " | " | v3-4.8 | edge_crud_cycle (graphbench e2e) | 115.3k ops/s | 124.9k ops/s | parity (reference swings 119-188k; residual = native write premium) |
+| " | " | v3-5.2 | native store, projected 50k/300k (staged RSS) | 261.2 MB | 223.9 MB | -37.3 MB: one adjacency representation (EdgeLink lists only; guid projections + Vertex* sets deleted) |
+| " | " | v3-5.2 | edge bytes (record+links+label+weight) | 607.0 B | 517.3 B | -14.8 % |
+| " | " | v3-5.2 | keyed vertex bytes | 1,579.0 B | 1,371.3 B | -13.2 %; sizeof(Vertex) 512 -> 320 |
+| " | " | v3-5.2 | edge_create_rowwise (native bench) | 935.7 ns | 533.3 ns | -43 % (less per-edge maintenance) |
+| " | " | v3-5.3 | graphbench peak working set (kimix 50k/300k) | 424.5 MB | 381.4 MB | slim transaction journal (Fat behind unique_ptr; creates alloc-free); peak-setting phase transient -40 MB |
+| " | " | v3-5.4 | graphbench peak working set (kimix 50k/300k) | 381.4 MB | 341-348 MB | PropertyValue 96 -> 24 B tagged union + exact link reservation in edge bulk |
+| " | " | v3-5.6 | graphbench peak working set (kimix 50k/300k) | 424.5 MB | 339.5 MB (median of 3) | GATE <=300 MISSED by 13 %: native store 261->187 MB delivered; remainder is .NET GC segments + engine transients (~113 MB), engine-side future work |
+| " | " | v3-6 | native store, projected 50k/300k (final, staged RSS) | 261.2 MB | 187.7 MB | -28 % across 5.2-5.4; edge 433.0 B, vertex keyed 1,153 B |
+| " | " | v3-6 | edge_create_rowwise (native bench, final) | 935.7 ns | 495.3 ns | -47 % (5.2 de-dup + 5.3 slim journal); reads flat (degree 281.7 ns, page 278.9 ns, 2hop 255.7 ns) |
+| " | " | v3-6 | verification sweep | — | 15 suites x (release + debug + ASan/UBSan) | all green; C# 57/57 + 44/44; FFI AOT 151/151 |
+
+v3-4.1 change: the UNFILTERED neighbourhood read (empty constraint, any cap,
+the cap-0 degree probe included) answers from ONE shard SHARED lock snapshot
+of the anchor's adjacency projection (`Graph::oriented_adjacency`) instead of
+per-edge endpoint round-trips plus per-neighbour label/property resolution.
+Distinct-neighbour semantics unchanged (parallel edges / both-halves /
+self loops collapse via the same seen dedup); neighbours are reported as
+recorded at the anchor snapshot and not re-validated (the traverse_bfs
+contract). A per-guid counter cache was considered and rejected: the bench
+probes random vertices over the full 100k set, so it would never warm.
+
+
 ## 5b. GDI layer: lock hierarchy v2 (authoritative copy in `graph.h` + `database.h`)
 
 Epoch 4 added two shard families and a request-level schema, so the levels are now
@@ -769,13 +819,44 @@ that announces a format NEWER than `KIMIX_GRAPH_DB_FORMAT_VERSION` is refused wi
 
 | Flag | value | why |
 |---|---|---|
-| `supports_global_scan` | **false** | no vertex-iteration command (deferred P9) |
+| `supports_global_scan` | **true** | G1 landed (plan v3 step 2): `Graph::for_each_vertex` (shard-ascending, one SHARED lock at a time) + `Database::scan_vertices`, exposed through the C ABI (`kimix_gdb_scan_vertices`, ABI 3) |
 | `supports_edge_by_stable_uid` | **true** | edge uids are records and survive save/load |
 | `supports_edge_property_read` | **true** | edges carry labels and properties |
-| `supports_native_multi_hop` | **false** (depth 0) | multi-hop is composed from neighbour reads (P9) |
-| `supports_global_aggregates` | **false** | P9 |
+| `supports_native_multi_hop` | **true** (depth 32) | G3 landed (plan v3 step 1): `Graph::traverse_bfs` + the bounded `shortest_path`, exposed through `Database`, the C ABI (`kimix_gdb_traverse_bfs` / `_shortest_path`, ABI 2) and the `kimix_graphdb_*` re-exports |
+| `supports_global_aggregates` | **true** | G4 landed (plan v3 step 2): `Database::aggregate_vertices` (count/min/max/sum/avg, per-shard partials merged in shard order over a fiber fan-out), exposed through the C ABI (`kimix_gdb_aggregate`, ABI 3) |
 | `supports_collective_transactions` | **true** | read-only scope; **no snapshot isolation** (single-writer store), documented in `transaction.h` |
 | `enforces_unique_external_ids` | **true** | the `KeyIndex` refuses a duplicate (`KeyMode::report_warning` is the warning path) |
+
+## 5f. G3 (plan v3 phase 1) — native multi-hop traversal, measured
+
+One native call now does the level-by-level BFS the engine used to compose
+from per-hop neighbour reads: `Graph::traverse_bfs` (per-level cap, bounded
+depth, §5.10 constraint filter gating ENQUEUE) and a bounded
+`Graph::shortest_path`, one shard SHARED lock per visited vertex, the
+`VisitedSet` linear-first hybrid of `has_path`, deterministic discovery order.
+`Database` forwards them with `_resolve_constraint`; the C ABI and the
+kimix_api re-exports carry them under ABI 2 (`kimix_gdb_traversal_vertex`,
+`KIMIX_GDB_MAX_HOP_DEPTH = 32` = `Graph::kMaxNativeHopDepth`).  Measured on the
+graphbench 50k/300k dataset shape (`test_graph_db_bench` release, this host,
+plan v3 step 1.12):
+
+| shape | ops/s |
+|---|---|
+| engine-composite 2-hop (5,576 single-hop reads) | 222,643 reads/s |
+| native `traverse_bfs` per anchor (cap 100/level, depth 2) | **434,047 walks/s** (2,304 ns each) |
+| graphbench `read_2hop_bfs` end-to-end over kimix (native command path) | **65,639 ops/s** (was 18,891 composite) — rma parity target was ≥ 46k |
+
+## 5g. G1/G4 (plan v3 phase 2) — global scan + global aggregates, measured
+
+Machine/mode as §5f (Ryzen 9 7950X3D, release, 2026-10-25).  The
+graphbench rows run ONE command per op through the engine (the engine worker
+has no fiber scheduler bound, so the aggregate takes its documented serial
+inline path); the native rows call the C ABI directly.
+
+| scenario | kimix | in-memory | note |
+|---|---:|---:|---|
+| `read_scan_page` (ScanVerticesCommand cap=100) | **2,065 ops/s** (484 us/op) | 942 ops/s | a full 50k-vertex shard walk per op, page capped at 100 |
+| `read_aggregate_avg` (AggregateNeighborsCommand Avg(age)) | 183 ops/s (5.5 ms/op) | 745 ops/s | O(vertices) serial walk; the in-memory store's plain dictionary pass is cheaper per vertex — the fiber fan-out needs a bound scheduler (the test suite's determinism suite runs it with 4 workers). No acceptance target exists for this new row; recorded as the phase-2 baseline |
 
 ## 5e. Epoch 4 — first-class edges + the GDI layer
 

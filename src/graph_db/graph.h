@@ -236,12 +236,13 @@
  * ===========================================================================
  * connect(from, to) records "from depends on to" (from -> to). Traversal
  * follows that direction: has_path/shortest_path walk outgoing dependency
- * edges, dependencies(guid) returns _depending_guids, and neighbors(guid)
- * returns the union of both directions (an undirected adjacency view).
+ * edges, dependencies(guid) returns the outgoing links' neighbour guids, and
+ * neighbors(guid) returns the union of both directions (an undirected
+ * adjacency view).
  *
  * ROOTS
  * ===========================================================================
- * A root is a vertex nothing depends on, i.e. one whose _depended set is empty
+ * A root is a vertex nothing depends on, i.e. one with no incoming links
  * (the plan's §9 definition: sinks in dependency order — NOT the "vertex with
  * no outgoing edges" reading). EPOCH 3 made the set a VERSION-KEYED CACHE: the
  * O(n) shard walk (0.59 ms at 100k) happens only when a structural write has
@@ -269,14 +270,15 @@
  *     kimix::vector<EdgeLink> _out_links, _in_links;   // {edge uid, neighbour}
  *
  * i.e. one entry per EDGE instead of one per neighbour, which is what makes
- * parallel edges, per-edge direction and delete-by-uid expressible at all. The
+ * parallel edges, per-edge direction and delete-by-uid expressible at all.
+ * PLAN V3 §5.2 made these link lists the SINGLE adjacency representation: the
  * neighbour guid lists (_depending_guids / _depended_guids) and the resolved
- * Vertex* sets (_depending / _depended) stay as MAINTAINED PROJECTIONS: they are
- * updated in place on every link insert/erase, so dependencies()/dependents()/
- * has_path()/neighbors() keep their 16-byte-per-edge read shape and their
- * behaviour. The alternative (rebuild a projection on demand) was rejected
- * because dependencies() returns a const reference and every traversal calls it
- * once per visited vertex.
+ * Vertex* sets (_depending / _depended) that used to sit alongside them as
+ * maintained projections were triple storage of the same fact (~45 MB on the
+ * graphbench 50k/300k dataset) and are gone; the guid-view reads
+ * (dependencies()/dependents()/has_path()/neighbors()) now copy the neighbour
+ * field out of the links under the same one-shard-lock snapshot, preserving
+ * both the read shape and the outgoing-first order.
  *
  * The legacy connect()/disconnect()/connect_bulk() semantics are UNCHANGED and
  * are now implemented THROUGH the edge table: connect() creates one DIRECTED
@@ -315,6 +317,8 @@
 #include "graph_db_options.h"
 #include "key.h"
 #include "property.h"
+#include "query.h"
+#include "schema.h"
 #include "status.h"
 #include "vertex.h"
 
@@ -473,6 +477,71 @@ private:
         }
     }
 
+    // The undirected-visit form: both edge lists concatenated (outgoing first).
+    // Duplicates between the two lists are left in — the caller's dedup removes
+    // them — because the one-lock snapshot matters more than the copy size.
+    void _assign_two(kimix::vector<kimix::Guid> const &first,
+                     kimix::vector<kimix::Guid> const &second) {
+        _size = first.size() + second.size();
+        if (_size <= kInlineCapacity) {
+            _data = _local;
+            std::copy(first.begin(), first.end(), _local);
+            std::copy(second.begin(), second.end(), _local + first.size());
+        } else {
+            _heap.clear(); // retains capacity across calls
+            _heap.reserve(_size);
+            _heap.insert(_heap.end(), first.begin(), first.end());
+            _heap.insert(_heap.end(), second.begin(), second.end());
+            _data = _heap.data();
+        }
+    }
+
+    // The link-list forms (plan v3 §5.2): the EdgeLink vectors are the one
+    // adjacency representation, and the guid view this buffer exposes is
+    // their neighbour field — copied under the same single shard lock, same
+    // order, same inline/heap split as the guid-list forms above.
+    void _assign_links(kimix::vector<EdgeLink> const &src) {
+        _size = src.size();
+        if (_size <= kInlineCapacity) {
+            _data = _local;
+            for (size_t i = 0; i < _size; ++i) {
+                _local[i] = src[i].neighbour;
+            }
+        } else {
+            _heap.clear(); // retains capacity across calls
+            _heap.reserve(_size);
+            for (auto const &link : src) {
+                _heap.push_back(link.neighbour);
+            }
+            _data = _heap.data();
+        }
+    }
+
+    void _assign_two_links(kimix::vector<EdgeLink> const &first,
+                           kimix::vector<EdgeLink> const &second) {
+        _size = first.size() + second.size();
+        if (_size <= kInlineCapacity) {
+            _data = _local;
+            kimix::Guid *cursor = _local;
+            for (auto const &link : first) {
+                *cursor++ = link.neighbour;
+            }
+            for (auto const &link : second) {
+                *cursor++ = link.neighbour;
+            }
+        } else {
+            _heap.clear(); // retains capacity across calls
+            _heap.reserve(_size);
+            for (auto const &link : first) {
+                _heap.push_back(link.neighbour);
+            }
+            for (auto const &link : second) {
+                _heap.push_back(link.neighbour);
+            }
+            _data = _heap.data();
+        }
+    }
+
     kimix::Guid _local[kInlineCapacity]{};
     kimix::Guid const *_data{_local};
     size_t _size{0};
@@ -539,11 +608,11 @@ public:
      *      instead of per edge (a bulk load is a single-threaded phase by
      *      contract, see WRITE POLICY).
      *
-     * Everything else is unchanged: the same duplicate probe (_depending on the
-     * source), the same two vertex UNIQUE locks per created edge (shard before
-     * vertex, never the inverse), and the same _add_depending/_add_depended
-     * bookkeeping, so the guid lists and the pointer sets stay in lockstep and
-     * the reverse edges are filled. `outcomes` receives one verdict per request,
+     * Everything else is unchanged: the same duplicate probe on the source,
+     * the same two vertex UNIQUE locks per created edge (shard before
+     * vertex, never the inverse), and the same _add_out_link/_add_in_link
+     * bookkeeping, so both directions of the link lists are filled.
+     * `outcomes` receives one verdict per request,
      * in request order, when its size is at least `count`; it is OPTIONAL (the
      * default empty span discards the verdicts) because a caller that only needs
      * the created count should not pay for them.
@@ -680,7 +749,7 @@ public:
     void restore_removed_vertex(kimix::Guid const &guid);
     void restore_removed_edge(EdgeId const &edge);
     [[nodiscard]] size_t removed_vertex_count() const noexcept { return _removed_vertices.size(); }
-    [[nodiscard]] size_t removed_edge_count() const noexcept { return _removed_edges.size(); }
+      [[nodiscard]] size_t removed_edge_count() const noexcept { return _removed_edges.size(); }
 
     // Every vertex guid / every edge id, copied one shard at a time (shard index,
     // then map insertion order — deterministic). O(n); used by the schema
@@ -780,8 +849,21 @@ public:
     // allocates nothing.
     [[nodiscard]] size_t dependencies(kimix::Guid const &guid,
                                       kimix::span<kimix::Guid> out) const noexcept;
-    [[nodiscard]] size_t dependents(kimix::Guid const &guid,
-                                    kimix::span<kimix::Guid> out) const noexcept;
+  [[nodiscard]] size_t dependents(kimix::Guid const &guid,
+                                  kimix::span<kimix::Guid> out) const noexcept;
+  // Oriented form of the buffer reads above (plan v3 §4.1): ONE shard SHARED
+  // lock snapshot of the neighbour-guid projection for `orientation` — the
+  // out list, the in list, or both concatenated outgoing-first. False when
+  // `guid` is unknown. Duplicates are left in (parallel edges, both-halves
+  // overlap, self loops); the caller's dedup removes them, exactly like
+  // traverse_bfs. The guids are reported as recorded at the anchor snapshot:
+  // the neighbours' own records are NOT re-validated (the traverse_bfs
+  // contract).
+  [[nodiscard]] bool oriented_adjacency(kimix::Guid const &guid,
+                                        EdgeOrientation orientation,
+                                        AdjacencyBuffer &out) const noexcept {
+      return _read_oriented_adjacency(guid, orientation, out);
+  }
 
     // --- traversals ---------------------------------------------------------
     // Reachability along outgoing edges. Cycle-safe: a BFS over an explicit
@@ -797,7 +879,108 @@ public:
     [[nodiscard]] kimix::vector<kimix::Guid>
     shortest_path(kimix::Guid const &from, kimix::Guid const &to) const;
 
-    // --- dirty bookkeeping (for the incremental serializer) -----------------
+    // --- GDI multi-hop traversal (the G3 capability) -------------------------
+    // The deepest traversal this build honours; a larger max_depth is refused
+    // with error_argument so the capability advertisement stays honest.
+    inline static constexpr uint32_t kMaxNativeHopDepth = 32;
+
+    // One vertex of a traverse_bfs result, in discovery (BFS) order: `guid`,
+    // the BFS-tree `parent` that discovered it (zeroed at depth 0), and its
+    // `depth` (0 = the start vertex).
+    struct KIMIX_GRAPH_DB_API TraversalVertex {
+        kimix::Guid guid;
+        kimix::Guid parent;
+        uint32_t depth{0};
+    };
+
+    // Breadth-first traversal from `start` over `orientation` edges, `max_depth`
+    // levels deep, keeping at most `cap_per_level` vertices per level (level 0,
+    // the start, is always exactly one vertex). A non-empty `constraint`
+    // filters every DISCOVERED vertex the GDI §5.10 way (a traversal filter
+    // applies to vertices, not edges): a vertex that fails the filter is not
+    // enqueued, so its own neighbourhood is never visited. The start vertex
+    // is returned unconditionally at depth 0 (it was chosen by the caller,
+    // not discovered). Discovery order is deterministic (shard-adjacency list
+    // order, levels in ascending order), so the same graph yields the same
+    // result regardless of scheduling.
+    //
+    // READ ATOMICITY: per-vertex, exactly like has_path/shortest_path above —
+    // one vertex's adjacency is copied under one shard SHARED lock, and a
+    // filtered candidate's labels/properties are read under that vertex's
+    // leaf SHARED lock; a concurrent structural writer may be observed on one
+    // visit and not the next, memory safety is preserved by the cascade
+    // argument in the header contract, and no lock is held between visits.
+    //
+    // Work is bounded: a level stops expanding the moment it reaches
+    // `cap_per_level`, so a hub-heavy level exits early instead of walking
+    // every remaining frontier vertex.
+    //
+    //   error_argument   cap_per_level < 1, max_depth < 1 or > kMaxNativeHopDepth
+    //   error_op         a label condition carries an ordering op (the
+    //                    _resolve_constraint rule — validated up front)
+    //   error_vertex     `start` is unknown
+    //   ok               otherwise (`out` holds every discovered vertex; the
+    //                    start is always `out[0]`)
+    [[nodiscard]] GdiStatus traverse_bfs(kimix::Guid const &start, Constraint const &constraint,
+                                         EdgeOrientation orientation, int64_t cap_per_level,
+                                         uint32_t max_depth,
+                                         kimix::vector<TraversalVertex> &out) const;
+
+    // Bounded shortest path along outgoing edges, endpoints INCLUDED. `out` is
+    // empty (status ok) when `to` is unreachable within `max_depth` hops;
+    // {from} when from == to and `from` exists. An UNKNOWN endpoint is
+    // error_vertex (the unbounded shortest_path above returns {} there; the
+    // GDI entry point must not silently invent an empty answer for a bad uid).
+    // Same BFS shape and read-atomicity contract as the unbounded form.
+    //
+    //   error_argument   max_depth < 1 or > kMaxNativeHopDepth
+    //   error_vertex     `from` or `to` is unknown
+    [[nodiscard]] GdiStatus shortest_path(kimix::Guid const &from, kimix::Guid const &to,
+                                        uint32_t max_depth,
+                                        kimix::vector<kimix::Guid> &out) const;
+      // --- GDI global scan (the G1 capability) -----------------------------
+      // Calls `visit(vertex)` for EVERY vertex in the graph: shard 0..
+      // kGraphShardCount-1 in ascending order, each shard's map order within a
+      // shard. ONE shard SHARED lock at a time, taken and released per shard —
+      // the same contract as _compute_roots(): a concurrent structural writer
+      // may be observed on one shard and not the next (the scan is a
+      // shard-by-shard snapshot, not a graph-wide point-in-time one), memory
+      // safety holds by the header's cascade argument, and no lock is held
+      // between shards. Per-vertex atomicity: the callback runs while its
+      // shard's SHARED lock is held, so one call sees one consistent view of
+      // that shard (same contract as roots()).
+      // The callback MUST NOT mutate the graph — it runs under a read lock.
+      // Returning false stops the scan early; the status is ok either way.
+      // Template (header-defined) so a lambda costs no allocation and no
+      // kimix::function indirection on the per-vertex hot path.
+      template <typename Fn> GdiStatus for_each_vertex(Fn &&visit) const {
+          return for_each_vertex(0u, static_cast<uint32_t>(kGraphShardCount),
+                                 static_cast<Fn &&>(visit));
+      }
+      // The shard-range form: visits shards [shard_begin, shard_end) only —
+      // the unit the aggregate fan-out parallelizes over. Each range obeys the
+      // same contract as the full scan (one SHARED lock at a time, ascending);
+      // DISJOINT ranges running on different fibers therefore never touch the
+      // same shard lock, and a caller that merges per-range results in range
+      // order gets the deterministic full-scan order. Indices are clamped to
+      // [0, kGraphShardCount]; an empty range invokes nothing.
+      template <typename Fn>
+      GdiStatus for_each_vertex(uint32_t shard_begin, uint32_t shard_end, Fn &&visit) const {
+          uint32_t const end = shard_end < kGraphShardCount ? shard_end
+                                                            : static_cast<uint32_t>(kGraphShardCount);
+          for (uint32_t i = shard_begin; i < end; ++i) {
+              Shard const &shard = _shards[i];
+              std::shared_lock<std::shared_mutex> lock(shard.mutex);
+              for (auto const &entry : shard.vertices) {
+                  Vertex *vertex = entry.second.get();
+                  if (vertex != nullptr && !visit(*vertex)) {
+                      return GdiStatus::ok;
+                  }
+              }
+          }
+          return GdiStatus::ok;
+      }
+      // --- dirty bookkeeping (for the incremental serializer) -----------------
 
     // Set/clear every vertex's AND every edge's dirty flag (a full save rewrites
     // both families). The vertex flags are atomics; one shard shared lock at a
@@ -923,6 +1106,13 @@ private:
                                        AdjacencyBuffer &out) const noexcept;
     [[nodiscard]] size_t _read_adjacency(kimix::Guid const &guid, bool outgoing,
                                          kimix::span<kimix::Guid> out) const noexcept;
+    // The traversal form: fill `out` with the oriented adjacency (both edge
+    // lists when orientation == both) under ONE shard shared lock, so the two
+    // directions of one undirected visit come from one snapshot of that
+    // vertex. False when the guid is unknown.
+    [[nodiscard]] bool _read_oriented_adjacency(kimix::Guid const &guid,
+                                                EdgeOrientation orientation,
+                                                AdjacencyBuffer &out) const noexcept;
 
     // Bump the structural version. Called by every structural write, AFTER the
     // mutation and while its shard lock is still held, so a reader that sees the

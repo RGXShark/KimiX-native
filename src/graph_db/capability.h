@@ -10,14 +10,17 @@
  * struct.
  *
  * Current state (see reports/gdi_alignment.md for the phase table):
- *   supports_global_scan            false  — no vertex iteration API (P9)
- *   supports_edge_by_stable_uid     true   (P3: edge ids survive save/load)
- *   supports_edge_property_read     true   (P3: edges carry properties)
- *   supports_native_multi_hop       false  — composed BFS only (P9)
- *   max_native_hop_depth            0
- *   supports_global_aggregates      false  (P9)
- *   supports_collective_transactions true  (P6: read-only scope, no snapshot)
- *   enforces_unique_external_ids    true   (P2: KeyIndex refuses a duplicate)
+ * supports_global_scan true (G1: Graph::for_each_vertex +
+ * Database::scan_vertices, plan v3 step 2.4)
+ * supports_edge_by_stable_uid true (P3: edge ids survive save/load)
+ * supports_edge_property_read true (P3: edges carry properties)
+ * supports_native_multi_hop true (G3: Graph::traverse_bfs + bounded
+ * shortest_path, plan v3 step 1.6)
+ * max_native_hop_depth 32 (Graph::kMaxNativeHopDepth)
+ * supports_global_aggregates true (G4: Database::aggregate_vertices with the
+ * fiber fan-out, plan v3 step 2.4)
+ * supports_collective_transactions true  (P6: read-only scope, no snapshot)
+ * enforces_unique_external_ids true (P2: KeyIndex refuses a duplicate)
  *
  * Example:
  *   auto cap = kimix::graph_db::current_capability();

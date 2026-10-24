@@ -282,6 +282,52 @@ public:
                                             Constraint const &constraint,
                                             EdgeOrientation orientation, bool &out) const;
 
+      // --- native multi-hop traversal (§5.12 composites — the G3 capability) ---
+      // One native call for the whole level-by-level walk the engine would
+      // otherwise compose from per-hop reads.  `constraint` is an empty
+      // Constraint or a registered handle, resolved exactly like the read
+      // commands; a non-empty one filters every discovered vertex (§5.10), so
+      // a filtered-out vertex's neighbourhood is never visited.  Read-only:
+      // usable inside any transaction scope, journaled by nothing.
+      // See Graph::traverse_bfs for the cap/depth/error contract.
+      [[nodiscard]] GdiStatus traverse_bfs(kimix::Guid const &start, Constraint const &constraint,
+                                           EdgeOrientation orientation, int64_t cap_per_level,
+                                           uint32_t max_depth,
+                                           kimix::vector<Graph::TraversalVertex> &out) const;
+      // Bounded shortest path along outgoing edges (the SHORTEST_PATH composite).
+      // Empty result + ok = unreachable within `max_depth`; error_vertex for an
+      // unknown endpoint; error_argument for a bound outside 1..kMaxNativeHopDepth.
+      [[nodiscard]] GdiStatus shortest_path(kimix::Guid const &from, kimix::Guid const &to,
+                                            uint32_t max_depth,
+                                            kimix::vector<kimix::Guid> &out) const;
+
+      // --- global scan (the G1 capability) ------------------------------------
+      // One native pass over EVERY vertex (Graph::for_each_vertex: shard 0..63
+      // ascending, one shard SHARED lock at a time, map order within a shard),
+      // filtered by `constraint` exactly like a neighbourhood read filters the
+      // neighbour vertex (§5.10: the scanned vertex itself, labels AND-ed with
+      // properties). `constraint` is an empty Constraint (match everything) or
+      // a registered handle, resolved like the read commands. cap == 0 is the
+      // count probe (no items, real total_count); cap < 0 is error_argument.
+      // Deterministic: the result order is shard order then map order, so the
+      // same graph yields the same page regardless of scheduling. Read-only.
+      [[nodiscard]] GdiStatus scan_vertices(Constraint const &constraint, int64_t cap,
+                                            VertexPage &out) const;
+
+      // --- global aggregates (the G4 capability) ------------------------------
+      // One native pass reducing one property over every vertex matching
+      // `spec.constraint` (empty = all). The fan-out runs one fiber per shard
+      // over the shard ranges (SHARED locks only), and the per-shard partials
+      // merge in SHARD ORDER, so the float sums and the min/max tie-breaks are
+      // bit-identical to the serial scan regardless of scheduling; the parallel
+      // path needs a bound fiber scheduler, and the unbound fast path runs the
+      // same shards inline (C-ABI safe: the call blocks either way). See
+      // AggregateSpec/AggregateResult in query.h for the legality matrix
+      // (error_op / error_property_type are decided BEFORE the scan) and the
+      // payload kinds. Read-only.
+      [[nodiscard]] GdiStatus aggregate_vertices(AggregateSpec const &spec,
+                                                 AggregateResult &out) const;
+
     // --- constraints (§2.5) -------------------------------------------------
     [[nodiscard]] GdiStatus create_constraint(Constraint const &definition,
                                               ConstraintHandle &out);

@@ -53,6 +53,8 @@ using graph_db::GraphSerializeStats;
 using graph_db::LabelId;
 using graph_db::NamedPropertyList;
 using graph_db::PropNameId;
+using graph_db::PropertyEntry;
+using graph_db::PropertyList;
 using graph_db::PropertyValue;
 using graph_db::VertexCreateResult;
 using graph_db::VertexKeyView;
@@ -551,6 +553,100 @@ int main(int argc, char *argv[]) {
         expect(eq(f.db.get_edge_properties(ghost, properties), GdiStatus::error_uid));
         kimix::vector<kimix::string> labels_out;
         expect(eq(f.db.get_edge_labels(ghost, labels_out), GdiStatus::error_uid));
-        expect(eq(f.db.add_edge_label(ghost, f.link), GdiStatus::error_uid));
-    };
-}
+          expect(eq(f.db.add_edge_label(ghost, f.link), GdiStatus::error_uid));
+      };
+
+      // Create-time properties (plan v3 step 3.1/3.2): ONE call carries labels
+      // and (name, value) properties; ONE journal entry; a refused create
+      // leaves NOTHING behind (no edge, no adjacency).
+      "edge_create_with_properties"_test = [] {
+          fixture f;
+          // A second property type for the payload mix.
+          graph_db::PropertyTypeInfo info;
+          info.name = "hops";
+          info.data = GdiDataType::int64_;
+          PropNameId hops{};
+          expect(eq(f.db.create_property_type(info, hops), GdiStatus::ok));
+          Guid const a = f.vertex("a");
+          Guid const b = f.vertex("b");
+          LabelId const labels[]{f.link};
+          PropertyList payload;
+          payload.push_back(PropertyEntry{f.weight, PropertyValue::make_double(2.5)});
+          payload.push_back(PropertyEntry{hops, PropertyValue::make_int64(3)});
+          Guid edge;
+          expect(eq(f.db.edge_create(a, b, EdgeDirectionType::directed,
+                                     kimix::span<const LabelId>{labels, 1}, &payload, edge),
+                    GdiStatus::ok));
+          // The payload is readable in the same shape it was created.
+          NamedPropertyList read_back;
+          expect(eq(f.db.get_edge_properties(edge, read_back), GdiStatus::ok));
+          expect(eq(read_back.size(), size_t{2}));
+          // NamedPropertyList entries carry the names as strings; both landed.
+          kimix::vector<kimix::string_view> names;
+          names.push_back(read_back[0].name);
+          names.push_back(read_back[1].name);
+          std::sort(names.begin(), names.end());
+          expect(eq(names[0], kimix::string_view{"hops"}));
+          expect(eq(names[1], kimix::string_view{"weight"}));
+          kimix::vector<kimix::string> edge_labels;
+          expect(eq(f.db.get_edge_labels(edge, edge_labels), GdiStatus::ok));
+          expect(eq(edge_labels.size(), size_t{1}));
+          expect(eq(edge_labels[0], kimix::string{"link"}));
+          // Adjacency was installed by the same call.
+          expect(eq(f.db.graph().dependencies(a).size(), size_t{1}));
+          expect(eq(f.db.graph().dependents(b).size(), size_t{1}));
+          // The error matrix: every refusal happens BEFORE anything is created.
+          size_t const edges_before = f.db.graph().edge_ids().size();
+          LabelId const bad_label{4242};
+          LabelId const bad_labels[]{bad_label};
+          PropertyList bad;
+          expect(eq(f.db.edge_create(a, b, EdgeDirectionType::directed,
+                                     kimix::span<const LabelId>{bad_labels, 1}, &payload, edge),
+                    GdiStatus::error_label));
+          bad.push_back(PropertyEntry{PropNameId{9999}, PropertyValue::make_int64(1)});
+          expect(eq(f.db.edge_create(a, b, EdgeDirectionType::directed, {}, &bad, edge),
+                    GdiStatus::error_property_type));
+          bad.clear();
+          bad.push_back(PropertyEntry{f.weight, PropertyValue::make_int64(1)});
+          expect(eq(f.db.edge_create(a, b, EdgeDirectionType::directed, {}, &bad, edge),
+                    GdiStatus::error_wrong_type))
+              << "an int64 value for the double_ weight type is refused";
+          bad.clear();
+          bad.push_back(PropertyEntry{hops, PropertyValue::make_int64(7)});
+          bad.push_back(PropertyEntry{f.weight, PropertyValue::make_int64(1)});
+          expect(eq(f.db.edge_create(a, b, EdgeDirectionType::directed, {}, &bad, edge),
+                    GdiStatus::error_wrong_type))
+              << "validation runs over the WHOLE payload before any mutation";
+          expect(eq(f.db.graph().edge_ids().size(), edges_before))
+              << "a refused create leaves no edge behind";
+          expect(eq(f.db.graph().dependencies(a).size(), size_t{1}))
+              << "and no adjacency behind";
+      };
+
+      // The same create, inside a transaction, aborts to nothing: the edge
+      // record, its payload and its adjacency links all roll back.
+      "edge_create_with_properties_rolls_back"_test = [] {
+          fixture f;
+          Guid const a = f.vertex("a");
+          Guid const b = f.vertex("b");
+          expect(eq(f.db.begin_transaction(), GdiStatus::ok));
+          LabelId const labels[]{f.link};
+          PropertyList payload;
+          payload.push_back(PropertyEntry{f.weight, PropertyValue::make_double(9.5)});
+          Guid edge;
+          expect(eq(f.db.edge_create(a, b, EdgeDirectionType::directed,
+                                     kimix::span<const LabelId>{labels, 1}, &payload, edge),
+                    GdiStatus::ok));
+          EdgeRecord inside;
+          expect(f.db.graph().edge_record(edge, inside));
+          expect(eq(f.db.abort(), GdiStatus::ok));
+          EdgeRecord after;
+          expect(!f.db.graph().edge_record(edge, after))
+              << "abort removed the edge record";
+          NamedPropertyList props;
+          expect(eq(f.db.get_edge_properties(edge, props), GdiStatus::error_uid))
+              << "abort removed the payload with it";
+          expect(f.db.graph().dependencies(a).empty());
+          expect(f.db.graph().dependents(b).empty());
+      };
+  }

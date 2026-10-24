@@ -76,14 +76,47 @@ template<typename T>
         page.items = std::move(matches);
         return page;
     }
-    page.items.reserve(take);
-    for (size_t i = 0; i < take; ++i) {
-        page.items.push_back(std::move(matches[i]));
-    }
-    return page;
-}
+      page.items.reserve(take);
+      for (size_t i = 0; i < take; ++i) {
+          page.items.push_back(std::move(matches[i]));
+      }
+      return page;
+  }
 
-// Does an entity with these labels/properties satisfy the constraint?
+  // ---------------------------------------------------------------------------
+  // Global aggregates (GDI G4)
+  // ---------------------------------------------------------------------------
+  // Which reduction Database::aggregate_vertices applies.
+  enum class GdiAggregate : int32_t { count = 0, min = 1, max = 2, sum = 3, avg = 4 };
+  // One aggregate request: the vertex set (constraint, empty = every vertex), the
+  // property to reduce (ignored by count), and the reduction. The property must
+  // be a REGISTERED property type for min/max/sum/avg: the declared dtype decides
+  // which reductions are legal (sum/avg need int64_/double_, min/max also accept
+  // char_ for the ordinal string order) — anything else is refused with error_op
+  // BEFORE the scan, and an unknown name id with error_property_type.
+  struct AggregateSpec {
+      Constraint constraint;           // empty = every vertex
+      PropNameId property{kNoPropName}; // ignored by count
+      GdiAggregate function{GdiAggregate::count};
+  };
+  // The aggregate outcome. `matched` counts the vertices satisfying the
+  // constraint; `valued` the subset of those CARRYING the property (a missing
+  // property is skipped, like SQL's AVG ignoring NULLs). `has_value` is false
+  // exactly when the reduction had no input rows (valued == 0, or matched == 0
+  // for count), and `value` is the payload:
+  //   count -> int64(matched)
+  //   min/max -> the extremal value, kind preserved (strings ordinal)
+  //   sum   -> int64 for an int64_ declaration, double for double_
+  //   avg   -> always double ((sum of every contributing value) / valued)
+  // `value` is none when !has_value; count's zero is read from `matched`.
+  struct AggregateResult {
+      uint64_t matched{0};
+      uint64_t valued{0};
+      bool has_value{false};
+      PropertyValue value;
+  };
+
+  // Does an entity with these labels/properties satisfy the constraint?
 // `properties` must be sorted by name for the binary search used below... it is
 // not: the bag is small and a linear scan is what the reference does, so a linear
 // scan it is (documented: a condition list is short, a property bag is short).

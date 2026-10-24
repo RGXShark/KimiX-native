@@ -31,23 +31,27 @@ uint64_t next_transaction_id() noexcept {
 
 size_t JournalEntry::approximate_bytes() const noexcept {
     size_t bytes = sizeof(JournalEntry);
-    bytes += name.size();
-    bytes += info.name.size();
-    bytes += labels.size() * sizeof(LabelId);
-    for (auto const &entry : properties) {
+    if (!fat) {
+        return bytes;
+    }
+    bytes += sizeof(Fat);
+    bytes += fat->name.size();
+    bytes += fat->info.name.size();
+    bytes += fat->labels.size() * sizeof(LabelId);
+    for (auto const &entry : fat->properties) {
         bytes += entry.value.as_string().size() + entry.value.as_blob().size();
         bytes += entry.value.as_int64_array().size() * sizeof(int64_t);
         bytes += entry.value.as_double_array().size() * sizeof(double);
     }
-    if (vertex) {
-        bytes += sizeof(Vertex) + vertex->content_size();
+    if (fat->vertex) {
+        bytes += sizeof(Vertex) + fat->vertex->content_size();
     }
-    for (auto const &removed : removed_edges) {
+    for (auto const &removed : fat->removed_edges) {
         if (removed) {
             bytes += sizeof(Edge);
         }
     }
-    if (edge) {
+    if (fat->edge) {
         bytes += sizeof(Edge);
     }
     return bytes;

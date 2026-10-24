@@ -2,29 +2,27 @@
  * vertex.h — kimix::graph_db::Vertex: one node of the graph.
  *
  * A Vertex owns
- *   - its identity (_guid),
- *   - an opaque content blob (_content) plus the MD5 cached over it,
- *   - its dependency links, held twice: as GUIDs (the serialized source of
- *     truth that survives a save/load cycle and tolerates cycles) and as
- *     resolved Vertex* sets (the in-memory form used by traversals),
- *   - a per-vertex read/write lock and a dirty flag for incremental save.
+ * - its identity (_guid),
+ * - an opaque content blob (_content) plus the cached content digest,
+ * - its dependency links: one EdgeLink vector per direction (edge uid + neighbour
+ *   uid), the SINGLE in-memory adjacency representation (plan v3 §5.2: the
+ *   guid-list and Vertex* set projections this file used to keep alongside the
+ *   links were triple storage of the same fact and are gone),
+ * - a per-vertex read/write lock and a dirty flag for incremental save.
  *
  * LOCKING (see graph.h for the full contract)
- *   _mutex (kimix::shared_atomic_mutex, a shared spin lock) guards _content,
- *   _content_hash and _dirty only: content reads take it shared, content writes
- *   take it unique. The dependency vectors/sets are GRAPH structure: they are
- *   guarded by the SHARD lock of this vertex's shard (graph.h —
- *   hash(guid) & (kGraphShardCount - 1)), which a Graph holds while it mutates
- *   them (unique) or reads them (shared). Both the guid lists and the pointer
- *   sets belong to this vertex, hence to this one shard, so the two forms are
- *   always mutually consistent while that lock is held.
- *   The raw depending_guids()/depended_guids()/depending()/depended() accessors
- *   below therefore do NOT lock: they are for a caller that already owns the
- *   structural state — the serializer, which runs under the single-writer rule
- *   ("save never overlaps a structural write"), and Graph's own internals.
- *   Everything else must go through Graph::dependencies()/dependents()/
- *   neighbors(), which take the shard lock themselves.
- *   Lock ordering is always shard-lock before vertex-lock, never the inverse.
+ * _mutex (kimix::shared_atomic_mutex, a shared spin lock) guards _content,
+ * _content_hash and _dirty only: content reads take it shared, content writes
+ * take it unique. The link vectors are GRAPH structure: they are guarded by the
+ * SHARD lock of this vertex's shard (graph.h — hash(guid) & (kGraphShardCount -
+ * 1)), which a Graph holds while it mutates them (unique) or reads them
+ * (shared).
+ * The raw out_links()/in_links() accessors below therefore do NOT lock: they
+ * are for a caller that already owns the structural state — Graph's own
+ * internals — which is the only production consumer. Everything else must go
+ * through Graph::dependencies()/dependents()/neighbors(), which take the shard
+ * lock themselves.
+ * Lock ordering is always shard-lock before vertex-lock, never the inverse.
  *
  * CACHE-LINE SEPARATION
  *   _mutex is alignas(64): a vertex therefore starts on a cache line and its
@@ -52,10 +50,11 @@
  */
 #pragma once
 
-#include "graph_db_api.h"
-#include "edge.h"
-#include "key.h"
-#include "property.h"
+  #include "graph_db_api.h"
+  #include "edge.h"
+  #include "graph_db_options.h"
+  #include "key.h"
+  #include "property.h"
 
 #include <core/guid.h>
 #include <core/md5.h>
@@ -122,10 +121,14 @@ class KIMIX_GRAPH_DB_API Vertex : public kimix::IOperatorNewBase {
     friend class Graph;
 
 public:
-    Vertex() noexcept;
-    explicit Vertex(kimix::Guid const &guid) noexcept;
-    Vertex(kimix::Guid const &guid,
-           kimix::span<const std::byte> initial_content);
+      Vertex() noexcept;
+      explicit Vertex(kimix::Guid const &guid) noexcept;
+      Vertex(kimix::Guid const &guid,
+             kimix::span<const std::byte> initial_content);
+      // The content digest policy (plan v3 §4.5) is fixed per vertex by whoever
+      // materializes it (Graph/loader) — the Graph's GraphOptions value.
+      Vertex(kimix::Guid const &guid,
+             kimix::span<const std::byte> initial_content, ContentDigest content_digest);
     Vertex(Vertex const &) = delete;
     Vertex &operator=(Vertex const &) = delete;
     Vertex(Vertex &&) = delete;
@@ -172,11 +175,26 @@ public:
     size_t remove_properties(kimix::span<PropNameId const> names);
     [[nodiscard]] bool has_property(PropNameId name) const;
     [[nodiscard]] bool property(PropNameId name, PropertyValue &out) const;
-    // Every property, copied. Order: the bag's iteration order (insertion order
-    // for ankerl's dense map), so an unfiltered read-back is stable.
-    void properties(PropertyList &out) const;
-    [[nodiscard]] PropertyList property_list() const;
-    [[nodiscard]] size_t property_count() const;
+      // Every property, copied. Order: the bag's iteration order (insertion order
+      // for ankerl's dense map), so an unfiltered read-back is stable.
+      void properties(PropertyList &out) const;
+      [[nodiscard]] PropertyList property_list() const;
+      [[nodiscard]] size_t property_count() const;
+      // The ZERO-COPY visitor form of properties() (plan v3 §4.3): `visitor` is
+      // invoked as visitor(name_id, value) under ONE leaf shared lock, in the
+      // bag's iteration order, until it returns false. The value is borrowed:
+      // it dies with the call, so a visitor that keeps it must copy. Use this
+      // on hot read paths instead of properties(), which deep-copies every
+      // value (a string/blob property costs an allocation per copy).
+      template <typename Visitor>
+      void visit_properties(Visitor &&visitor) const {
+          VertexSharedLock guard(const_cast<kimix::shared_atomic_mutex &>(_mutex));
+          for (auto const &entry : _properties) {
+              if (!visitor(entry.first, entry.second)) {
+                  return;
+              }
+          }
+      }
 
     bool add_label(LabelId label);
     bool remove_label(LabelId label);
@@ -205,43 +223,34 @@ public:
     // Same key in its owned form (a copy).
     [[nodiscard]] VertexKey key() const;
 
-    // --- dependency links (GRAPH structure: caller holds this vertex's SHARD
-    // lock, unique to mutate / shared to read) --------------------------------
+    // --- dependencies (GRAPH structure: caller holds this vertex's SHARD lock,
+    // or runs under the single-writer rule; see the LOCKING comment above) ----
     // The adjacency is a list of (edge uid, neighbour uid) pairs, one entry per
-    // EDGE: parallel edges are therefore representable, and an oriented read is a
-    // scan of one list. The neighbour guid lists below are a maintained
-    // PROJECTION of it (one guid per edge) — see README.md, epoch 4: a projection
-    // that is updated in place beats a rebuilt one on every traversal, measured.
+    // EDGE: parallel edges are representable, an oriented read is a scan of one
+    // list, and the neighbour guid is right there in the entry — the separate
+    // guid projections and Vertex* sets this class used to maintain alongside
+    // (plan v3 §5.2) were triple storage of the same fact: reads now derive the
+    // guid view from these lists (Graph::_read_oriented_adjacency et al).
     [[nodiscard]] kimix::vector<EdgeLink> const &out_links() const noexcept { return _out_links; }
     [[nodiscard]] kimix::vector<EdgeLink> const &in_links() const noexcept { return _in_links; }
 
-    // --- dependencies (GRAPH structure: caller holds this vertex's SHARD lock,
+    // --- dependencies (GRAPH structure: caller holds this vertex's shard lock,
     // or runs under the single-writer rule; see the LOCKING comment above) ----
     // Epoch-2 sizing hook: reserve room for `outgoing` + `incoming` edges in the
-    // four containers those edges live in. A bulk builder (the loader's link
+    // two containers those edges live in. A bulk builder (the loader's link
     // pass, Graph::connect's caller) knows its vertex's final degree up front, so
     // reserving once removes the per-edge growth reallocation - and the 16-slot
-    // minimum `kimix::unordered_set`, `kimix::HashMap` and `kimix::vector`
-    // each start with. Never shrinks: it only ever raises capacity, so calling it
-    // with a smaller count than the current capacity is a no-op, and it never
-    // touches the elements. Same locking rule as the accessors above: graph
-    // structure, so caller holds this vertex's SHARD lock (unique).
+    // minimum `kimix::vector` starts with. Never shrinks: it only ever raises
+    // capacity, so calling it with a smaller count than the current capacity is
+    // a no-op, and it never touches the elements. Same locking rule as the
+    // accessors above: graph structure, so caller holds this vertex's SHARD
+    // lock (unique).
     void reserve_links(size_t outgoing, size_t incoming);
-    // GUIDs this vertex depends on (outgoing edges), serialized form.
-    [[nodiscard]] kimix::vector<kimix::Guid> const &depending_guids() const noexcept {
-        return _depending_guids;
-    }
-    // GUIDs of the vertices that depend on this one (reverse edges).
-    [[nodiscard]] kimix::vector<kimix::Guid> const &depended_guids() const noexcept {
-        return _depended_guids;
-    }
-    [[nodiscard]] size_t depending_count() const noexcept { return _depending_guids.size(); }
-    [[nodiscard]] size_t depended_count() const noexcept { return _depended_guids.size(); }
+    // Outgoing-edge count (one per edge, parallel edges counted individually).
+    [[nodiscard]] size_t depending_count() const noexcept { return _out_links.size(); }
+    // Incoming-edge count (one per edge, parallel edges counted individually).
+    [[nodiscard]] size_t depended_count() const noexcept { return _in_links.size(); }
     [[nodiscard]] bool depends_on(kimix::Guid const &guid) const noexcept;
-    // Resolved in-memory edges, as copies (the pointer sets themselves stay
-    // private so only a Graph can grow or shrink them).
-    [[nodiscard]] kimix::vector<Vertex *> depending() const;
-    [[nodiscard]] kimix::vector<Vertex *> depended() const;
 
     // --- locking (exposed for callers that already own a Vertex*, e.g. the
     // serializer, which wants a long-lived content snapshot) -----------------
@@ -303,18 +312,17 @@ private:
     void _clear_links() noexcept;
 
     kimix::Guid _guid;
-    kimix::MD5 _content_hash;             // guarded by _mutex
-    kimix::vector<std::byte> _content;    // guarded by _mutex
+      kimix::MD5 _content_hash; // guarded by _mutex
+      kimix::vector<std::byte> _content; // guarded by _mutex
+      // Which digest _content_hash uses (GraphOptions::content_digest at
+      // materialization time; immutable afterwards).
+      ContentDigest _content_digest{ContentDigest::md5};
     kimix::vector<EdgeLink> _out_links;   // graph lock (shard unique/shared)
     kimix::vector<EdgeLink> _in_links;    // graph lock
-    kimix::vector<kimix::Guid> _depending_guids; // graph lock (projection of _out_links)
-    kimix::vector<kimix::Guid> _depended_guids;  // graph lock (projection of _in_links)
     PropertyBag _properties;              // guarded by _mutex
     kimix::vector<LabelId> _labels;       // guarded by _mutex
     LabelId _key_label{kNoLabel};         // immutable after construction
     ExternalId _external_id;              // immutable after construction
-    kimix::unordered_set<Vertex *> _depending;   // graph lock + vertex locks
-    kimix::unordered_set<Vertex *> _depended;    // graph lock + vertex locks
 
     // Dedicated cache line: the lock bitfield and the dirty flag live alone so
     // neighbouring vertices never invalidate each other's line (see the class

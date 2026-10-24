@@ -99,7 +99,12 @@ int main(int argc, char *argv[]) {
         expect(eq(graph.size(), size_t{6}));
 
         // b sits between a (a -> b) and d (b -> d): removing it must clean up
-        // both neighbours, in both the pointer sets and the guid lists.
+
+
+        // both neighbours' link lists (the single adjacency representation,
+
+
+        // plan v3 §5.2).
         kimix::Guid b_guid = dag.b->guid();
         auto removed = graph.remove_vertex(b_guid);
         expect(removed != nullptr);
@@ -107,29 +112,31 @@ int main(int argc, char *argv[]) {
 
         expect(eq(dag.a->depending_count(), size_t{1}))
             << "a keeps only its edge to c";
-        for (auto const &other : dag.a->depending()) {
-            expect(other != removed.get()) << "no stale Vertex* may survive";
-        }
-        expect(!dag.a->depends_on(b_guid)) << "a's guid list drops b";
-        for (auto const &guid : dag.a->depending_guids()) {
-            expect(guid != b_guid);
+        expect(!dag.a->depends_on(b_guid)) << "a's link list drops b";
+
+        for (auto const &link : dag.a->out_links()) {
+
+        expect(link.neighbour != b_guid) << "no stale edge to b may survive";
+
         }
 
         expect(eq(dag.d->depended_count(), size_t{2}))
             << "d keeps c and f as dependents";
         expect(!dag.d->depends_on(b_guid))
             << "d never depended on b, so its own outgoing list is unaffected";
-        for (auto const &guid : dag.d->depended_guids()) {
-            expect(guid != b_guid);
-        }
-        for (auto *other : dag.d->depended()) {
-            expect(other != removed.get());
+        for (auto const &link : dag.d->in_links()) {
+
+        expect(link.neighbour != b_guid) << "no stale edge from b may survive";
+
         }
 
-        // The neighbours' guid lists and pointer sets agree in size — the
-        // invariant the serializer relies on.
-        expect(eq(dag.a->depending_count(), dag.a->depending().size()));
-        expect(eq(dag.d->depended_count(), dag.d->depended().size()));
+        
+
+        // The count accessors and the link lists are one view now (§5.2).
+
+        expect(eq(dag.a->depending_count(), dag.a->out_links().size()));
+
+        expect(eq(dag.d->depended_count(), dag.d->in_links().size()));
 
         // Traversals see the new shape: a no longer reaches d through b (its
         // only remaining edge is a -> c -> d, which still reaches it), so use
@@ -147,10 +154,13 @@ int main(int argc, char *argv[]) {
         expect(eq(from->depending_count(), size_t{1}));
         expect(eq(to->depended_count(), size_t{1}));
         expect(from->depends_on(to->guid()));
-        expect(eq(from->depending().size(), size_t{1}));
-        expect(eq(to->depended().size(), size_t{1}));
-        expect(from->depending().front() == to);
-        expect(to->depended().front() == from);
+        expect(eq(from->out_links().size(), size_t{1}));
+
+        expect(eq(to->in_links().size(), size_t{1}));
+
+        expect(from->out_links().front().neighbour == to->guid());
+
+        expect(to->in_links().front().neighbour == from->guid());
 
         expect(!graph.connect(from->guid(), to->guid()))
             << "a duplicate edge is rejected";
@@ -175,9 +185,9 @@ int main(int argc, char *argv[]) {
 
         expect(graph.disconnect(from->guid(), to->guid()));
         expect(eq(from->depending_count(), size_t{0}));
-        expect(eq(to->depended_count(), size_t{0}));
-        expect(from->depending().empty());
-        expect(to->depended().empty());
+        expect(eq(to->depended_count(), size_t{0}));expect(from->out_links().empty());
+
+        expect(to->in_links().empty());
         expect(!graph.disconnect(from->guid(), to->guid()))
             << "a second disconnect is a no-op";
     };

@@ -124,7 +124,21 @@ KIMIX_FFI void kimix_graphdb_close(KIMIX_TRANSFER kimix_gdb_session *session);
 /* The honest capability advertisement of this backend into `out`.
  * KIMIX_GDB_ERR_ARGUMENT for a NULL `session` or `out`. */
 KIMIX_FFI int32_t kimix_graphdb_capabilities(KIMIX_IN kimix_gdb_session *session,
-                                             KIMIX_OUT kimix_gdb_capability *out);
+ KIMIX_OUT kimix_gdb_capability *out);
+
+/* The named-graph catalog (ABI 5+): the process-wide registry of the LIVE
+ * named graphs.  A second live open of one name is KIMIX_GDB_ERR_NAME_EXISTS;
+ * close releases the entry.  Anonymous opens never touch it. */
+KIMIX_FFI int32_t kimix_graphdb_catalog_contains(KIMIX_IN const char *name,
+ KIMIX_IN size_t name_len,
+ KIMIX_OUT uint8_t *out_exists);
+KIMIX_FFI int32_t kimix_graphdb_catalog_count(KIMIX_OUT size_t *out_count);
+/* The session's graph name into a caller buffer ("" when anonymous);
+ * KIMIX_GDB_ERR_BUFFER with the required size when the buffer is too small. */
+KIMIX_FFI int32_t kimix_graphdb_session_graph_name(KIMIX_IN kimix_gdb_session *session,
+ KIMIX_OUT KIMIX_NULLABLE char *buffer,
+ KIMIX_IN size_t capacity,
+ KIMIX_OUT size_t *out_len);
 
 /* Save the store.  `full != 0` rewrites every record, 0 only the dirty ones.
  * KIMIX_GDB_ERR_NO_SUCH_FILE when the session has no store (in-memory). */
@@ -299,18 +313,21 @@ KIMIX_FFI int32_t kimix_graphdb_edge_property_types(KIMIX_IN kimix_gdb_session *
  * 6. Edges
  * ======================================================================== */
 
-/* Connect origin -> target (a vertex uid each, or KIMIX_GDB_ERR_VERTEX).
- * `labels` may be NULL/0; `properties` are read as property_count entries.
- * The edge uid lands in `*out_edge`. */
+/* Connect origin -> target (a vertex uid each, or KIMIX_GDB_ERR_VERTEX) WITH
+ * the initial payload in the same call: `labels` may be NULL/0 and
+ * `property_names[i]` names `properties[i]` (a property-type id; ABI 4 — the
+ * create-time degrade of dropping unnamed property values is gone).  The edge
+ * uid lands in `*out_edge`. */
 KIMIX_FFI int32_t kimix_graphdb_edge_create(KIMIX_IN_OUT kimix_gdb_session *session,
-                                            KIMIX_IN kimix_gdb_guid origin,
-                                            KIMIX_IN kimix_gdb_guid target,
-                                            KIMIX_IN uint8_t direction,
-                                            KIMIX_IN KIMIX_NULLABLE const uint32_t *labels,
-                                            KIMIX_IN size_t label_count,
-                                            KIMIX_IN KIMIX_NULLABLE const kimix_gdb_property *properties,
-                                            KIMIX_IN size_t property_count,
-                                            KIMIX_OUT kimix_gdb_guid *out_edge);
+ KIMIX_IN kimix_gdb_guid origin,
+ KIMIX_IN kimix_gdb_guid target,
+ KIMIX_IN uint8_t direction,
+ KIMIX_IN KIMIX_NULLABLE const uint32_t *labels,
+ KIMIX_IN size_t label_count,
+ KIMIX_IN KIMIX_NULLABLE const uint32_t *property_names,
+ KIMIX_IN KIMIX_NULLABLE const kimix_gdb_property *properties,
+ KIMIX_IN size_t property_count,
+ KIMIX_OUT kimix_gdb_guid *out_edge);
 
 /* Remove the edge.  Unknown uid: KIMIX_GDB_ERR_EDGE. */
 KIMIX_FFI int32_t kimix_graphdb_edge_free(KIMIX_IN_OUT kimix_gdb_session *session,
@@ -377,12 +394,71 @@ KIMIX_FFI int32_t kimix_graphdb_count_neighbors(KIMIX_IN kimix_gdb_session *sess
 KIMIX_FFI int32_t kimix_graphdb_exists_neighbor(KIMIX_IN kimix_gdb_session *session,
                                                 KIMIX_IN kimix_gdb_guid vertex,
                                                 KIMIX_IN uint32_t constraint,
-                                                KIMIX_IN uint8_t orientation,
-                                                KIMIX_OUT uint8_t *out_exists);
+                                                  KIMIX_IN uint8_t orientation,
+                                                  KIMIX_OUT uint8_t *out_exists);
+
+  /* ===========================================================================
+   * 7b. Native multi-hop traversal (the G3 capability — ABI 2)
+   * ======================================================================== */
+
+  /* ONE call for the whole level-by-level BFS the engine would otherwise
+   * compose from per-hop neighbour reads.  `constraint` filters every
+   * discovered vertex (GDI section 5.10); `cap_per_level` bounds each level
+   * (>= 1); `max_depth` is 1..KIMIX_GDB_MAX_HOP_DEPTH.  Two-phase like the
+   * reads: items == NULL reports *out_count, then caller-owned storage of
+   * *out_count records (items[0] is the start at depth 0).  ERR_BUFFER when
+   * capacity < *out_count (the count is still reported). */
+  KIMIX_FFI int32_t kimix_graphdb_traverse_bfs(KIMIX_IN kimix_gdb_session *session,
+                                               KIMIX_IN kimix_gdb_guid start,
+                                               KIMIX_IN uint32_t constraint,
+                                               KIMIX_IN uint8_t orientation,
+                                               KIMIX_IN int64_t cap_per_level,
+                                               KIMIX_IN uint32_t max_depth,
+                                               KIMIX_OUT KIMIX_NULLABLE kimix_gdb_traversal_vertex *items,
+                                               KIMIX_IN size_t capacity,
+                                               KIMIX_OUT size_t *out_count);
+
+  /* Bounded shortest path along outgoing edges, endpoints included, in one
+   * native call.  Two-phase like traverse_bfs.  OK with *out_count == 0 is
+   * "unreachable within max_depth" (not an error); an unknown endpoint is
+   * KIMIX_GDB_ERR_VERTEX; a bound outside 1..KIMIX_GDB_MAX_HOP_DEPTH is
+   * KIMIX_GDB_ERR_ARGUMENT. */
+KIMIX_FFI int32_t kimix_graphdb_shortest_path(KIMIX_IN kimix_gdb_session *session,
+KIMIX_IN kimix_gdb_guid from,
+KIMIX_IN kimix_gdb_guid to,
+KIMIX_IN uint32_t max_depth,
+KIMIX_OUT KIMIX_NULLABLE kimix_gdb_guid *items,
+KIMIX_IN size_t capacity,
+KIMIX_OUT size_t *out_count);
+
+/* Global scan (the G1 capability): ONE native pass over EVERY vertex matching
+* `constraint` (0 = none), in the deterministic shard-then-map order.
+* Two-phase like the reads: items == NULL reports *out_count and *out_total,
+* then caller-owned storage of *out_count guids. */
+KIMIX_FFI int32_t kimix_graphdb_scan_vertices(KIMIX_IN kimix_gdb_session *session,
+KIMIX_IN uint32_t constraint,
+KIMIX_IN int64_t cap,
+KIMIX_OUT KIMIX_NULLABLE kimix_gdb_guid *items,
+KIMIX_IN size_t capacity,
+KIMIX_OUT size_t *out_count,
+KIMIX_OUT size_t *out_total);
+
+/* Global aggregate (the G4 capability): reduce `property` over every vertex
+* matching `constraint` (0 = none), in one blocking native call (a fiber per
+* shard when a scheduler is bound, inline otherwise). `function` is one of the
+* KIMIX_GDB_AGGREGATE_* values; a string payload lands in `scratch`
+* (KIMIX_GDB_ERR_BUFFER when it does not fit, *out still reported). */
+KIMIX_FFI int32_t kimix_graphdb_aggregate(KIMIX_IN kimix_gdb_session *session,
+KIMIX_IN uint32_t constraint,
+KIMIX_IN uint32_t property,
+KIMIX_IN int32_t function,
+KIMIX_OUT KIMIX_NULLABLE uint8_t *scratch,
+KIMIX_IN size_t scratch_capacity,
+KIMIX_OUT kimix_gdb_aggregate_result *out);
 
 /* ===========================================================================
- * 8. Transactions (one open transaction per session)
- * ======================================================================== */
+* 8. Transactions (one open transaction per session)
+* ======================================================================== */
 
 /* Begin / commit / abort the session's ONE transaction.  A second begin is
  * KIMIX_GDB_ERR_STATE; a commit or abort with none open is

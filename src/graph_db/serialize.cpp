@@ -317,16 +317,17 @@ GraphSerializeStats GraphSerializer::_write(Graph &graph, bool full) {
         edge_key(removed_edges[i], commands[count + edge_count + removed_vertices.size() + i].key);
         commands[count + edge_count + removed_vertices.size() + i].value.clear();
     }
-    kimix::vector<kimix::MD5> written_hashes(count);
+      kimix::vector<kimix::MD5> written_hashes(count);
+      ContentDigest const digest_policy = graph.options().content_digest;
 
-    // --- stage A: encode the vertices (fiber parallel) ----------------------
-    // Each job copies its vertex's payload under the vertex lock, asks the graph
-    // for the two degree hints under that vertex's shard shared lock, and encodes
-    // the record straight into its own command slot. The adjacency itself is
-    // NOT part of a vertex record any more: edges own their endpoints (see
-    // utils.h, VertexRecordV2).
-    parallel_over(count, [&graph, &dirty, &commands,
-                          &written_hashes](uint32_t id) noexcept {
+      // --- stage A: encode the vertices (fiber parallel) ----------------------
+      // Each job copies its vertex's payload under the vertex lock, asks the graph
+      // for the two degree hints under that vertex's shard shared lock, and encodes
+      // the record straight into its own command slot. The adjacency itself is
+      // NOT part of a vertex record any more: edges own their endpoints (see
+      // utils.h, VertexRecordV2).
+      parallel_over(count, [&graph, &dirty, &commands,
+                            &written_hashes, digest_policy](uint32_t id) noexcept {
         DirtyVertex const &item = dirty[id];
         Vertex *vertex = item.vertex; // never null: filtered above
         VertexRecordV2 record;
@@ -338,8 +339,12 @@ GraphSerializeStats GraphSerializer::_write(Graph &graph, bool full) {
         vertex->labels(labels);
         record.labels = std::move(labels);
         record.properties = vertex->property_list();
-        vertex->content(record.content); // vertex SHARED lock, copies the blob
-        record.content_hash = md5_of(record.content);
+      vertex->content(record.content); // vertex SHARED lock, copies the blob
+      // The record carries the GRAPH's digest policy (plan v3 §4.5): under
+      // XXH3 the stored hash must equal the vertex's cached hash or the
+      // post-write clear-dirty comparison would never match and every
+      // incremental save would rewrite the vertex forever.
+      record.content_hash = content_digest_of(record.content, digest_policy);
         // The adjacency projection: one guid per incident edge, read through the
         // graph's shard-locked accessors (a vertex record describes its own
         // adjacency, the edge records are the authority — see utils.h).
@@ -649,15 +654,17 @@ GraphSerializeStats GraphDeserializer::load(ColdStorage &cold, Graph &graph,
     // vertex's existence cannot depend on any other vertex, which is the
     // structural half of the dual-stage guarantee. The constructor recomputes the
     // content hash, so a store carrying a stale hash is repaired here.
-    parallel_over(slots.size(), [&slots](uint32_t id) noexcept {
-        LoadSlot &slot = slots[id];
-        if (!slot.valid) {
-            return;
-        }
-        slot.vertex = kimix::unique_ptr<Vertex>{
-            new Vertex(slot.guid,
-                       kimix::span<const std::byte>{slot.content.data(), slot.content.size()})};
-    });
+      ContentDigest const content_digest = graph.options().content_digest;
+      parallel_over(slots.size(), [&slots, content_digest](uint32_t id) noexcept {
+          LoadSlot &slot = slots[id];
+          if (!slot.valid) {
+              return;
+          }
+          slot.vertex = kimix::unique_ptr<Vertex>{
+              new Vertex(slot.guid,
+                         kimix::span<const std::byte>{slot.content.data(), slot.content.size()},
+                         content_digest)};
+      });
 
     // --- insert (single thread: adoption is a structural write) -------------
     kimix::vector<LoadSlot *> placed_slots;

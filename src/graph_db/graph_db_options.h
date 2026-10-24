@@ -47,21 +47,32 @@
 
 namespace kimix::graph_db {
 
-// What a duplicate (label, external_id) key does.
-enum class KeyMode : uint8_t {
-    // Refuse the create: error_non_unique_id (GDI's EnforcesUniqueExternalIds).
-    enforce_unique = 0,
-    // Return the EXISTING vertex's uid plus warning_non_unique_id (GDI-RMA's
-    // under-enforced uniqueness, surfaced as a warning).
-    report_warning = 1,
-};
-
-struct KIMIX_GRAPH_DB_API GraphOptions {
-    bool auto_create_schema{true};
-    KeyMode key_mode{KeyMode::enforce_unique};
-    bool allow_parallel_edges{true};
-    bool allow_self_edges{true};
-    // 64 MiB of undo journal per transaction (see max_journal_bytes).
+  // What a duplicate (label, external_id) key does.
+  enum class KeyMode : uint8_t {
+      // Refuse the create: error_non_unique_id (GDI's EnforcesUniqueExternalIds).
+      enforce_unique = 0,
+      // Return the EXISTING vertex's uid plus warning_non_unique_id (GDI-RMA's
+      // under-enforced uniqueness, surfaced as a warning).
+      report_warning = 1,
+  };
+  // Which digest caches a vertex's content (plan v3 §4.5). Both produce a
+  // 128-bit value stored in the same 16-byte record field, so the on-disk
+  // format is identical — the choice only changes the VALUES. Cross-policy
+  // use is benign: the loader recomputes the cached hash at materialization,
+  // loaded vertices stay clean, and a dirty vertex is saved under the
+  // graph's own policy, so the post-write clear-dirty comparison keeps
+  // matching.
+  enum class ContentDigest : uint8_t {
+      md5 = 0,   // the historical default (RFC 1321, ~3 block transforms any size)
+      xxh3 = 1,  // XXH3-128 (~20x faster on small blobs; non-cryptographic)
+  };
+  struct KIMIX_GRAPH_DB_API GraphOptions {
+      bool auto_create_schema{true};
+      KeyMode key_mode{KeyMode::enforce_unique};
+      bool allow_parallel_edges{true};
+      bool allow_self_edges{true};
+        ContentDigest content_digest{ContentDigest::md5};
+        // 64 MiB of undo journal per transaction (see max_journal_bytes).
     size_t max_journal_bytes{64ull * 1024ull * 1024ull};
     // ColdStorage::default_map_size (64 GiB); 0 means "keep the storage default".
     size_t cold_map_size{0};

@@ -145,12 +145,12 @@ public:
     [[nodiscard]] PropertyKind kind() const noexcept { return _kind; }
     [[nodiscard]] bool is_none() const noexcept { return _kind == PropertyKind::none; }
 
-    [[nodiscard]] int64_t as_int64() const noexcept {
-        return _kind == PropertyKind::int64_value ? _integer : 0;
-    }
-    [[nodiscard]] double as_double() const noexcept {
-        return _kind == PropertyKind::double_value ? _double : 0.0;
-    }
+  [[nodiscard]] int64_t as_int64() const noexcept {
+      return _kind == PropertyKind::int64_value ? _payload.integer : 0;
+  }
+  [[nodiscard]] double as_double() const noexcept {
+      return _kind == PropertyKind::double_value ? _payload.real : 0.0;
+  }
     // UTF-8 text of a string value (empty for any other kind). Valid until this
     // value is modified or destroyed.
     [[nodiscard]] kimix::string_view as_string() const noexcept;
@@ -162,7 +162,14 @@ public:
     [[nodiscard]] size_t element_count() const noexcept;
 
     // Value equality — the C# reference's Equals, including the array kinds.
-    [[nodiscard]] bool equals(PropertyValue const &other) const noexcept;
+    [[nodiscard]] bool equals(PropertyValue const &other) const noexcept;    // Rule of five (plan v3 §5.4): the value owns its variable-size payload
+    // through the tagged union below, so copying and destruction manage the
+    // heap block explicitly.
+    PropertyValue(PropertyValue const &other);
+    PropertyValue &operator=(PropertyValue const &other);
+    PropertyValue(PropertyValue &&other) noexcept;
+    PropertyValue &operator=(PropertyValue &&other) noexcept;
+    ~PropertyValue();
 
     // The GDI datatype this value's payload corresponds to (int64 -> Int64,
     // double_value -> Double, string -> Char, blob -> Byte,
@@ -173,19 +180,34 @@ public:
     // True when this value satisfies a PropertyTypeInfo's container/dtype/count
     // declaration.
     [[nodiscard]] bool matches_declaration(GdiContainerType container, GdiDataType data,
-                                           uint32_t count) const noexcept;
-
-    void clear() noexcept;
-
+                                           uint32_t count) const noexcept;    void clear() noexcept;
 private:
+    // Frees any owned payload block and resets to `none`.
+    void _release() noexcept;
+    // Deep-copies `other`'s payload into this (already released) value.
+    void _clone_from(PropertyValue const &other);    // PLAN V3 §5.4: the payload is ONE tagged union (24 B total) instead of
+    // three kimix::vectors (~96 B, nearly all of it dead weight for the scalar
+    // kinds that dominate real bags). The variable-size kinds own a single
+    // heap block; `count` is in ELEMENTS, not bytes.
     PropertyKind _kind{PropertyKind::none};
-    int64_t _integer{0};
-    double _double{0.0};
-    // A string's UTF-8 bytes and a blob share the same storage; `_kind` decides
-    // which reading of it is meant.
-    kimix::vector<std::byte> _bytes;
-    kimix::vector<int64_t> _int64_array;
-    kimix::vector<double> _double_array;
+    union Payload {
+        int64_t integer;
+        double real;
+        struct {
+            std::byte *data;
+            size_t count;
+        } bytes; // string (UTF-8, no NUL) or blob; `_kind` disambiguates
+        struct {
+            int64_t *data;
+            size_t count;
+        } int64s;
+        struct {
+            double *data;
+            size_t count;
+        } doubles;
+        Payload() noexcept : integer(0) {}
+        ~Payload() {}
+    } _payload;
 };
 
 // Result of compare_values(): negative / zero / positive ordering.

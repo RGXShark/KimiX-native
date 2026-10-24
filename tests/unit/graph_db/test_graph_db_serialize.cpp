@@ -225,9 +225,92 @@ int main(int argc, char *argv[]) {
         expect(eq(noop.bytes_written, size_t{0}));
     };
 
-    "serialize_incremental_writes_only_dirty_records"_test = [] {
-        gtest::temp_dir_guard dir;
-        expect(dir.ok());
+      "serialize_content_digest_policy_round_trip"_test = [] {
+          // Plan v3 §4.5: the content digest is selectable (MD5 default, XXH3-128
+          // behind GraphOptions::content_digest). Both fill the same 16-byte
+          // record field, so the on-disk format is unchanged: a store written
+          // under one policy reads cleanly under the other (the loader
+          // RECOMPUTES the cached hash at materialization), and the record the
+          // save writes carries the graph's own policy so the post-write
+          // clear-dirty comparison keeps matching.
+          using graph_db::ContentDigest;
+          using graph_db::Database;
+          using graph_db::GdiStatus;
+          using graph_db::GraphOptions;
+          using graph_db::LabelId;
+          using graph_db::VertexCreateResult;
+          // The helper: same bytes, two policies, different non-zero digests,
+          // and the md5 policy reproduces kimix::MD5 exactly.
+          auto const sample = gtest::to_bytes("the quick brown fox jumps over");
+          kimix::span<const std::byte> const sample_span{sample.data(), sample.size()};
+          kimix::MD5 const as_md5 = graph_db::content_digest_of(sample_span, ContentDigest::md5);
+          kimix::MD5 const as_xxh3 = graph_db::content_digest_of(sample_span, ContentDigest::xxh3);
+          expect(as_md5 == kimix::MD5{kimix::string_view{"the quick brown fox jumps over"}});
+          expect(!(as_md5 == as_xxh3))
+              << "the two policies produce different digests";
+          expect(!(as_xxh3 == kimix::MD5{}))
+              << "XXH3 of non-empty content is not the zero digest";
+
+          // One store, built under XXH3, read back under both policies.
+          gtest::temp_dir_guard dir;
+          expect(dir.ok()) << "a temp directory must be creatable";
+          if (!dir.ok()) {
+              return;
+          }
+          LabelId node{};
+          kimix::Guid uid;
+          {
+              Database db;
+              GraphOptions options;
+              options.content_digest = ContentDigest::xxh3;
+              expect(eq(db.open(dir.path(), options), GdiStatus::ok));
+              expect(eq(db.schema().create_label("node", node), GdiStatus::ok));
+              VertexCreateResult created;
+              auto const key = gtest::to_bytes("digest-policy");
+              expect(eq(db.create_vertex(graph_db::VertexKeyView{
+                            node, kimix::span<const std::byte>{key.data(), key.size()}},
+                                       {}, nullptr, created),
+                        GdiStatus::ok));
+              uid = created.uid;
+              expect(db.graph().update_content(uid, sample_span));
+              expect(db.persist(/*full=*/true, nullptr) == GdiStatus::ok);
+          }
+          auto const read_back = [&](ContentDigest policy, kimix::MD5 &hash_out) {
+              Database db;
+              GraphOptions options;
+              options.content_digest = policy;
+              expect(eq(db.open(dir.path(), options), GdiStatus::ok));
+              Vertex *vertex = db.graph().find(uid);
+              expect(vertex != nullptr);
+              kimix::vector<std::byte> content;
+              vertex->content(content);
+              expect(eq(content.size(), sample.size()));
+              expect(std::equal(content.begin(), content.end(), sample.begin()))
+                  << "content is byte-identical regardless of the digest policy";
+              hash_out = vertex->content_hash();
+              // The record the save wrote must carry the graph's own policy.
+              GraphSerializeStats stats;
+              expect(eq(db.persist(/*full=*/false, &stats), GdiStatus::ok));
+              return stats;
+          };
+          kimix::MD5 xxh3_hash;
+          GraphSerializeStats const under_xxh3 = read_back(ContentDigest::xxh3, xxh3_hash);
+          expect(under_xxh3.saved_count == size_t{0})
+              << "a clean xxh3 reopen writes nothing incrementally";
+          expect(xxh3_hash == as_xxh3)
+              << "the xxh3 cache matches the xxh3 digest of the content";
+          kimix::MD5 md5_hash;
+          GraphSerializeStats const under_md5 = read_back(ContentDigest::md5, md5_hash);
+          expect(under_md5.saved_count == size_t{0})
+              << "a clean md5 reopen also writes nothing (the loader recomputed the hash)";
+          expect(md5_hash == as_md5)
+              << "the md5-reopened vertex carries the recomputed md5 digest";
+          expect(!(md5_hash == xxh3_hash));
+      };
+
+      "serialize_incremental_writes_only_dirty_records"_test = [] {
+          gtest::temp_dir_guard dir;
+          expect(dir.ok());
         if (!dir.ok()) {
             return;
         }

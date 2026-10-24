@@ -8,6 +8,8 @@
 #include "binary_le.h"
 #include "property.h"
 
+#include <core/stl/memory.h> // kimix::allocator (owned payload blocks)
+
 #include <algorithm>
 #include <cstring>
 #include <utility>
@@ -117,53 +119,184 @@ char const *property_kind_name(PropertyKind kind) noexcept {
 PropertyValue PropertyValue::make_int64(int64_t value) noexcept {
     PropertyValue out;
     out._kind = PropertyKind::int64_value;
-    out._integer = value;
+    out._payload.integer = value;
     return out;
 }
 
+PropertyValue::PropertyValue(PropertyValue const &other) {
+    _clone_from(other);
+}
+
+PropertyValue &PropertyValue::operator=(PropertyValue const &other) {
+    if (this != &other) {
+        _release();
+        _clone_from(other);
+    }
+    return *this;
+}
+
+PropertyValue::PropertyValue(PropertyValue &&other) noexcept
+    : _kind(other._kind), _payload(other._payload) {
+    other._kind = PropertyKind::none;
+    other._payload.integer = 0;
+}
+
+PropertyValue &PropertyValue::operator=(PropertyValue &&other) noexcept {
+    if (this != &other) {
+        _release();
+        _kind = other._kind;
+        _payload = other._payload;
+        other._kind = PropertyKind::none;
+        other._payload.integer = 0;
+    }
+    return *this;
+}
+
+PropertyValue::~PropertyValue() {
+    _release();
+}
+
+void PropertyValue::_release() noexcept {
+    switch (_kind) {
+    case PropertyKind::string:
+    case PropertyKind::blob:
+        if (_payload.bytes.data != nullptr) {
+            kimix::allocator<std::byte>{}.deallocate(_payload.bytes.data,
+                                                     _payload.bytes.count);
+        }
+        break;
+    case PropertyKind::int64_array:
+        if (_payload.int64s.data != nullptr) {
+            kimix::allocator<int64_t>{}.deallocate(_payload.int64s.data,
+                                                   _payload.int64s.count);
+        }
+        break;
+    case PropertyKind::double_array:
+        if (_payload.doubles.data != nullptr) {
+            kimix::allocator<double>{}.deallocate(_payload.doubles.data,
+                                                  _payload.doubles.count);
+        }
+        break;
+    default:
+        break;
+    }
+    _kind = PropertyKind::none;
+    _payload.integer = 0;
+}
+
+void PropertyValue::_clone_from(PropertyValue const &other) {
+    _kind = other._kind;
+    switch (_kind) {
+    case PropertyKind::int64_value:
+        _payload.integer = other._payload.integer;
+        break;
+    case PropertyKind::double_value:
+        _payload.real = other._payload.real;
+        break;
+    case PropertyKind::string:
+    case PropertyKind::blob: {
+        _payload.bytes.count = other._payload.bytes.count;
+        _payload.bytes.data = nullptr;
+        if (_payload.bytes.count != 0) {
+            kimix::allocator<std::byte> alloc{};
+            _payload.bytes.data = alloc.allocate(_payload.bytes.count);
+            std::memcpy(_payload.bytes.data, other._payload.bytes.data,
+                        _payload.bytes.count);
+        }
+        break;
+    }
+    case PropertyKind::int64_array: {
+        _payload.int64s.count = other._payload.int64s.count;
+        _payload.int64s.data = nullptr;
+        if (_payload.int64s.count != 0) {
+            kimix::allocator<int64_t> alloc{};
+            _payload.int64s.data = alloc.allocate(_payload.int64s.count);
+            std::copy(other._payload.int64s.data,
+                      other._payload.int64s.data + _payload.int64s.count,
+                      _payload.int64s.data);
+        }
+        break;
+    }
+    case PropertyKind::double_array: {
+        _payload.doubles.count = other._payload.doubles.count;
+        _payload.doubles.data = nullptr;
+        if (_payload.doubles.count != 0) {
+            kimix::allocator<double> alloc{};
+            _payload.doubles.data = alloc.allocate(_payload.doubles.count);
+            std::copy(other._payload.doubles.data,
+                      other._payload.doubles.data + _payload.doubles.count,
+                      _payload.doubles.data);
+        }
+        break;
+    }
+    default:
+        _payload.integer = 0;
+        break;
+    }
+}
+
 PropertyValue PropertyValue::make_double(double value) noexcept {
-    PropertyValue out;
-    out._kind = PropertyKind::double_value;
-    out._double = value;
-    return out;
+ PropertyValue out;
+ out._kind = PropertyKind::double_value;
+ out._payload.real = value;
+ return out;
 }
 
 PropertyValue PropertyValue::make_string(kimix::string_view value) {
     PropertyValue out;
     out._kind = PropertyKind::string;
     auto const bytes = bytes_of(value);
-    out._bytes.assign(bytes.begin(), bytes.end());
+    out._payload.bytes.count = bytes.size();
+    out._payload.bytes.data = nullptr;
+    if (!bytes.empty()) {
+        kimix::allocator<std::byte> alloc{};
+        out._payload.bytes.data = alloc.allocate(bytes.size());
+        std::memcpy(out._payload.bytes.data, bytes.data(), bytes.size());
+    }
     return out;
 }
 
 PropertyValue PropertyValue::make_blob(kimix::span<const std::byte> value) {
     PropertyValue out;
     out._kind = PropertyKind::blob;
-    out._bytes.assign(value.begin(), value.end());
+    out._payload.bytes.count = value.size();
+    out._payload.bytes.data = nullptr;
+    if (!value.empty()) {
+        kimix::allocator<std::byte> alloc{};
+        out._payload.bytes.data = alloc.allocate(value.size());
+        std::memcpy(out._payload.bytes.data, value.data(), value.size());
+    }
     return out;
 }
 
 PropertyValue PropertyValue::make_int64_array(kimix::span<const int64_t> value) {
     PropertyValue out;
     out._kind = PropertyKind::int64_array;
-    out._int64_array.assign(value.begin(), value.end());
+    out._payload.int64s.count = value.size();
+    out._payload.int64s.data = nullptr;
+    if (!value.empty()) {
+        kimix::allocator<int64_t> alloc{};
+        out._payload.int64s.data = alloc.allocate(value.size());
+        std::copy(value.begin(), value.end(), out._payload.int64s.data);
+    }
     return out;
 }
 
 PropertyValue PropertyValue::make_double_array(kimix::span<const double> value) {
     PropertyValue out;
     out._kind = PropertyKind::double_array;
-    out._double_array.assign(value.begin(), value.end());
+    out._payload.doubles.count = value.size();
+    out._payload.doubles.data = nullptr;
+    if (!value.empty()) {
+        kimix::allocator<double> alloc{};
+        out._payload.doubles.data = alloc.allocate(value.size());
+        std::copy(value.begin(), value.end(), out._payload.doubles.data);
+    }
     return out;
 }
 
 void PropertyValue::clear() noexcept {
-    _kind = PropertyKind::none;
-    _integer = 0;
-    _double = 0.0;
-    _bytes.clear();
-    _int64_array.clear();
-    _double_array.clear();
+    _release();
 }
 
 // ---------------------------------------------------------------------------
@@ -171,37 +304,40 @@ void PropertyValue::clear() noexcept {
 // ---------------------------------------------------------------------------
 
 kimix::string_view PropertyValue::as_string() const noexcept {
-    return _kind == PropertyKind::string ? text_of(_bytes) : kimix::string_view{};
+    if (_kind != PropertyKind::string) {
+        return {};
+    }
+    if (_payload.bytes.count == 0) {
+        return {};
+    }
+    return kimix::string_view{
+        reinterpret_cast<char const *>(_payload.bytes.data), _payload.bytes.count};
 }
 
 kimix::span<const std::byte> PropertyValue::as_blob() const noexcept {
-    if (_kind != PropertyKind::blob) {
+    if (_kind != PropertyKind::blob || _payload.bytes.count == 0) {
         return {};
     }
-    if (_bytes.empty()) {
-        return {};
-    }
-    return kimix::span<const std::byte>{_bytes.data(), _bytes.size()};
+    return kimix::span<const std::byte>{_payload.bytes.data, _payload.bytes.count};
 }
 
 kimix::span<const int64_t> PropertyValue::as_int64_array() const noexcept {
-    if (_kind != PropertyKind::int64_array || _int64_array.empty()) {
+    if (_kind != PropertyKind::int64_array || _payload.int64s.count == 0) {
         return {};
     }
-    return kimix::span<const int64_t>{_int64_array.data(), _int64_array.size()};
+    return kimix::span<const int64_t>{_payload.int64s.data, _payload.int64s.count};
 }
 
 kimix::span<const double> PropertyValue::as_double_array() const noexcept {
-    if (_kind != PropertyKind::double_array || _double_array.empty()) {
+    if (_kind != PropertyKind::double_array || _payload.doubles.count == 0) {
         return {};
     }
-    return kimix::span<const double>{_double_array.data(), _double_array.size()};
+    return kimix::span<const double>{_payload.doubles.data, _payload.doubles.count};
 }
 
-size_t PropertyValue::element_count() const noexcept {
-    switch (_kind) {
-    case PropertyKind::int64_array: return _int64_array.size();
-    case PropertyKind::double_array: return _double_array.size();
+size_t PropertyValue::element_count() const noexcept {    switch (_kind) {
+    case PropertyKind::int64_array: return _payload.int64s.count;
+    case PropertyKind::double_array: return _payload.doubles.count;
     case PropertyKind::none: return 0;
     default: return 0;
     }
@@ -210,15 +346,27 @@ size_t PropertyValue::element_count() const noexcept {
 bool PropertyValue::equals(PropertyValue const &other) const noexcept {
     if (_kind != other._kind) {
         return false;
-    }
-    switch (_kind) {
+    }    switch (_kind) {
     case PropertyKind::none: return true;
-    case PropertyKind::int64_value: return _integer == other._integer;
-    case PropertyKind::double_value: return _double == other._double;
+    case PropertyKind::int64_value: return _payload.integer == other._payload.integer;
+    case PropertyKind::double_value: return _payload.real == other._payload.real;
     case PropertyKind::string:
-    case PropertyKind::blob: return same_bytes(_bytes, other._bytes);
-    case PropertyKind::int64_array: return same_sequence(_int64_array, other._int64_array);
-    case PropertyKind::double_array: return same_sequence(_double_array, other._double_array);
+    case PropertyKind::blob:
+        return _payload.bytes.count == other._payload.bytes.count &&
+               (_payload.bytes.count == 0 ||
+                std::memcmp(_payload.bytes.data, other._payload.bytes.data,
+                            _payload.bytes.count) == 0);
+    case PropertyKind::int64_array:
+        return _payload.int64s.count == other._payload.int64s.count &&
+               (_payload.int64s.count == 0 ||
+                std::equal(_payload.int64s.data, _payload.int64s.data + _payload.int64s.count,
+                           other._payload.int64s.data));
+    case PropertyKind::double_array:
+        return _payload.doubles.count == other._payload.doubles.count &&
+               (_payload.doubles.count == 0 ||
+                std::equal(_payload.doubles.data,
+                           _payload.doubles.data + _payload.doubles.count,
+                           other._payload.doubles.data));
     }
     return false;
 }

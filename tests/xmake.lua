@@ -740,7 +740,28 @@ end)
 test_proj("test_graph_db_read", "unit/graph_db/test_graph_db_read.cpp", function()
     add_deps("kimix-graph-db")
 end)
-test_proj("test_graph_db_tx", "unit/graph_db/test_graph_db_tx.cpp", function()
+-- Native multi-hop traversal (plan v3 step 1.2): traverse_bfs / bounded
+-- shortest_path vs a brute-force reference, cap/depth/orientation matrix,
+-- §5.10 filter gating, determinism, 4-reader/1-writer stress.
+  test_proj("test_graph_db_traverse", "unit/graph_db/test_graph_db_traverse.cpp", function()
+        add_deps("kimix-graph-db")
+    end)
+  -- GDI alignment (src/graph_db/reports/gdi_alignment.md): one suite per phase.
+  -- test_graph_db_scan.cpp covers the G1 global scan: Graph::for_each_vertex
+  -- (shard-ascending iterator, early stop) and Database::scan_vertices over
+  -- the paging matrix, the constraint matrix, handle equivalence,
+  -- determinism and the empty graph.
+  test_proj("test_graph_db_scan", "unit/graph_db/test_graph_db_scan.cpp", function()
+      add_deps("kimix-graph-db")
+  end)
+  test_proj("test_graph_db_tx", "unit/graph_db/test_graph_db_tx.cpp", function()
+    add_deps("kimix-graph-db")
+end)
+-- Phase-5 memory budget (plan v3 step 5.1): sizeof probes pin the hot
+-- structs and a scaled 10k/60k store asserts the per-entity RSS ceilings,
+-- so the 425 -> 300 MB peak-working-set target has a per-PR guard between
+-- full graphbench gate runs (step 5.6).
+test_proj("test_graph_db_memory", "unit/graph_db/test_graph_db_memory.cpp", function()
     add_deps("kimix-graph-db")
 end)
 test_proj("test_graph_db_bulk", "unit/graph_db/test_graph_db_bulk.cpp", function()

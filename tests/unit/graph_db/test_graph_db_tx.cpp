@@ -56,6 +56,8 @@ using graph_db::LabelId;
 using graph_db::NamedPropertyList;
 using graph_db::PropNameId;
 using graph_db::PropertyTypeInfo;
+using graph_db::PropertyEntry;
+using graph_db::PropertyList;
 using graph_db::PropertyValue;
 using graph_db::Transaction;
 using graph_db::VertexCreateResult;
@@ -444,10 +446,33 @@ int main(int argc, char *argv[]) {
         expect(eq(incoming.size(), size_t{1}));
     };
 
-    "tx_commit_marks_dirty_for_the_next_save"_test = [] {
-        gtest::temp_dir_guard dir;
-        expect(dir.ok());
-        if (!dir.ok()) {
+      // Create-time edge properties (plan v3 step 3.2): an edge created WITH
+      // its payload inside a transaction aborts to exactly the prior state —
+      // the fingerprint covers the edge's endpoints, direction, labels and
+      // properties, so equality proves the payload rolled back with the edge.
+      "tx_abort_restores_create_with_properties"_test = [] {
+          fixture f(6);
+          fingerprint const before = take_fingerprint(f.db);
+          expect(eq(f.db.begin_transaction(), GdiStatus::ok));
+          LabelId const labels[]{f.link};
+          PropertyList payload;
+          payload.push_back(PropertyEntry{f.age, PropertyValue::make_int64(42)});
+          Guid edge;
+          expect(eq(f.db.edge_create(f.vertices[0], f.vertices[3],
+                                     EdgeDirectionType::directed,
+                                     kimix::span<const LabelId>{labels, 1}, &payload, edge),
+                    GdiStatus::ok));
+          expect(!(take_fingerprint(f.db) == before));
+          expect(eq(f.db.abort(), GdiStatus::ok));
+          expect(take_fingerprint(f.db) == before)
+              << "abort restored the edge set WITH the create-time payload";
+          expect(eq(f.db.graph().key_index().size(), before.key_count));
+      };
+
+      "tx_commit_marks_dirty_for_the_next_save"_test = [] {
+          gtest::temp_dir_guard dir;
+          expect(dir.ok());
+          if (!dir.ok()) {
             return;
         }
         Database db;

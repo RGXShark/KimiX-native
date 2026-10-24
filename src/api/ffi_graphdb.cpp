@@ -53,7 +53,19 @@ void kimix_graphdb_close(kimix_gdb_session *session) {
 }
 
 int32_t kimix_graphdb_capabilities(kimix_gdb_session *session, kimix_gdb_capability *out) {
-    return kimix_gdb_capabilities(session, out);
+ return kimix_gdb_capabilities(session, out);
+}
+
+int32_t kimix_graphdb_catalog_contains(const char *name, size_t name_len, uint8_t *out_exists) {
+ return kimix_gdb_catalog_contains(name, name_len, out_exists);
+}
+
+int32_t kimix_graphdb_catalog_count(size_t *out_count) {
+ return kimix_gdb_catalog_count(out_count);
+}
+
+int32_t kimix_graphdb_session_graph_name(kimix_gdb_session *session, char *buffer, size_t capacity, size_t *out_len) {
+ return kimix_gdb_session_graph_name(session, buffer, capacity, out_len);
 }
 
 int32_t kimix_graphdb_persist(kimix_gdb_session *session, uint8_t full) {
@@ -172,8 +184,8 @@ int32_t kimix_graphdb_edge_property_types(kimix_gdb_session *session, kimix_gdb_
 // 6. Edges
 // ===========================================================================
 
-int32_t kimix_graphdb_edge_create(kimix_gdb_session *session, kimix_gdb_guid origin, kimix_gdb_guid target, uint8_t direction, const uint32_t *labels, size_t label_count, const kimix_gdb_property *properties, size_t property_count, kimix_gdb_guid *out_edge) {
-    return kimix_gdb_edge_create(session, origin, target, direction, labels, label_count, properties, property_count, out_edge);
+int32_t kimix_graphdb_edge_create(kimix_gdb_session *session, kimix_gdb_guid origin, kimix_gdb_guid target, uint8_t direction, const uint32_t *labels, size_t label_count, const uint32_t *property_names, const kimix_gdb_property *properties, size_t property_count, kimix_gdb_guid *out_edge) {
+ return kimix_gdb_edge_create(session, origin, target, direction, labels, label_count, property_names, properties, property_count, out_edge);
 }
 
 int32_t kimix_graphdb_edge_free(kimix_gdb_session *session, kimix_gdb_guid edge) {
@@ -213,7 +225,23 @@ int32_t kimix_graphdb_count_neighbors(kimix_gdb_session *session, kimix_gdb_guid
 }
 
 int32_t kimix_graphdb_exists_neighbor(kimix_gdb_session *session, kimix_gdb_guid vertex, uint32_t constraint, uint8_t orientation, uint8_t *out_exists) {
-    return kimix_gdb_exists_neighbor(session, vertex, constraint, orientation, out_exists);
+ return kimix_gdb_exists_neighbor(session, vertex, constraint, orientation, out_exists);
+}
+
+int32_t kimix_graphdb_traverse_bfs(kimix_gdb_session *session, kimix_gdb_guid start, uint32_t constraint, uint8_t orientation, int64_t cap_per_level, uint32_t max_depth, kimix_gdb_traversal_vertex *items, size_t capacity, size_t *out_count) {
+ return kimix_gdb_traverse_bfs(session, start, constraint, orientation, cap_per_level, max_depth, items, capacity, out_count);
+}
+
+int32_t kimix_graphdb_shortest_path(kimix_gdb_session *session, kimix_gdb_guid from, kimix_gdb_guid to, uint32_t max_depth, kimix_gdb_guid *items, size_t capacity, size_t *out_count) {
+ return kimix_gdb_shortest_path(session, from, to, max_depth, items, capacity, out_count);
+}
+
+int32_t kimix_graphdb_scan_vertices(kimix_gdb_session *session, uint32_t constraint, int64_t cap, kimix_gdb_guid *items, size_t capacity, size_t *out_count, size_t *out_total) {
+ return kimix_gdb_scan_vertices(session, constraint, cap, items, capacity, out_count, out_total);
+}
+
+int32_t kimix_graphdb_aggregate(kimix_gdb_session *session, uint32_t constraint, uint32_t property, int32_t function, uint8_t *scratch, size_t scratch_capacity, kimix_gdb_aggregate_result *out) {
+ return kimix_gdb_aggregate(session, constraint, property, function, scratch, scratch_capacity, out);
 }
 
 // ===========================================================================

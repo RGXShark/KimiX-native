@@ -28,6 +28,7 @@
 #include "transaction.h"
 
 #include <core/clock.h>
+#include <core/fiber.h>
 #include <core/stl/filesystem.h>
 
 #include <algorithm>
@@ -37,10 +38,6 @@ namespace kimix::graph_db {
 
 namespace {
 
-// GDI's count/size limit for one page: nothing enforces a maximum, but a caller
-// that asks for a negative cap is rejected (the reference backend raises
-// ErrorArgument), and an absurd cap is simply a request for everything.
-constexpr int64_t kUnlimitedCap = 0x7fffffff;
 
 [[nodiscard]] bool is_blank_name(kimix::string_view text) noexcept {
     for (char c : text) {
@@ -247,8 +244,9 @@ bool Database::_journal_vertex_payload(kimix::Guid const &uid) {
     JournalEntry entry;
     entry.kind = JournalEntry::Kind::vertex_payload;
     entry.uid = uid;
-    vertex->labels(entry.labels);
-    entry.properties = vertex->property_list();
+    entry.fat.reset(new JournalEntry::Fat);
+    vertex->labels(entry.fat->labels);
+    entry.fat->properties = vertex->property_list();
     return _tx->push(std::move(entry));
 }
 
@@ -263,11 +261,12 @@ bool Database::_journal_edge_state(kimix::Guid const &edge) {
     JournalEntry entry;
     entry.kind = JournalEntry::Kind::edge_state;
     entry.uid = edge;
-    entry.origin = record.origin;
-    entry.target = record.target;
-    entry.direction = record.direction;
-    entry.labels = record.labels;
-    entry.properties = record.properties;
+    entry.fat.reset(new JournalEntry::Fat);
+    entry.fat->origin = record.origin;
+    entry.fat->target = record.target;
+    entry.fat->direction = record.direction;
+    entry.fat->labels = record.labels;
+    entry.fat->properties = record.properties;
     return _tx->push(std::move(entry));
 }
 
@@ -429,11 +428,12 @@ GdiStatus Database::free_vertex(kimix::Guid const &uid) {
         JournalEntry entry;
         entry.kind = JournalEntry::Kind::vertex_removed;
         entry.uid = uid;
-        entry.labels.clear();
-        removed->labels(entry.labels);
-        entry.properties = removed->property_list();
-        entry.vertex = std::move(removed);
-        entry.removed_edges = std::move(removed_edges);
+        entry.fat.reset(new JournalEntry::Fat);
+        entry.fat->labels.clear();
+        removed->labels(entry.fat->labels);
+        entry.fat->properties = removed->property_list();
+        entry.fat->vertex = std::move(removed);
+        entry.fat->removed_edges = std::move(removed_edges);
         if (!_tx->push(std::move(entry))) {
             return GdiStatus::error_size_limit;
         }
@@ -472,12 +472,17 @@ GdiStatus Database::create_vertices_bulk(kimix::span<VertexBulkRow const> rows,
 
     // ONE transaction for the whole batch: a local scope when the caller has none
     // open, so "N creates, one atomic unit" holds without the caller having to
-    // begin anything (GDI's CreateVerticesBulkCommand shape).
-    Transaction local(*this, /*read_only=*/false, _options.max_journal_bytes);
+    // begin anything (GDI's CreateVerticesBulkCommand shape). The local object is
+    // built LAZILY: a stack Transaction's destructor aborts the DATABASE's
+    // current transaction when still open, which — with a caller transaction
+    // open — would abort the CALLER's (plan v3 §4.4: the old eager construction
+    // made the native batch unusable inside an engine transaction).
     Transaction *previous = _tx;
     bool const own_scope = previous == nullptr;
+    kimix::unique_ptr<Transaction> local;
     if (own_scope) {
-        _tx = &local;
+        local.reset(new Transaction(*this, /*read_only=*/false, _options.max_journal_bytes));
+        _tx = local.get();
     }
 
     bool aborted = false;
@@ -508,13 +513,13 @@ GdiStatus Database::create_vertices_bulk(kimix::span<VertexBulkRow const> rows,
             // created NOTHING, so the counters are reset — only the row that
             // actually failed stays in `failed`.
             aborted = true;
-            if (own_scope) {
-                (void)_rollback(local);
-                local.clear_journal();
-            } else {
-                (void)_rollback(*_tx);
-                _tx->clear_journal();
-            }
+              if (own_scope) {
+                  (void)_rollback(*local);
+                  local->clear_journal();
+              } else {
+                  (void)_rollback(*_tx);
+                  _tx->clear_journal();
+              }
             stats.created = 0;
             stats.warning = 0;
         }
@@ -523,11 +528,11 @@ GdiStatus Database::create_vertices_bulk(kimix::span<VertexBulkRow const> rows,
             row_status->push_back(status);
         }
     }
-    if (own_scope) {
-        _tx = previous;
-        local.clear_journal();
-    }
-    return aborted ? GdiStatus::error_state : GdiStatus::ok;
+      if (own_scope) {
+          _tx = previous;
+          local->clear_journal();
+      }
+      return aborted ? GdiStatus::error_state : GdiStatus::ok;
 }
 
 GdiStatus Database::create_edges_bulk(kimix::span<EdgeBulkRow const> rows,
@@ -543,6 +548,32 @@ GdiStatus Database::create_edges_bulk(kimix::span<EdgeBulkRow const> rows,
     if (row_status != nullptr) {
         row_status->clear();
         row_status->reserve(rows.size());
+    }
+    // PLAN V3 §5.4: reserve each endpoint's link vectors at its EXACT final
+    // degree before the create loop. Without this every vertex's _out_links /
+    // _in_links grow 1 -> 2 -> 4 -> 8 for a 6-edge workload: four allocation
+    // waves of retained heap plus 25 % capacity slack, which the staged RSS
+    // attribution measures as per-edge overhead. The reserve pass runs under
+    // the single-writer contract (same as the creates below).
+    {
+        kimix::unordered_map<kimix::Guid, uint64_t> degrees;
+        // ~1/4 of the rows are distinct endpoints on a typical bulk load
+        // (graphbench: 50k endpoints for 300k rows); over-reserving the full
+        // row count would churn a transient map bigger than the slack it
+        // saves. ankerl only grows, never rehashes downward.
+        degrees.reserve(rows.size() / 4 + 64);
+        for (auto const &row : rows) {
+            if (row.origin != row.target) {
+                degrees[row.origin] += 1; // outgoing count in the low half
+                degrees[row.target] += 1ull << 32; // incoming count in the high half
+            }
+        }
+        for (auto const &entry : degrees) {
+            uint64_t const outgoing = entry.second & 0xffffffffull;
+            uint64_t const incoming = entry.second >> 32;
+            (void)_graph.reserve_links(entry.first, static_cast<size_t>(outgoing),
+                                       static_cast<size_t>(incoming));
+        }
     }
     bool aborted = false;
     for (auto const &row : rows) {
@@ -592,8 +623,9 @@ GdiStatus Database::add_label(kimix::Guid const &uid, LabelId label) {
         JournalEntry entry;
         entry.kind = JournalEntry::Kind::vertex_payload;
         entry.uid = uid;
-        vertex->labels(entry.labels);
-        entry.properties = vertex->property_list();
+        entry.fat.reset(new JournalEntry::Fat);
+        vertex->labels(entry.fat->labels);
+        entry.fat->properties = vertex->property_list();
         if (!_tx->push(std::move(entry))) {
             return GdiStatus::error_size_limit;
         }
@@ -615,8 +647,9 @@ GdiStatus Database::remove_label(kimix::Guid const &uid, LabelId label) {
         JournalEntry entry;
         entry.kind = JournalEntry::Kind::vertex_payload;
         entry.uid = uid;
-        vertex->labels(entry.labels);
-        entry.properties = vertex->property_list();
+        entry.fat.reset(new JournalEntry::Fat);
+        vertex->labels(entry.fat->labels);
+        entry.fat->properties = vertex->property_list();
         if (!_tx->push(std::move(entry))) {
             return GdiStatus::error_size_limit;
         }
@@ -665,8 +698,9 @@ GdiStatus Database::add_property(kimix::Guid const &uid, PropNameId name,
         JournalEntry entry;
         entry.kind = JournalEntry::Kind::vertex_payload;
         entry.uid = uid;
-        vertex->labels(entry.labels);
-        entry.properties = vertex->property_list();
+        entry.fat.reset(new JournalEntry::Fat);
+        vertex->labels(entry.fat->labels);
+        entry.fat->properties = vertex->property_list();
         if (!_tx->push(std::move(entry))) {
             return GdiStatus::error_size_limit;
         }
@@ -693,8 +727,9 @@ GdiStatus Database::set_property(kimix::Guid const &uid, PropNameId name,
         JournalEntry entry;
         entry.kind = JournalEntry::Kind::vertex_payload;
         entry.uid = uid;
-        vertex->labels(entry.labels);
-        entry.properties = vertex->property_list();
+        entry.fat.reset(new JournalEntry::Fat);
+        vertex->labels(entry.fat->labels);
+        entry.fat->properties = vertex->property_list();
         if (!_tx->push(std::move(entry))) {
             return GdiStatus::error_size_limit;
         }
@@ -721,8 +756,9 @@ GdiStatus Database::update_property(kimix::Guid const &uid, PropNameId name,
         JournalEntry entry;
         entry.kind = JournalEntry::Kind::vertex_payload;
         entry.uid = uid;
-        vertex->labels(entry.labels);
-        entry.properties = vertex->property_list();
+        entry.fat.reset(new JournalEntry::Fat);
+        vertex->labels(entry.fat->labels);
+        entry.fat->properties = vertex->property_list();
         if (!_tx->push(std::move(entry))) {
             return GdiStatus::error_size_limit;
         }
@@ -745,8 +781,9 @@ GdiStatus Database::remove_properties(kimix::Guid const &uid,
         JournalEntry entry;
         entry.kind = JournalEntry::Kind::vertex_payload;
         entry.uid = uid;
-        vertex->labels(entry.labels);
-        entry.properties = vertex->property_list();
+        entry.fat.reset(new JournalEntry::Fat);
+        vertex->labels(entry.fat->labels);
+        entry.fat->properties = vertex->property_list();
         if (!_tx->push(std::move(entry))) {
             return GdiStatus::error_size_limit;
         }
@@ -848,11 +885,12 @@ GdiStatus Database::edge_free(kimix::Guid const &edge) {
         JournalEntry entry;
         entry.kind = JournalEntry::Kind::edge_removed;
         entry.uid = edge;
-        entry.origin = record.origin;
-        entry.target = record.target;
-        entry.direction = record.direction;
-        entry.labels = record.labels;
-        entry.properties = record.properties;
+        entry.fat.reset(new JournalEntry::Fat);
+        entry.fat->origin = record.origin;
+        entry.fat->target = record.target;
+        entry.fat->direction = record.direction;
+        entry.fat->labels = record.labels;
+        entry.fat->properties = record.properties;
         if (!_tx->push(std::move(entry))) {
             return GdiStatus::error_size_limit;
         }
@@ -872,11 +910,12 @@ GdiStatus Database::set_edge_origin(kimix::Guid const &edge, kimix::Guid const &
         JournalEntry entry;
         entry.kind = JournalEntry::Kind::edge_state;
         entry.uid = edge;
-        entry.origin = record.origin;
-        entry.target = record.target;
-        entry.direction = record.direction;
-        entry.labels = record.labels;
-        entry.properties = record.properties;
+        entry.fat.reset(new JournalEntry::Fat);
+        entry.fat->origin = record.origin;
+        entry.fat->target = record.target;
+        entry.fat->direction = record.direction;
+        entry.fat->labels = record.labels;
+        entry.fat->properties = record.properties;
         if (!_tx->push(std::move(entry))) {
             return GdiStatus::error_size_limit;
         }
@@ -896,11 +935,12 @@ GdiStatus Database::set_edge_target(kimix::Guid const &edge, kimix::Guid const &
         JournalEntry entry;
         entry.kind = JournalEntry::Kind::edge_state;
         entry.uid = edge;
-        entry.origin = record.origin;
-        entry.target = record.target;
-        entry.direction = record.direction;
-        entry.labels = record.labels;
-        entry.properties = record.properties;
+        entry.fat.reset(new JournalEntry::Fat);
+        entry.fat->origin = record.origin;
+        entry.fat->target = record.target;
+        entry.fat->direction = record.direction;
+        entry.fat->labels = record.labels;
+        entry.fat->properties = record.properties;
         if (!_tx->push(std::move(entry))) {
             return GdiStatus::error_size_limit;
         }
@@ -921,11 +961,12 @@ GdiStatus Database::set_edge_direction(kimix::Guid const &edge,
         JournalEntry entry;
         entry.kind = JournalEntry::Kind::edge_state;
         entry.uid = edge;
-        entry.origin = record.origin;
-        entry.target = record.target;
-        entry.direction = record.direction;
-        entry.labels = record.labels;
-        entry.properties = record.properties;
+        entry.fat.reset(new JournalEntry::Fat);
+        entry.fat->origin = record.origin;
+        entry.fat->target = record.target;
+        entry.fat->direction = record.direction;
+        entry.fat->labels = record.labels;
+        entry.fat->properties = record.properties;
         if (!_tx->push(std::move(entry))) {
             return GdiStatus::error_size_limit;
         }
@@ -954,11 +995,12 @@ GdiStatus Database::add_edge_label(kimix::Guid const &edge, LabelId label) {
         JournalEntry entry;
         entry.kind = JournalEntry::Kind::edge_state;
         entry.uid = edge;
-        entry.origin = record.origin;
-        entry.target = record.target;
-        entry.direction = record.direction;
-        entry.labels = record.labels;
-        entry.properties = record.properties;
+        entry.fat.reset(new JournalEntry::Fat);
+        entry.fat->origin = record.origin;
+        entry.fat->target = record.target;
+        entry.fat->direction = record.direction;
+        entry.fat->labels = record.labels;
+        entry.fat->properties = record.properties;
         if (!_tx->push(std::move(entry))) {
             return GdiStatus::error_size_limit;
         }
@@ -978,11 +1020,12 @@ GdiStatus Database::remove_edge_label(kimix::Guid const &edge, LabelId label) {
         JournalEntry entry;
         entry.kind = JournalEntry::Kind::edge_state;
         entry.uid = edge;
-        entry.origin = record.origin;
-        entry.target = record.target;
-        entry.direction = record.direction;
-        entry.labels = record.labels;
-        entry.properties = record.properties;
+        entry.fat.reset(new JournalEntry::Fat);
+        entry.fat->origin = record.origin;
+        entry.fat->target = record.target;
+        entry.fat->direction = record.direction;
+        entry.fat->labels = record.labels;
+        entry.fat->properties = record.properties;
         if (!_tx->push(std::move(entry))) {
             return GdiStatus::error_size_limit;
         }
@@ -1021,11 +1064,12 @@ GdiStatus Database::add_edge_property(kimix::Guid const &edge, PropNameId name,
         JournalEntry entry;
         entry.kind = JournalEntry::Kind::edge_state;
         entry.uid = edge;
-        entry.origin = record.origin;
-        entry.target = record.target;
-        entry.direction = record.direction;
-        entry.labels = record.labels;
-        entry.properties = record.properties;
+        entry.fat.reset(new JournalEntry::Fat);
+        entry.fat->origin = record.origin;
+        entry.fat->target = record.target;
+        entry.fat->direction = record.direction;
+        entry.fat->labels = record.labels;
+        entry.fat->properties = record.properties;
         if (!_tx->push(std::move(entry))) {
             return GdiStatus::error_size_limit;
         }
@@ -1050,11 +1094,12 @@ GdiStatus Database::set_edge_property(kimix::Guid const &edge, PropNameId name,
         JournalEntry entry;
         entry.kind = JournalEntry::Kind::edge_state;
         entry.uid = edge;
-        entry.origin = record.origin;
-        entry.target = record.target;
-        entry.direction = record.direction;
-        entry.labels = record.labels;
-        entry.properties = record.properties;
+        entry.fat.reset(new JournalEntry::Fat);
+        entry.fat->origin = record.origin;
+        entry.fat->target = record.target;
+        entry.fat->direction = record.direction;
+        entry.fat->labels = record.labels;
+        entry.fat->properties = record.properties;
         if (!_tx->push(std::move(entry))) {
             return GdiStatus::error_size_limit;
         }
@@ -1079,11 +1124,12 @@ GdiStatus Database::update_edge_property(kimix::Guid const &edge, PropNameId nam
         JournalEntry entry;
         entry.kind = JournalEntry::Kind::edge_state;
         entry.uid = edge;
-        entry.origin = record.origin;
-        entry.target = record.target;
-        entry.direction = record.direction;
-        entry.labels = record.labels;
-        entry.properties = record.properties;
+        entry.fat.reset(new JournalEntry::Fat);
+        entry.fat->origin = record.origin;
+        entry.fat->target = record.target;
+        entry.fat->direction = record.direction;
+        entry.fat->labels = record.labels;
+        entry.fat->properties = record.properties;
         if (!_tx->push(std::move(entry))) {
             return GdiStatus::error_size_limit;
         }
@@ -1104,11 +1150,12 @@ GdiStatus Database::remove_edge_properties(kimix::Guid const &edge,
         JournalEntry entry;
         entry.kind = JournalEntry::Kind::edge_state;
         entry.uid = edge;
-        entry.origin = record.origin;
-        entry.target = record.target;
-        entry.direction = record.direction;
-        entry.labels = record.labels;
-        entry.properties = record.properties;
+        entry.fat.reset(new JournalEntry::Fat);
+        entry.fat->origin = record.origin;
+        entry.fat->target = record.target;
+        entry.fat->direction = record.direction;
+        entry.fat->labels = record.labels;
+        entry.fat->properties = record.properties;
         if (!_tx->push(std::move(entry))) {
             return GdiStatus::error_size_limit;
         }
@@ -1206,6 +1253,41 @@ GdiStatus Database::get_neighbor_vertices(kimix::Guid const &uid,
     if (is_error(status)) {
         return status;
     }
+    if (resolved.conditions.empty()) {
+        // Plan v3 §4.1 (the degree-counter epoch): the UNFILTERED neighbourhood
+        // read no longer resolves every neighbour's own record — the labels /
+        // properties / matches work below is pure overhead when the constraint
+        // matches everything, and the per-edge edge_endpoints round-trips cost
+        // two more hash lookups per link. One shard SHARED lock snapshot of the
+        // oriented guid projection, deduped here; distinct-neighbour semantics
+        // are unchanged (parallel edges, both-orientation overlap and self
+        // loops collapse exactly as before). The count probe (cap == 0) counts
+        // the distinct guids without materialising any items.
+        AdjacencyBuffer adjacency;
+        if (!_graph.oriented_adjacency(uid, orientation, adjacency)) {
+            return GdiStatus::error_vertex;
+        }
+        if (cap == 0) {
+            kimix::unordered_set<kimix::Guid> seen;
+            seen.reserve(adjacency.size());
+            for (auto const &guid : adjacency) {
+                seen.insert(guid);
+            }
+            out.total_count = seen.size();
+            return GdiStatus::ok;
+        }
+        kimix::vector<kimix::Guid> matches;
+        matches.reserve(adjacency.size());
+        kimix::unordered_set<kimix::Guid> seen;
+        seen.reserve(adjacency.size());
+        for (auto const &guid : adjacency) {
+            if (seen.insert(guid).second) {
+                matches.push_back(guid);
+            }
+        }
+        out = make_page(std::move(matches), cap);
+        return GdiStatus::ok;
+    }
     kimix::vector<EdgeId> ids;
     _graph.incident_edges(uid, orientation, ids);
     kimix::vector<kimix::Guid> matches;
@@ -1244,11 +1326,13 @@ GdiStatus Database::get_neighbor_vertices(kimix::Guid const &uid,
 }
 
 GdiStatus Database::count_neighbors(kimix::Guid const &uid, Constraint const &constraint,
-                                    EdgeOrientation orientation, size_t &out) const {
+                                      EdgeOrientation orientation, size_t &out) const {
     out = 0;
+    // cap == 0: the count probe — the callee's total_count is the full match
+    // count, and an unfiltered probe now answers from one adjacency snapshot
+    // (plan v3 §4.1) instead of walking every incident edge.
     VertexPage page;
-    GdiStatus const status =
-        get_neighbor_vertices(uid, constraint, orientation, kUnlimitedCap, page);
+    GdiStatus const status = get_neighbor_vertices(uid, constraint, orientation, 0, page);
     if (is_error(status)) {
         return status;
     }
@@ -1270,6 +1354,287 @@ GdiStatus Database::exists_neighbor(kimix::Guid const &uid, Constraint const &co
     out = page.total_count > 0;
     return GdiStatus::ok;
 }
+
+// ---------------------------------------------------------------------------
+// Native multi-hop traversal (the G3 capability)
+// ---------------------------------------------------------------------------
+
+GdiStatus Database::traverse_bfs(kimix::Guid const &start, Constraint const &constraint,
+                                 EdgeOrientation orientation, int64_t cap_per_level,
+                                 uint32_t max_depth,
+                                 kimix::vector<Graph::TraversalVertex> &out) const {
+    out.clear();
+    Constraint resolved;
+    GdiStatus const status = _resolve_constraint(constraint, resolved);
+    if (is_error(status)) {
+        return status;
+    }
+    return _graph.traverse_bfs(start, resolved, orientation, cap_per_level, max_depth, out);
+}
+
+  GdiStatus Database::shortest_path(kimix::Guid const &from, kimix::Guid const &to,
+                                    uint32_t max_depth, kimix::vector<kimix::Guid> &out) const {
+      out.clear();
+      return _graph.shortest_path(from, to, max_depth, out);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Global scan (the G1 capability)
+  GdiStatus Database::scan_vertices(Constraint const &constraint, int64_t cap,
+                                    VertexPage &out) const {
+      out = VertexPage{};
+      if (cap < 0) {
+          return GdiStatus::error_argument;
+      }
+      Constraint resolved;
+      GdiStatus const status = _resolve_constraint(constraint, resolved);
+      if (is_error(status)) {
+          return status;
+      }
+      bool const filtered = !resolved.conditions.empty();
+      kimix::vector<kimix::Guid> found;
+      kimix::vector<LabelId> labels; // filtered path only, reused across vertices
+      _graph.for_each_vertex([&](Vertex const &vertex) {
+          if (filtered) {
+              // §5.10: the filter applies to the scanned VERTEX itself. The
+              // labels()/property_list() reads take the vertex's leaf SHARED
+              // lock while the shard SHARED lock is held — the documented
+              // shard-before-vertex order.
+              labels.clear();
+              vertex.labels(labels);
+              PropertyBag bag;
+              PropertyList list = vertex.property_list();
+              for (auto const &entry : list) {
+                  bag.emplace(entry.name, entry.value);
+              }
+              if (!kimix::graph_db::matches(resolved,
+                                            kimix::span<const LabelId>{labels.data(), labels.size()},
+                                            bag)) {
+                  return true; // keep scanning
+              }
+          }
+          found.push_back(vertex.guid());
+          return true;
+      });
+      out = make_page(std::move(found), cap);
+      return GdiStatus::ok;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Global aggregates (the G4 capability)
+  namespace {
+  // One shard's share of an aggregate. Integer and double sums accumulate in
+  // SEPARATE buckets so an int64_ declaration sums exactly (no widening), and
+  // the merge adds the buckets in shard order — deterministic floats.
+  struct AggregatePartial {
+      uint64_t matched{0};
+      uint64_t valued{0};
+      int64_t int_sum{0};
+      double double_sum{0.0};
+      bool has_extreme{false};
+      PropertyValue extreme;
+      GdiStatus status{GdiStatus::ok};
+  };
+  // Fold one contributing value into a partial. `numeric` is the sum/avg path,
+  // `want_min`/`want_max` the extremal path; a kind the reduction cannot order
+  // (defensive: the declaration check already guaranteed homogeneous kinds)
+  // records error_datatype in the partial instead of throwing.
+  void aggregate_accumulate(AggregatePartial &partial, GdiAggregate function,
+                            PropertyValue const &value) noexcept {
+      switch (function) {
+      case GdiAggregate::min:
+      case GdiAggregate::max: {
+          if (!partial.has_extreme) {
+              partial.extreme = value;
+              partial.has_extreme = true;
+              return;
+          }
+          kimix::optional<int32_t> const order = compare_values(value, partial.extreme);
+          if (!order.has_value()) {
+              partial.status = GdiStatus::error_datatype;
+              return;
+          }
+          bool const take = function == GdiAggregate::min ? *order < 0 : *order > 0;
+          if (take) {
+              partial.extreme = value; // strict: a tie keeps the earlier shard's
+          }                            // value, which is the deterministic pick
+          return;
+      }
+      case GdiAggregate::sum:
+      case GdiAggregate::avg:
+          if (value.kind() == PropertyKind::int64_value) {
+              partial.int_sum += value.as_int64();
+          } else {
+              partial.double_sum += value.as_double();
+          }
+          return;
+      case GdiAggregate::count:
+          return; // count never reaches here; the payload is `matched`
+      }
+      partial.status = GdiStatus::error_argument;
+  }
+  } // namespace
+
+  GdiStatus Database::aggregate_vertices(AggregateSpec const &spec, AggregateResult &out) const {
+      out = AggregateResult{};
+      switch (spec.function) {
+      case GdiAggregate::count:
+      case GdiAggregate::min:
+      case GdiAggregate::max:
+      case GdiAggregate::sum:
+      case GdiAggregate::avg:
+          break;
+      default:
+          return GdiStatus::error_argument;
+      }
+      Constraint resolved;
+      GdiStatus const status = _resolve_constraint(spec.constraint, resolved);
+      if (is_error(status)) {
+          return status;
+      }
+      // The legality matrix, decided from the REGISTERED declaration before any
+      // scan: count reduces rows (no property needed); min/max order values
+      // (numeric cross-kind via compare_values, strings ordinal via char_); sum/
+      // avg need a numeric scalar declaration.
+      GdiDataType declared = GdiDataType::int64_;
+      if (spec.function != GdiAggregate::count) {
+          if (spec.property == kNoPropName) {
+              return GdiStatus::error_argument;
+          }
+          if (!_schema.has_property_type(spec.property)) {
+              return GdiStatus::error_property_type;
+          }
+          PropertyTypeInfo const declaration = _schema.property_type(spec.property);
+          declared = declaration.data;
+          bool const scalar = declaration.container == GdiContainerType::single;
+          bool const ordered =
+              scalar && (declared == GdiDataType::int64_ || declared == GdiDataType::double_ ||
+                         declared == GdiDataType::char_);
+          bool const numeric = scalar && (declared == GdiDataType::int64_ ||
+                                          declared == GdiDataType::double_);
+          bool const legal = spec.function == GdiAggregate::min ||
+                             spec.function == GdiAggregate::max ? ordered : numeric;
+          if (!legal) {
+              return GdiStatus::error_op;
+          }
+      }
+      bool const filtered = !resolved.conditions.empty();
+      bool const reduces_property = spec.function != GdiAggregate::count;
+      // One partial per shard; every shard index gets exactly one write (its own
+      // scan), disjoint across fibers, so no synchronization is needed.
+      kimix::vector<AggregatePartial> partials(kGraphShardCount);
+      auto scan_shard = [&](uint32_t shard, AggregatePartial &partial) noexcept {
+          kimix::vector<LabelId> labels; // filtered path only, reused per vertex
+          _graph.for_each_vertex(shard, shard + 1, [&](Vertex const &vertex) {
+              if (filtered) {
+                  labels.clear();
+                  vertex.labels(labels);
+                  PropertyBag bag;
+                  PropertyList list = vertex.property_list();
+                  for (auto const &entry : list) {
+                      bag.emplace(entry.name, entry.value);
+                  }
+                  if (!kimix::graph_db::matches(
+                          resolved, kimix::span<const LabelId>{labels.data(), labels.size()},
+                          bag)) {
+                      return true;
+                  }
+              }
+              ++partial.matched;
+              if (!reduces_property) {
+                  return true;
+              }
+              PropertyList list = vertex.property_list();
+              for (auto const &entry : list) {
+                  if (entry.name != spec.property) {
+                      continue;
+                  }
+                  ++partial.valued;
+                  aggregate_accumulate(partial, spec.function, entry.value);
+                  break;
+              }
+              return true;
+          });
+      };
+      // Fan-out: one fiber per shard when a scheduler with workers is bound;
+      // the same shards inline when unbound (the C ABI path) — both produce the
+      // same partials, merged in shard order below.
+      uint32_t const workers = kimix::fiber::worker_thread_count();
+      if (workers <= 1) {
+          for (uint32_t shard = 0; shard < static_cast<uint32_t>(kGraphShardCount); ++shard) {
+              scan_shard(shard, partials[shard]);
+          }
+      } else {
+          kimix::fiber::parallel(static_cast<uint32_t>(kGraphShardCount),
+                                 [&](uint32_t shard) noexcept {
+                                     scan_shard(shard, partials[shard]);
+                                 },
+                                 /*internal_jobs=*/1u);
+      }
+      // Merge in shard order: the sums add partial-by-partial (deterministic
+      // floats), the extremal fold keeps the earlier shard on a tie, and the
+      // first partial-level error wins.
+      int64_t int_total = 0;
+      double double_total = 0.0;
+      PropertyValue extreme;
+      bool has_extreme = false;
+      for (auto const &partial : partials) {
+          if (is_error(partial.status)) {
+              return partial.status;
+          }
+          out.matched += partial.matched;
+          out.valued += partial.valued;
+          int_total += partial.int_sum;
+          double_total += partial.double_sum;
+          if (partial.has_extreme) {
+              if (!has_extreme) {
+                  extreme = partial.extreme;
+                  has_extreme = true;
+              } else {
+                  kimix::optional<int32_t> const order =
+                      compare_values(partial.extreme, extreme);
+                  if (!order.has_value()) {
+                      return GdiStatus::error_datatype;
+                  }
+                  bool const take = spec.function == GdiAggregate::min ? *order < 0 : *order > 0;
+                  if (take) {
+                      extreme = partial.extreme;
+                  }
+              }
+          }
+      }
+      switch (spec.function) {
+      case GdiAggregate::count:
+          if (out.matched > 0) {
+              out.has_value = true;
+              out.value = PropertyValue::make_int64(static_cast<int64_t>(out.matched));
+          }
+          return GdiStatus::ok;
+      case GdiAggregate::min:
+      case GdiAggregate::max:
+          if (has_extreme) {
+              out.has_value = true;
+              out.value = std::move(extreme);
+          }
+          return GdiStatus::ok;
+      case GdiAggregate::sum:
+          if (out.valued > 0) {
+              out.has_value = true;
+              out.value = declared == GdiDataType::double_
+                              ? PropertyValue::make_double(double_total)
+                              : PropertyValue::make_int64(int_total);
+          }
+          return GdiStatus::ok;
+      case GdiAggregate::avg:
+          if (out.valued > 0) {
+              out.has_value = true;
+              double const sum = static_cast<double>(int_total) + double_total;
+              out.value = PropertyValue::make_double(sum / static_cast<double>(out.valued));
+          }
+          return GdiStatus::ok;
+      }
+      return GdiStatus::error_argument;
+  }
 
 // ---------------------------------------------------------------------------
 // Constraints
@@ -1352,8 +1717,9 @@ GdiStatus Database::update_label(LabelId id, kimix::string_view new_name) {
         }
         JournalEntry entry;
         entry.kind = JournalEntry::Kind::label_renamed;
+        entry.fat.reset(new JournalEntry::Fat);
         entry.label = id;
-        entry.name = previous;
+        entry.fat->name = previous;
         if (!_tx->push(std::move(entry))) {
             return GdiStatus::error_size_limit;
         }
@@ -1378,8 +1744,9 @@ GdiStatus Database::free_label(LabelId id) {
         // id) plus one entry per entity the cascade touches, pushed by _strip_label.
         JournalEntry entry;
         entry.kind = JournalEntry::Kind::label_freed;
+        entry.fat.reset(new JournalEntry::Fat);
         entry.label = id;
-        entry.name = _schema.label_name(id);
+        entry.fat->name = _schema.label_name(id);
         if (!_tx->push(std::move(entry))) {
             return GdiStatus::error_size_limit;
         }
@@ -1443,8 +1810,9 @@ GdiStatus Database::update_property_type(PropNameId id, PropertyTypeInfo const &
     if (_tx != nullptr) {
         JournalEntry entry;
         entry.kind = JournalEntry::Kind::property_type_updated;
+        entry.fat.reset(new JournalEntry::Fat);
         entry.property = id;
-        entry.info = _schema.property_type(id);
+        entry.fat->info = _schema.property_type(id);
         if (!_tx->push(std::move(entry))) {
             return GdiStatus::error_size_limit;
         }
@@ -1464,8 +1832,9 @@ GdiStatus Database::free_property_type(PropNameId id) {
     if (_tx != nullptr) {
         JournalEntry entry;
         entry.kind = JournalEntry::Kind::property_type_freed;
+        entry.fat.reset(new JournalEntry::Fat);
         entry.property = id;
-        entry.info = _schema.property_type(id);
+        entry.fat->info = _schema.property_type(id);
         if (!_tx->push(std::move(entry))) {
             return GdiStatus::error_size_limit;
         }
@@ -1565,13 +1934,13 @@ GdiStatus Database::_rollback(Transaction &tx) {
         case JournalEntry::Kind::vertex_removed: {
             // Re-adopt the vertex with its payload, then every edge its cascade
             // removed. The key index entry comes back with adopt_vertex.
-            if (entry.vertex) {
-                entry.vertex->restore_payload(
-                    kimix::span<const LabelId>{entry.labels.data(), entry.labels.size()},
-                    entry.properties);
-                (void)_graph.adopt_vertex(std::move(entry.vertex));
+            if (entry.fat->vertex) {
+                entry.fat->vertex->restore_payload(
+                    kimix::span<const LabelId>{entry.fat->labels.data(), entry.fat->labels.size()},
+                    entry.fat->properties);
+                (void)_graph.adopt_vertex(std::move(entry.fat->vertex));
             }
-            for (auto &edge : entry.removed_edges) {
+            for (auto &edge : entry.fat->removed_edges) {
                 if (edge) {
                     (void)_graph.adopt_edge(std::move(edge));
                 }
@@ -1582,8 +1951,8 @@ GdiStatus Database::_rollback(Transaction &tx) {
             Vertex *vertex = _graph.find(entry.uid);
             if (vertex != nullptr) {
                 vertex->restore_payload(
-                    kimix::span<const LabelId>{entry.labels.data(), entry.labels.size()},
-                    entry.properties);
+                    kimix::span<const LabelId>{entry.fat->labels.data(), entry.fat->labels.size()},
+                    entry.fat->properties);
             }
             break;
         }
@@ -1591,11 +1960,11 @@ GdiStatus Database::_rollback(Transaction &tx) {
             (void)_graph.edge_free(entry.uid);
             break;
         case JournalEntry::Kind::edge_removed: {
-            kimix::unique_ptr<Edge> restored{new Edge(entry.uid, entry.origin, entry.target,
-                                                     entry.direction)};
-            restored->assign_payload(kimix::span<const LabelId>{entry.labels.data(),
-                                                               entry.labels.size()},
-                                     entry.properties);
+            kimix::unique_ptr<Edge> restored{new Edge(entry.uid, entry.fat->origin, entry.fat->target,
+                                                     entry.fat->direction)};
+            restored->assign_payload(kimix::span<const LabelId>{entry.fat->labels.data(),
+                                                               entry.fat->labels.size()},
+                                     entry.fat->properties);
             restored->clear_dirty();
             (void)_graph.adopt_edge(std::move(restored));
             break;
@@ -1607,29 +1976,29 @@ GdiStatus Database::_rollback(Transaction &tx) {
             if (!_graph.edge_endpoints(entry.uid, origin, target)) {
                 break;
             }
-            if (origin != entry.origin) {
-                (void)_graph.edge_set_origin(entry.uid, entry.origin);
+            if (origin != entry.fat->origin) {
+                (void)_graph.edge_set_origin(entry.uid, entry.fat->origin);
             }
-            if (target != entry.target) {
-                (void)_graph.edge_set_target(entry.uid, entry.target);
+            if (target != entry.fat->target) {
+                (void)_graph.edge_set_target(entry.uid, entry.fat->target);
             }
-            (void)_graph.edge_set_direction(entry.uid, entry.direction);
+            (void)_graph.edge_set_direction(entry.uid, entry.fat->direction);
             _graph.edge_restore_payload(
                 entry.uid,
-                kimix::span<const LabelId>{entry.labels.data(), entry.labels.size()},
-                entry.properties);
+                kimix::span<const LabelId>{entry.fat->labels.data(), entry.fat->labels.size()},
+                entry.fat->properties);
             break;
         }
         case JournalEntry::Kind::label_created:
             (void)_schema.free_label(entry.label);
             break;
         case JournalEntry::Kind::label_renamed:
-            (void)_schema.rename_label(entry.label, entry.name);
+            (void)_schema.rename_label(entry.label, entry.fat->name);
             break;
         case JournalEntry::Kind::label_freed: {
             LabelTableEntry restored;
             restored.id = entry.label;
-            restored.name = entry.name;
+            restored.name = entry.fat->name;
             (void)_schema.restore_label(restored);
             break;
         }
@@ -1639,11 +2008,11 @@ GdiStatus Database::_rollback(Transaction &tx) {
         case JournalEntry::Kind::property_type_updated: {
             PropertyTypeInfo const current = _schema.property_type(entry.property);
             (void)current;
-            (void)_schema.update_property_type(entry.property, entry.info, false);
+            (void)_schema.update_property_type(entry.property, entry.fat->info, false);
             break;
         }
         case JournalEntry::Kind::property_type_freed:
-            (void)_schema.restore_property_type(entry.info);
+            (void)_schema.restore_property_type(entry.fat->info);
             break;
         }
     }

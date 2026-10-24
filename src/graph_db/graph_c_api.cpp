@@ -29,11 +29,13 @@
 
 #include <core/guid.h>
 #include <core/md5.h>
+#include <core/stl/map.h>
 #include <core/stl/string.h>
 #include <core/stl/vector.h>
 
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 #include <utility>
 
 /*
@@ -51,13 +53,26 @@ struct kimix_gdb_session {
     kimix::vector<ConstraintSlot> constraints;
     uint32_t next_constraint{1};
     bool open{false};
+    // The catalog name this session registered under ("" = anonymous; plan v3
+    // step 3.7).  Copied at open; close() releases the catalog entry.
+    kimix::string graph_name;
 };
 
 namespace {
 
+// The named-graph catalog: the LIVE named graphs of this process, one entry
+// per name (a second live open is ERR_NAME_EXISTS — the one-session-per-worker
+// contract, named).  Anonymous sessions never appear.  Guarded by its own
+// mutex: opens and closes may arrive from any thread.
+std::mutex g_catalog_mutex;
+kimix::map<kimix::string, kimix_gdb_session *> g_catalog;
+
+using kimix::graph_db::AggregateResult;
+using kimix::graph_db::AggregateSpec;
 using kimix::graph_db::Constraint;
 using kimix::graph_db::ConstraintHandle;
 using kimix::graph_db::Database;
+using kimix::graph_db::GdiAggregate;
 using kimix::graph_db::EdgeDirectionType;
 using kimix::graph_db::EdgeOrientation;
 using kimix::graph_db::EdgeRecord;
@@ -291,21 +306,68 @@ GdiStatus resolve_constraint(kimix_gdb_session *session, uint32_t id, Constraint
     return GdiStatus::ok;
 }
 
-// The property list of one vertex in the ABI's (name, value) shape.
-void collect_vertex_properties(Database &db, kimix::Guid const &uid,
-                               kimix::vector<std::pair<PropNameId, PropertyValue>> &out) {
-    out.clear();
-    kimix::graph_db::Vertex *vertex = db.graph().find(uid);
-    if (vertex == nullptr) {
-        return;
-    }
-    kimix::graph_db::PropertyList properties;
-    vertex->properties(properties);
-    out.reserve(properties.size());
-    for (auto const &entry : properties) {
-        out.push_back({entry.name, entry.value});
-    }
-}
+  // The property list of one vertex in the ABI's (name, value) shape.
+  void collect_vertex_properties(Database &db, kimix::Guid const &uid,
+                                 kimix::vector<std::pair<PropNameId, PropertyValue>> &out) {
+      out.clear();
+      kimix::graph_db::Vertex *vertex = db.graph().find(uid);
+      if (vertex == nullptr) {
+          return;
+      }
+      kimix::graph_db::PropertyList properties;
+      vertex->properties(properties);
+      out.reserve(properties.size());
+      for (auto const &entry : properties) {
+          out.push_back({entry.name, entry.value});
+      }
+  }
+
+  // Plan v3 §4.3: the one-pass record+scratch fill for the VERTEX property
+  // read. Walks the bag once under the leaf lock via visit_properties, writing
+  // each record and appending each payload straight into the caller's buffers.
+  // The collect_vertex_properties + write_properties pair this replaces copied
+  // every PropertyValue twice on the way through (a string/blob property: two
+  // heap allocations) on top of the final payload copy. Same two-phase
+  // contract and error semantics as write_properties: probe (both buffers
+  // NULL) reports the sizes and succeeds; a too-small scratch or item
+  // capacity yields ERR_BUFFER with the sizes still reported.
+  GdiStatus write_vertex_property_records(kimix::graph_db::Vertex &vertex,
+                                          kimix_gdb_property_record *items, size_t capacity,
+                                          uint8_t *scratch_buffer, size_t scratch_capacity,
+                                          size_t *out_count, size_t *out_scratch) {
+      bool const probe = items == nullptr && scratch_buffer == nullptr;
+      ScratchWriter scratch{scratch_buffer, scratch_capacity};
+      size_t count = 0;
+      vertex.visit_properties([&](PropNameId name, PropertyValue const &value) {
+          uint32_t offset = 0;
+          uint32_t length = 0;
+          // In probe mode the writer has a null buffer and only accumulates
+          // the needed byte count (its overflow flag is ignored below).
+          bool const fits = scratch.append(payload_of(value), offset, length);
+          (void)fits;
+          if (!probe && items != nullptr && count < capacity) {
+              fill_property_record(items[count], name, value, offset, length);
+          }
+          ++count;
+          return true;
+      });
+      if (out_count != nullptr) {
+          *out_count = count;
+      }
+      if (out_scratch != nullptr) {
+          *out_scratch = scratch.needed();
+      }
+      if (probe) {
+          return GdiStatus::ok;
+      }
+      if (scratch.overflowed()) {
+          return GdiStatus::error_buffer;
+      }
+      if (count > capacity) {
+          return GdiStatus::error_buffer;
+      }
+      return GdiStatus::ok;
+  }
 
 void collect_edge_properties(Database &db, kimix::Guid const &edge,
                              kimix::vector<std::pair<PropNameId, PropertyValue>> &out) {
@@ -384,6 +446,8 @@ int32_t kimix_gdb_layout_info(kimix_gdb_layout *out) {
     out->sizeof_vertex_spec = static_cast<uint32_t>(sizeof(kimix_gdb_vertex_spec));
     out->sizeof_size_t = static_cast<uint32_t>(sizeof(size_t));
     out->alignof_guid = static_cast<uint32_t>(alignof(kimix_gdb_guid));
+    out->sizeof_traversal_vertex = static_cast<uint32_t>(sizeof(kimix_gdb_traversal_vertex));
+    out->sizeof_aggregate_result = static_cast<uint32_t>(sizeof(kimix_gdb_aggregate_result));
     return KIMIX_GDB_OK;
 }
 
@@ -412,7 +476,11 @@ int32_t kimix_gdb_open(const kimix_gdb_open_options *options, kimix_gdb_session 
     graph_options.key_mode = request.key_mode == 1 ? kimix::graph_db::KeyMode::report_warning
                                                    : kimix::graph_db::KeyMode::enforce_unique;
     graph_options.allow_parallel_edges = request.allow_parallel_edges != 0;
-    graph_options.allow_self_edges = request.allow_self_edges != 0;
+          graph_options.allow_self_edges = request.allow_self_edges != 0;
+      // ABI 6 (plan v3 §4.5): 0 (or a pre-ABI-6 zeroed struct) = MD5, 1 = XXH3.
+      graph_options.content_digest = request.content_digest == 1
+                                         ? kimix::graph_db::ContentDigest::xxh3
+                                         : kimix::graph_db::ContentDigest::md5;
     graph_options.persist_on_commit = request.persist_on_commit != 0;
     graph_options.max_journal_bytes =
         request.max_journal_bytes != 0 ? request.max_journal_bytes : 64ull * 1024ull * 1024ull;
@@ -425,12 +493,34 @@ int32_t kimix_gdb_open(const kimix_gdb_open_options *options, kimix_gdb_session 
             delete session;
             return KIMIX_GDB_ERR_ARGUMENT;
         }
+    }
+    // The named-graph catalog name (ABI 5+, plan v3 step 3.7): an explicit
+    // graph_name wins; without one the directory path remains the recorded
+    // name (the pre-ABI-5 behavior, unchanged).  Only an EXPLICIT name enters
+    // the live-graph catalog.
+    kimix::string catalog_name;
+    if (request.graph_name != nullptr && request.graph_name[0] != '\0') {
+        catalog_name.assign(request.graph_name);
+        graph_options.graph_name = catalog_name;
+    } else if (request.directory != nullptr && request.directory[0] != '\0') {
         graph_options.graph_name = request.directory;
     }
     GdiStatus const status = session->database.open(directory, graph_options);
     if (is_error(status)) {
         delete session;
         return code_of(status);
+    }
+    if (!catalog_name.empty()) {
+        // One live graph per name: a collision is a status code, not an
+        // exception, and leaves the refused session completely unregistered.
+        std::lock_guard<std::mutex> lock(g_catalog_mutex);
+        if (g_catalog.find(catalog_name) != g_catalog.end()) {
+            session->database.close();
+            delete session;
+            return KIMIX_GDB_ERR_NAME_EXISTS;
+        }
+        session->graph_name = catalog_name;
+        g_catalog.emplace(session->graph_name, session);
     }
     session->open = true;
     *out = session;
@@ -440,6 +530,14 @@ int32_t kimix_gdb_open(const kimix_gdb_open_options *options, kimix_gdb_session 
 void kimix_gdb_close(kimix_gdb_session *session) {
     if (session == nullptr) {
         return;
+    }
+    if (!session->graph_name.empty()) {
+        std::lock_guard<std::mutex> lock(g_catalog_mutex);
+        auto entry = g_catalog.find(session->graph_name);
+        if (entry != g_catalog.end() && entry->second == session) {
+            g_catalog.erase(entry);
+        }
+        session->graph_name.clear();
     }
     session->database.close();
     session->open = false;
@@ -459,6 +557,39 @@ int32_t kimix_gdb_capabilities(kimix_gdb_session *session, kimix_gdb_capability 
     out->supports_global_aggregates = capability.supports_global_aggregates ? 1 : 0;
     out->supports_collective_transactions = capability.supports_collective_transactions ? 1 : 0;
     out->enforces_unique_external_ids = capability.enforces_unique_external_ids ? 1 : 0;
+    return KIMIX_GDB_OK;
+}
+
+int32_t kimix_gdb_catalog_contains(const char *name, size_t name_len, uint8_t *out_exists) {
+    if (name == nullptr || name_len == 0 || out_exists == nullptr) {
+        return KIMIX_GDB_ERR_ARGUMENT;
+    }
+    kimix::string key{name, name + name_len};
+    std::lock_guard<std::mutex> lock(g_catalog_mutex);
+    *out_exists = g_catalog.find(key) != g_catalog.end() ? 1 : 0;
+    return KIMIX_GDB_OK;
+}
+
+int32_t kimix_gdb_catalog_count(size_t *out_count) {
+    if (out_count == nullptr) {
+        return KIMIX_GDB_ERR_ARGUMENT;
+    }
+    std::lock_guard<std::mutex> lock(g_catalog_mutex);
+    *out_count = g_catalog.size();
+    return KIMIX_GDB_OK;
+}
+
+int32_t kimix_gdb_session_graph_name(kimix_gdb_session *session, char *buffer, size_t capacity,
+                                     size_t *out_len) {
+    if (session == nullptr || out_len == nullptr) {
+        return KIMIX_GDB_ERR_ARGUMENT;
+    }
+    size_t const needed = session->graph_name.size();
+    *out_len = needed;
+    if (buffer == nullptr || capacity < needed) {
+        return KIMIX_GDB_ERR_BUFFER;
+    }
+    std::memcpy(buffer, session->graph_name.data(), needed);
     return KIMIX_GDB_OK;
 }
 
@@ -695,17 +826,20 @@ int32_t vertex_properties_read(kimix_gdb_session *session, kimix_gdb_guid vertex
     if (session == nullptr) {
         return KIMIX_GDB_ERR_ARGUMENT;
     }
-    kimix::Guid const uid = to_guid(vertex);
-    if (!session->database.graph().contains(uid)) {
-        return KIMIX_GDB_ERR_VERTEX;
-    }
-    if (what == 0) {
-        kimix::vector<std::pair<PropNameId, PropertyValue>> properties;
-        collect_vertex_properties(session->database, uid, properties);
-        return code_of(write_properties(
-            properties, static_cast<kimix_gdb_property_record *>(raw_items), capacity, scratch,
-            scratch_capacity, out_count, out_scratch));
-    }
+      kimix::Guid const uid = to_guid(vertex);
+        if (what == 0) {
+            // Plan v3 §4.3: one pass straight from the bag into the caller's
+            // record + scratch buffers (no PropertyList / (id, value) copies).
+            // The single find below doubles as the existence check (no separate
+            // contains() hash lookup).
+            kimix::graph_db::Vertex *vertex = session->database.graph().find(uid);
+            if (vertex == nullptr) {
+                return KIMIX_GDB_ERR_VERTEX;
+            }
+          return code_of(write_vertex_property_records(
+              *vertex, static_cast<kimix_gdb_property_record *>(raw_items), capacity, scratch,
+              scratch_capacity, out_count, out_scratch));
+      }
       auto *items = static_cast<kimix_gdb_property_type *>(raw_items);
       // Property TYPES: the declaration of every property the vertex carries.
       kimix::graph_db::PropertyTypeList types;
@@ -925,23 +1059,25 @@ int32_t kimix_gdb_edge_property_types(kimix_gdb_session *session, kimix_gdb_guid
 
 int32_t kimix_gdb_edge_create(kimix_gdb_session *session, kimix_gdb_guid origin,
 kimix_gdb_guid target, uint8_t direction, const uint32_t *labels,
-size_t label_count, const kimix_gdb_property *properties,
-size_t property_count, kimix_gdb_guid *out_edge) {
-    if (session == nullptr || (labels == nullptr && label_count != 0)) {
-        return KIMIX_GDB_ERR_ARGUMENT;
-    }
-    kimix_gdb_edge_spec spec{};
-    spec.origin = origin;
-    spec.target = target;
-    spec.direction = direction;
-    spec.labels = labels;
-    spec.label_count = label_count;
-    spec.properties = properties;
-    spec.property_names = nullptr;
-    spec.property_count = 0; // unnamed properties are not accepted (see the header)
-    (void)property_count;
-    kimix::graph_db::PropertyList list;
-    named_properties(spec, list);
+size_t label_count, const uint32_t *property_names,
+const kimix_gdb_property *properties, size_t property_count,
+kimix_gdb_guid *out_edge) {
+ if (session == nullptr || (labels == nullptr && label_count != 0) ||
+     (property_names == nullptr && property_count != 0) ||
+     (properties == nullptr && property_count != 0)) {
+ return KIMIX_GDB_ERR_ARGUMENT;
+ }
+ kimix_gdb_edge_spec spec{};
+ spec.origin = origin;
+ spec.target = target;
+ spec.direction = direction;
+ spec.labels = labels;
+ spec.label_count = label_count;
+ spec.properties = properties;
+ spec.property_names = property_names;
+ spec.property_count = property_count;
+ kimix::graph_db::PropertyList list;
+ named_properties(spec, list);
     kimix::Guid edge;
     GdiStatus const status = session->database.edge_create(
         to_guid(origin), to_guid(target),
@@ -1142,6 +1278,170 @@ int32_t kimix_gdb_exists_neighbor(kimix_gdb_session *session, kimix_gdb_guid ver
         return code_of(status);
     }
     *out_exists = exists ? 1 : 0;
+    return KIMIX_GDB_OK;
+}
+
+int32_t kimix_gdb_traverse_bfs(kimix_gdb_session *session, kimix_gdb_guid start,
+                               uint32_t constraint, uint8_t orientation, int64_t cap_per_level,
+                               uint32_t max_depth, kimix_gdb_traversal_vertex *items,
+                               size_t capacity, size_t *out_count) {
+    if (session == nullptr || out_count == nullptr) {
+        return KIMIX_GDB_ERR_ARGUMENT;
+    }
+    if (cap_per_level < 1 || max_depth < 1 ||
+        max_depth > kimix::graph_db::Graph::kMaxNativeHopDepth) {
+        return KIMIX_GDB_ERR_ARGUMENT;
+    }
+    kimix::graph_db::Constraint resolved;
+    GdiStatus status = resolve_constraint(session, constraint, resolved);
+    if (is_error(status)) {
+        return code_of(status);
+    }
+    EdgeOrientation const direction = orientation == KIMIX_GDB_ORIENTATION_OUTGOING
+                                          ? EdgeOrientation::outgoing
+                                      : orientation == KIMIX_GDB_ORIENTATION_INCOMING
+                                          ? EdgeOrientation::incoming
+                                          : EdgeOrientation::both;
+    kimix::vector<kimix::graph_db::Graph::TraversalVertex> walk;
+    status = session->database.traverse_bfs(to_guid(start), resolved, direction, cap_per_level,
+                                            max_depth, walk);
+    if (is_error(status)) {
+        return code_of(status);
+    }
+    *out_count = walk.size();
+    if (items == nullptr) {
+        return KIMIX_GDB_OK;
+    }
+    if (walk.size() > capacity) {
+        return KIMIX_GDB_ERR_BUFFER;
+    }
+    for (size_t i = 0; i < walk.size(); ++i) {
+        items[i].vertex = from_guid(walk[i].guid);
+        items[i].parent = from_guid(walk[i].parent);
+        items[i].depth = walk[i].depth;
+        items[i].reserved = 0;
+    }
+    return KIMIX_GDB_OK;
+}
+
+int32_t kimix_gdb_shortest_path(kimix_gdb_session *session, kimix_gdb_guid from,
+                                kimix_gdb_guid to, uint32_t max_depth, kimix_gdb_guid *items,
+                                size_t capacity, size_t *out_count) {
+    if (session == nullptr || out_count == nullptr) {
+        return KIMIX_GDB_ERR_ARGUMENT;
+    }
+    if (max_depth < 1 || max_depth > kimix::graph_db::Graph::kMaxNativeHopDepth) {
+        return KIMIX_GDB_ERR_ARGUMENT;
+    }
+    kimix::vector<kimix::Guid> path;
+    GdiStatus const status =
+        session->database.shortest_path(to_guid(from), to_guid(to), max_depth, path);
+    if (is_error(status)) {
+        return code_of(status);
+    }
+    *out_count = path.size();
+    if (items == nullptr) {
+        return KIMIX_GDB_OK;
+    }
+    if (path.size() > capacity) {
+        return KIMIX_GDB_ERR_BUFFER;
+    }
+    for (size_t i = 0; i < path.size(); ++i) {
+        items[i] = from_guid(path[i]);
+    }
+    return KIMIX_GDB_OK;
+}
+
+int32_t kimix_gdb_scan_vertices(kimix_gdb_session *session, uint32_t constraint, int64_t cap,
+                                kimix_gdb_guid *items, size_t capacity, size_t *out_count,
+                                size_t *out_total) {
+    if (session == nullptr) {
+        return KIMIX_GDB_ERR_ARGUMENT;
+    }
+    Constraint resolved;
+    GdiStatus status = resolve_constraint(session, constraint, resolved);
+    if (is_error(status)) {
+        return code_of(status);
+    }
+    kimix::graph_db::VertexPage page;
+    int64_t const effective_cap = items == nullptr ? 0 : cap;
+    status = session->database.scan_vertices(resolved, effective_cap, page);
+    if (is_error(status)) {
+        return code_of(status);
+    }
+    if (out_total != nullptr) {
+        *out_total = page.total_count;
+    }
+    if (out_count != nullptr) {
+        *out_count = page.items.size();
+    }
+    if (items == nullptr) {
+        return KIMIX_GDB_OK;
+    }
+    if (page.items.size() > capacity) {
+        return KIMIX_GDB_ERR_BUFFER;
+    }
+    for (size_t i = 0; i < page.items.size(); ++i) {
+        items[i] = from_guid(page.items[i]);
+    }
+    return KIMIX_GDB_OK;
+}
+
+int32_t kimix_gdb_aggregate(kimix_gdb_session *session, uint32_t constraint, uint32_t property,
+                            int32_t function, uint8_t *scratch, size_t scratch_capacity,
+                            kimix_gdb_aggregate_result *out) {
+    if (session == nullptr || out == nullptr) {
+        return KIMIX_GDB_ERR_ARGUMENT;
+    }
+    Constraint resolved;
+    GdiStatus status = resolve_constraint(session, constraint, resolved);
+    if (is_error(status)) {
+        return code_of(status);
+    }
+    AggregateSpec spec;
+    spec.constraint = resolved;
+    spec.property = PropNameId{property};
+    spec.function = static_cast<GdiAggregate>(function);
+    AggregateResult result;
+    status = session->database.aggregate_vertices(spec, result);
+    if (is_error(status)) {
+        return code_of(status);
+    }
+    out->matched = result.matched;
+    out->valued = result.valued;
+    out->has_value = result.has_value ? 1 : 0;
+    out->int64_value = 0;
+    out->double_value = 0.0;
+    out->string_offset = 0;
+    out->string_len = 0;
+    for (size_t i = 0; i < sizeof(out->reserved); ++i) {
+        out->reserved[i] = 0;
+    }
+    switch (result.value.kind()) {
+    case PropertyKind::int64_value:
+        out->value_kind = KIMIX_GDB_VALUE_INT64;
+        out->int64_value = result.value.as_int64();
+        break;
+    case PropertyKind::double_value:
+        out->value_kind = KIMIX_GDB_VALUE_DOUBLE;
+        out->double_value = result.value.as_double();
+        break;
+    case PropertyKind::string: {
+        kimix::string_view const text = result.value.as_string();
+        out->value_kind = KIMIX_GDB_VALUE_STRING;
+        if (scratch == nullptr || text.size() > scratch_capacity) {
+            out->string_len = static_cast<uint32_t>(text.size());
+            return KIMIX_GDB_ERR_BUFFER;
+        }
+        std::memcpy(scratch, text.data(), text.size());
+        out->string_offset = 0;
+        out->string_len = static_cast<uint32_t>(text.size());
+        break;
+    }
+    default:
+        out->value_kind = KIMIX_GDB_VALUE_NONE;
+        break;
+    }
     return KIMIX_GDB_OK;
 }
 

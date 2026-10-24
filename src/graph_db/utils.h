@@ -54,8 +54,9 @@
  */
 #pragma once
 
-#include "graph_db_api.h"
-#include "property.h"
+  #include "graph_db_api.h"
+  #include "graph_db_options.h"
+  #include "property.h"
 
 #include <core/guid.h>
 #include <core/lmdb.h>
@@ -142,9 +143,16 @@ KIMIX_GRAPH_DB_API void edge_key(kimix::Guid const &edge_id,
 [[nodiscard]] KIMIX_GRAPH_DB_API kimix::optional<kimix::Guid>
 edge_from_key(kimix::span<const std::byte> key) noexcept;
 
-// MD5 of an opaque byte blob (the content hash cached on a Vertex).
-[[nodiscard]] KIMIX_GRAPH_DB_API kimix::MD5
-md5_of(kimix::span<const std::byte> bytes) noexcept;
+  // MD5 of an opaque byte blob (the content hash cached on a Vertex).
+  [[nodiscard]] KIMIX_GRAPH_DB_API kimix::MD5
+  md5_of(kimix::span<const std::byte> bytes) noexcept;
+
+  // The policy-aware content digest (plan v3 §4.5): md5 for the historical
+  // default, XXH3-128 behind GraphOptions::content_digest. Both are 128-bit
+  // values carried in the same kimix::MD5 container, so callers (Vertex,
+  // serializer) switch policy without a type change.
+  [[nodiscard]] KIMIX_GRAPH_DB_API kimix::MD5
+  content_digest_of(kimix::span<const std::byte> bytes, ContentDigest policy) noexcept;
 
 // ---------------------------------------------------------------------------
 // Vertex record

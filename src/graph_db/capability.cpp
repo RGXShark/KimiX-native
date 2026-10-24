@@ -8,6 +8,8 @@
  */
 #include "capability.h"
 
+#include "graph.h" // Graph::kMaxNativeHopDepth — the advertised bound
+
 namespace kimix::graph_db {
 
 Capability current_capability() noexcept {
@@ -20,14 +22,23 @@ Capability current_capability() noexcept {
     // save/load, and they carry labels and properties.
     cap.supports_edge_by_stable_uid = true;
     cap.supports_edge_property_read = true;
-    // P6: begin_collective/close_collective install a read-only scope.
-    cap.supports_collective_transactions = true;
-    // P9 (deferred): global scan, native multi-hop, global aggregates.
-    cap.supports_global_scan = false;
-    cap.supports_native_multi_hop = false;
-    cap.max_native_hop_depth = 0;
-    cap.supports_global_aggregates = false;
-    return cap;
+      // P6: begin_collective/close_collective install a read-only scope.
+      cap.supports_collective_transactions = true;
+      // P9/G3 (plan v3 step 1.6): native multi-hop traversal — Graph::
+      // traverse_bfs / the bounded shortest_path, exposed through Database,
+      // the C ABI (kimix_gdb_traverse_bfs / _shortest_path) and the
+      // kimix_graphdb_* re-exports.  The advertised depth is the real bound
+      // the implementation validates against (Graph::kMaxNativeHopDepth).
+      cap.supports_native_multi_hop = true;
+      cap.max_native_hop_depth = static_cast<int32_t>(Graph::kMaxNativeHopDepth);
+    // P9/G1+G4 (plan v3 steps 2.1-2.4): global scan (Graph::for_each_vertex
+    // + Database::scan_vertices, the kimix_gdb_scan_vertices call) and global
+    // aggregates (Database::aggregate_vertices with the fiber fan-out, the
+    // kimix_gdb_aggregate call). Both walk the shards with SHARED locks only
+    // and are exposed through the C ABI.
+    cap.supports_global_scan = true;
+    cap.supports_global_aggregates = true;
+      return cap;
 }
 
 kimix::vector<kimix::string> capability_name_diff(Capability const &lhs,
