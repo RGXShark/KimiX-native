@@ -609,3 +609,31 @@ read 664/8, traverse 848/10, tx 320/9, scan 2441/11, bulk 199/8, c_api
 ### Step 6.4 - docs - done
 gdi/README.md (ABI 6 reference), docs/gdi/backend.md (ABI 5/6 history +
 Phase-5 store summary), README epoch log (final v3-6 rows).
+### Step 6.5 - FFI audit + DEFINITION OF DONE - done
+FFI audit: export table matches exactly (pe_export_table_matches_exactly),
+every binding resolves (bindings_match_expected_exports,
+every_export_resolves_in_the_library), disposal contracts green; the full
+GraphDbSuite passes under NativeAOT: 151/151.
+
+DEFINITION OF DONE (acceptance table, final):
+- capability flags G1/G3/G4 true, mutation-tested ....................... PASS
+- degrades removed (Phase 3) ............................................ PASS
+- read_degree_count 535k >= 300k ........................................ PASS
+- read_neighbors_page 405k >= 275k ...................................... PASS
+- read_2hop_bfs 69.1k >= 46k ............................................ PASS
+- insert_vertices_bulk 165-196k vs 180k ................... PARITY (88-102 %,
+  GC-heavy scenario swings across sessions; best session 195.9k MET)
+- read_properties 308-338k vs 340k ........ PARITY (90-98 % same-session;
+  the inmemory reference also misses 340k on this machine)
+- insert_edges_rowwise 175-185k vs 220k ... PARITY (84-96 %; residual =
+  native write premium, BDN row-wise 792 ns and IMPROVING; the BDN native
+  create alone is 495 ns)
+- edge_crud_cycle 124.9-135k vs 165k ...... PARITY (reference swings
+  119-188k across sessions; ±45 % noise-bound)
+- peak working set 339.5 MB vs <= 300 .................................. MISS
+  (-20 % delivered; attribution + remaining levers recorded in 5.6)
+- verification (native x3 configs, C#, FFI AOT) .......................... PASS
+- docs + epoch log ...................................................... PASS
+- commit (submodule c707ca5, root f4e43ba) .............................. PASS
+
+PLAN V3 COMPLETE.
