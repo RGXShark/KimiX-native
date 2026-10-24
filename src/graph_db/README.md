@@ -723,6 +723,8 @@ full re-run closes the epoch. Rows here, detail there.
 | " | " | v3-6 | native store, projected 50k/300k (final, staged RSS) | 261.2 MB | 187.7 MB | -28 % across 5.2-5.4; edge 433.0 B, vertex keyed 1,153 B |
 | " | " | v3-6 | edge_create_rowwise (native bench, final) | 935.7 ns | 495.3 ns | -47 % (5.2 de-dup + 5.3 slim journal); reads flat (degree 281.7 ns, page 278.9 ns, 2hop 255.7 ns) |
 | " | " | v3-6 | verification sweep | — | 15 suites x (release + debug + ASan/UBSan) | all green; C# 57/57 + 44/44; FFI AOT 151/151 |
+| " | " | v3-6.6 | read_aggregate_avg (graphbench e2e) | 129 ops/s | 1,634 ops/s | 12.7x: zero-copy constraint probes (Vertex::find_property + matches_probe), no per-vertex property copies |
+| " | " | v3-6.6 | read_filtered_neighbors (graphbench e2e) | 93k ops/s | 208.5k ops/s | 2.2x (158 % parity): one-lock adjacency snapshot + probe filter, no per-edge endpoint lookups |
 
 v3-4.1 change: the UNFILTERED neighbourhood read (empty constraint, any cap,
 the cap-0 degree probe included) answers from ONE shard SHARED lock snapshot

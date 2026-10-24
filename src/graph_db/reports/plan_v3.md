@@ -637,3 +637,31 @@ DEFINITION OF DONE (acceptance table, final):
 - commit (submodule c707ca5, root f4e43ba) .............................. PASS
 
 PLAN V3 COMPLETE.
+### Step 6.6 - epoch: zero-copy constraint evaluation (post-plan continuation) - done
+- Finding: three per-entity hot loops deep-copied EVERY property value to
+  evaluate a constraint or reduce an aggregate - the aggregate fan-out, the
+  filtered global scan and filtered traversal rebuilt a PropertyBag from a
+  property_list() copy PER VERTEX (a 256-char string property = a heap alloc
+  + memcpy per vertex per read), and the filtered neighbourhood read did the
+  same PER NEIGHBOUR plus a shard-locked edge_endpoints round-trip PER EDGE.
+  read_aggregate_avg was 129 ops/s (9 % of the inmemory reference).
+- Change: Vertex::find_property (zero-copy probe via visit_properties, one
+  leaf shared lock), kimix::graph_db::matches_probe (the constraint loop over
+  a probe callback; identical AND-of-get-by-name semantics), and:
+  1. scan_shard (aggregate): probe-based filter + single-visit zero-copy
+     reduce (no property_list at all);
+  2. scan_vertices: probe-based filter;
+  3. traverse_bfs: probe-based candidate filter;
+  4. get_neighbor_vertices filtered path: the same one-lock adjacency
+     snapshot the unfiltered path uses (neighbour guids come from the link
+     entries - the per-edge endpoint lookups are gone) + probe filter.
+- Gate (graphbench kimix 50k/300k, fresh all-backend run):
+  read_aggregate_avg 129 -> 1,634 ops/s (94 % parity, 12.7x);
+  read_filtered_neighbors 93k -> 208.5k ops/s (158 % parity, 2.2x);
+  read_scan_page 912 -> 2,178 ops/s (245 %); insert_vertices_bulk
+  207.7k = 104 % parity (the >=180k target MET absolutely);
+  read_properties 97 %; unfiltered reads flat (degree 535k, page 408k,
+  2hop 71.6k). No tracked scenario regressed.
+- Verification: 15 suites release green; ASan/UBSan green on the six
+  touched suites; C# 57/57 + 44/44. Report.md regenerated (inmemory /
+  kimix / rma; neo4j excluded).

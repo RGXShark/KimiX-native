@@ -1360,14 +1360,16 @@ GdiStatus Graph::traverse_bfs(kimix::Guid const &start, Constraint const &constr
                     }
                     candidate_labels.clear();
                     vertex->labels(candidate_labels);
-                    PropertyBag bag;
-                    PropertyList list = vertex->property_list();
-                    for (auto const &entry : list) {
-                        bag.emplace(entry.name, entry.value);
-                    }
-                    if (!matches(constraint, kimix::span<const LabelId>{candidate_labels.data(),
-                                                                        candidate_labels.size()},
-                                 bag)) {
+                    // §6.6 zero-copy: probe the borrowed values through one
+                    // leaf shared lock instead of deep-copying every property
+                    // of every candidate vertex.
+                    auto probe = [vertex](PropNameId name) -> PropertyValue const * {
+                        return vertex->find_property(name);
+                    };
+                    if (!matches_probe(constraint,
+                                       kimix::span<const LabelId>{candidate_labels.data(),
+                                                                  candidate_labels.size()},
+                                       probe)) {
                         continue;
                     }
                 }

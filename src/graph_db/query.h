@@ -133,4 +133,40 @@ matches(Constraint const &constraint, kimix::span<const LabelId> labels,
 [[nodiscard]] KIMIX_GRAPH_DB_API bool
 has_label(kimix::span<const LabelId> labels, LabelId label) noexcept;
 
+// PLAN V3 §6.6 zero-copy form: `probe(name)` returns the BORROWED value or
+// nullptr (Vertex::find_property supplies it). Identical semantics to the two
+// owned-forms above - a condition is an AND of get-by-name probes - but hot
+// loops (aggregate fan-out, filtered scans/traversals) evaluate a constraint
+// per vertex without deep-copying the property payload.
+template <typename Probe>
+[[nodiscard]] bool matches_probe(Constraint const &constraint,
+                                 kimix::span<const LabelId> labels,
+                                 Probe &&probe) noexcept {
+    for (auto const &condition : constraint.conditions) {
+        if (condition.is_label()) {
+            bool const present = has_label(labels, condition.label);
+            if (condition.op == GdiOp::equal) {
+                if (!present) {
+                    return false;
+                }
+            } else if (condition.op == GdiOp::not_equal) {
+                if (present) {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+            continue;
+        }
+        PropertyValue const *actual = probe(condition.property);
+        if (actual == nullptr) {
+            return false;
+        }
+        if (!evaluate(condition.op, *actual, condition.value)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace kimix::graph_db

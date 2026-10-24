@@ -1288,38 +1288,41 @@ GdiStatus Database::get_neighbor_vertices(kimix::Guid const &uid,
         out = make_page(std::move(matches), cap);
         return GdiStatus::ok;
     }
-    kimix::vector<EdgeId> ids;
-    _graph.incident_edges(uid, orientation, ids);
+    // §6.6: the filtered path uses the SAME one-lock adjacency snapshot as the
+    // unfiltered path (the link entries carry the neighbour guid, so the old
+    // incident_edges + per-edge edge_endpoints round-trips - a shard-locked
+    // map lookup PER EDGE - are gone), and evaluates the constraint through
+    // the zero-copy probe (no per-neighbour property_list deep copy: a
+    // 256-char string property was a heap alloc + memcpy per neighbour).
+    AdjacencyBuffer adjacency;
+    if (!_graph.oriented_adjacency(uid, orientation, adjacency)) {
+        return GdiStatus::error_vertex;
+    }
     kimix::vector<kimix::Guid> matches;
     kimix::unordered_set<kimix::Guid> seen;
-    matches.reserve(ids.size());
-    seen.reserve(ids.size());
-    for (auto const &id : ids) {
-        kimix::Guid origin;
-        kimix::Guid target;
-        if (!_graph.edge_endpoints(id, origin, target)) {
-            continue;
-        }
-        kimix::Guid const neighbour = origin == uid ? target : origin;
-        if (!seen.insert(neighbour).second) {
+    matches.reserve(adjacency.size());
+    seen.reserve(adjacency.size());
+    kimix::vector<LabelId> labels; // reused across neighbours
+    for (auto const &guid : adjacency) {
+        if (!seen.insert(guid).second) {
             continue; // a neighbour is returned once (multi-edges collapse)
         }
-        Vertex *other = _graph.find(neighbour);
+        Vertex *other = _graph.find(guid);
         if (other == nullptr) {
             continue; // a missing endpoint is skipped, not an error
         }
         // §5.10: a NEIGHBOURHOOD read filters the neighbour vertex, not the edge.
-        kimix::vector<LabelId> labels;
+        labels.clear();
         other->labels(labels);
-        PropertyBag properties;
-        PropertyList list = other->property_list();
-        for (auto const &entry : list) {
-            properties.emplace(entry.name, entry.value);
-        }
-        if (!kimix::graph_db::matches(resolved, labels, properties)) {
+        auto probe = [other](PropNameId name) -> PropertyValue const * {
+            return other->find_property(name);
+        };
+        if (!kimix::graph_db::matches_probe(
+                resolved, kimix::span<const LabelId>{labels.data(), labels.size()},
+                probe)) {
             continue;
         }
-        matches.push_back(neighbour);
+        matches.push_back(guid);
     }
     out = make_page(std::move(matches), cap);
     return GdiStatus::ok;
@@ -1401,17 +1404,16 @@ GdiStatus Database::traverse_bfs(kimix::Guid const &start, Constraint const &con
               // lock while the shard SHARED lock is held — the documented
               // shard-before-vertex order.
               labels.clear();
-              vertex.labels(labels);
-              PropertyBag bag;
-              PropertyList list = vertex.property_list();
-              for (auto const &entry : list) {
-                  bag.emplace(entry.name, entry.value);
-              }
-              if (!kimix::graph_db::matches(resolved,
-                                            kimix::span<const LabelId>{labels.data(), labels.size()},
-                                            bag)) {
-                  return true; // keep scanning
-              }
+vertex.labels(labels);
+// §6.6 zero-copy constraint probe (see scan_shard).
+auto probe = [&vertex](PropNameId name) -> PropertyValue const * {
+return vertex.find_property(name);
+};
+if (!kimix::graph_db::matches_probe(
+resolved, kimix::span<const LabelId>{labels.data(), labels.size()},
+probe)) {
+return true; // keep scanning
+}
           }
           found.push_back(vertex.guid());
           return true;
@@ -1527,33 +1529,33 @@ GdiStatus Database::traverse_bfs(kimix::Guid const &start, Constraint const &con
           kimix::vector<LabelId> labels; // filtered path only, reused per vertex
           _graph.for_each_vertex(shard, shard + 1, [&](Vertex const &vertex) {
               if (filtered) {
-                  labels.clear();
-                  vertex.labels(labels);
-                  PropertyBag bag;
-                  PropertyList list = vertex.property_list();
-                  for (auto const &entry : list) {
-                      bag.emplace(entry.name, entry.value);
-                  }
-                  if (!kimix::graph_db::matches(
-                          resolved, kimix::span<const LabelId>{labels.data(), labels.size()},
-                          bag)) {
-                      return true;
-                  }
-              }
-              ++partial.matched;
-              if (!reduces_property) {
-                  return true;
-              }
-              PropertyList list = vertex.property_list();
-              for (auto const &entry : list) {
-                  if (entry.name != spec.property) {
-                      continue;
-                  }
-                  ++partial.valued;
-                  aggregate_accumulate(partial, spec.function, entry.value);
-                  break;
-              }
-              return true;
+labels.clear();
+vertex.labels(labels);
+// §6.6 zero-copy: probe the borrowed values through one leaf
+// shared lock instead of deep-copying every property per vertex.
+auto probe = [&vertex](PropNameId name) -> PropertyValue const * {
+return vertex.find_property(name);
+};
+if (!kimix::graph_db::matches_probe(
+resolved, kimix::span<const LabelId>{labels.data(), labels.size()},
+probe)) {
+return true;
+}
+}
+++partial.matched;
+if (!reduces_property) {
+return true;
+}
+// §6.6 zero-copy reduce: one visitor pass, no property copies.
+vertex.visit_properties([&](PropNameId name, PropertyValue const &value) {
+if (name != spec.property) {
+return true;
+}
+++partial.valued;
+aggregate_accumulate(partial, spec.function, value);
+return false;
+});
+return true;
           });
       };
       // Fan-out: one fiber per shard when a scheduler with workers is bound;

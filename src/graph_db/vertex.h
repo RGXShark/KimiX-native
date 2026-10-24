@@ -186,6 +186,23 @@ public:
       // it dies with the call, so a visitor that keeps it must copy. Use this
       // on hot read paths instead of properties(), which deep-copies every
       // value (a string/blob property costs an allocation per copy).
+      // Zero-copy property probe (plan v3 §6.6): the BORROWED value or
+      // nullptr, via one leaf shared lock and no copies. The aggregate
+      // fan-out, filtered scan and filtered traversal paths use this instead
+      // of property_list() — a deep copy of every value (a 256-char string
+      // property was a heap alloc + memcpy PER VERTEX PER READ).
+      [[nodiscard]] PropertyValue const *find_property(PropNameId name) const {
+          PropertyValue const *found = nullptr;
+          visit_properties([name, &found](PropNameId n, PropertyValue const &value) {
+              if (n == name) {
+                  found = &value;
+                  return false;
+              }
+              return true;
+          });
+          return found;
+      }
+
       template <typename Visitor>
       void visit_properties(Visitor &&visitor) const {
           VertexSharedLock guard(const_cast<kimix::shared_atomic_mutex &>(_mutex));
