@@ -96,6 +96,34 @@ test_proj("test_pool", "unit/core/test_pool.cpp")
 test_proj("test_first_fit", "unit/core/test_first_fit.cpp")
 test_proj("test_string_scratch", "unit/core/test_string_scratch.cpp")
 test_proj("test_binary_file_stream", "unit/core/test_binary_file_stream.cpp")
+-- unit/core (xNVMe-backed reader mirroring kimix::BinaryFileStream)
+test_proj("test_xnvme_file_stream", "unit/core/test_xnvme_file_stream.cpp")
+-- unit/core (Phase 4: kimix::DeferredBinaryFileStream — recorded reads committed
+-- as one batch through the xNVMe async queue / overlapped batch).
+test_proj("test_deferred_binary_file_stream", "unit/core/test_deferred_binary_file_stream.cpp")
+-- unit/core (Phase 5: kimix::BinaryFileWriter + kimix::DeferredBinaryWriter —
+-- the xNVMe-backed write side).
+test_proj("test_binary_file_writer", "unit/core/test_binary_file_writer.cpp")
+-- unit/core (Phase 3 throughput benchmark: kimix::BinaryFileStream vs
+-- kimix::XnvmeBinaryFileStream over a generated 1 GiB data file).
+--
+-- Plain main(), NOT a Boost.UT suite, and deliberately registered WITHOUT
+-- add_tests("default"): one run reads several GiB and takes seconds, so it must
+-- stay out of `xmake test`. Build and run it explicitly via
+--   xmake build bench_binary_file_stream
+--   xmake run bench_binary_file_stream [file_mib] [chunk_kib] [reps]
+-- The structure mirrors test_proj() otherwise (same deps/includedirs/config),
+-- including "no KIMIX_CORE_STATIC": KIMIX_CORE_API resolves as dllimport and
+-- the binary links kimix-core.dll from the shared bin/<mode> directory.
+-- No exception setting is needed either (only tests/ut/ut.hpp requires them),
+-- and no before_run PATH hack: this binary never loads runtime_py.
+target("bench_binary_file_stream")
+    set_kind("binary")
+    add_files("unit/core/bench_binary_file_stream.cpp")
+    add_includedirs("./")
+    add_deps("kimix-core")
+    _config_project({batch_size = 8})
+target_end()
 test_proj("test_clock", "unit/core/test_clock.cpp")
 test_proj("test_format", "unit/core/test_format.cpp")
 test_proj("test_json_repair", "unit/core/test_json_repair.cpp")

@@ -1,6 +1,6 @@
 ---
 name: cpp
-description: KimixBase C++ core library usage guide. Use when writing or editing C++ code in this project — covers namespace kimix, STL wrappers, Vector/Matrix, hashing, memory/pool, JSON repair, threading, platform, and I/O.
+description: KimixBase C++ core library usage guide. Use when writing or editing C++ code in this project — covers namespace kimix, STL wrappers, Vector/Matrix, hashing, memory/pool, JSON repair, threading, platform, and file I/O (including the xNVMe-backed BinaryFileStream/writer classes).
 ---
 
 # KimixBase Core Library (`src/core/`)
@@ -325,7 +325,7 @@ if (stream) {
 Also `length()`, `position()`, `is_open()`, `close()`, `explicit operator bool()`; constructible from an existing `FILE*`; move-only. Opening a missing file leaves the stream closed (`!stream`) instead of throwing.
 
 ### `kimix::BinaryFileWriteStream` (write) — not header-visible
-`write(const void*, size_t)` / `write(std::span<const kimix::byte>)` / `close()` / `is_open()` are defined **only inside `binary_file_stream.cpp`** and declared in no header, so they are not usable from other translation units. Use `BinaryFileStream` + `FILE*` (`fopen`), `std::ofstream`, or `kimix::DefaultBinaryIO` for writing.
+`write(const void*, size_t)` / `write(std::span<const kimix::byte>)` / `close()` / `is_open()` are defined **only inside `binary_file_stream.cpp`** and declared in no header, so they are not usable from other translation units. Use `BinaryFileStream` + `FILE*` (`fopen`), `std::ofstream`, or `kimix::DefaultBinaryIO` for writing — or the compiled, header-visible `kimix::BinaryFileWriter` below (positioned writes through xNVMe).
 
 ### `kimix::BinaryIO` / `kimix::DefaultBinaryIO`
 Abstract interface for shader source/cache I/O:
@@ -335,6 +335,82 @@ kimix::string src;
 io.read_shader_source("shader.glsl", src);
 io.write_shader_cache("shader.bin", byte_span);
 ```
+
+### `kimix::XnvmeBinaryFileStream` (read) / `kimix::BinaryFileWriter` (write) — xNVMe-backed
+
+Opt-in includes — these classes are deliberately **not** in `kimix_core.h`:
+
+```cpp
+#include <core/binary_file_stream_xnvme.h>     // kimix::XnvmeBinaryFileStream
+#include <core/deferred_binary_file_stream.h>  // kimix::DeferredBinaryFileStream
+#include <core/binary_file_writer.h>           // kimix::BinaryFileWriter, kimix::DeferredBinaryWriter
+```
+
+They mirror `BinaryFileStream` step for step (same method names, move-only, non-throwing: an unopenable path leaves the object closed, `is_open() == false`, and every call is then a no-op reporting 0 bytes / `false`), but are compiled **out-of-line with `KIMIX_CORE_API`** instead of header-inline. Reason: what they wrap is not the CRT but the vendored xNVMe static library, which must be linked into `kimix-core` exactly once so its process-global state (backend tables, device registry) is instantiated once for every module. Consumers never include `<libxnvme.h>` — `struct xnvme_dev` stays opaque; on Windows xnvme itself is MinGW-compiled while these classes are compiled by MSVC, and the C call layer in between is `src/core/binary_file_stream_xnvme_shim.c`.
+
+Reading (`#include <core/binary_file_stream_xnvme.h>`):
+
+```cpp
+kimix::XnvmeBinaryFileStream stream("data.bin"); // opened read-only through xnvme_file_open
+if (!stream) { /* missing / unopenable */ }
+kimix::byte buf[64 * 1024];
+size_t n = stream.read(buf, sizeof(buf));       // positioned pread at the current position
+n = stream.read(std::span<kimix::byte>(buf));   // span form
+stream.set_pos(12345);                          // uint64_t; the next read is positioned (no seek syscall)
+uint64_t pos = stream.position();
+size_t len = stream.length();                   // captured at open via filesystem::file_size (0 if unknown)
+auto all = stream.read_all();                   // vector<kimix::byte>, one pread from offset 0; position ends after the data
+stream.close();
+```
+
+`set_pos` / `position` / `length` are `uint64_t` / `size_t` here (`BinaryFileStream` uses a 32-bit `long`). `read()` / `read_all()` speak `kimix::byte` (= `int8_t`), like the rest of core file I/O. `read()` returns 0 at EOF, on a closed stream or on error; a short read at the tail is a *success* with a short count (pread(2) semantics), so loop until 0.
+
+Writing (`#include <core/binary_file_writer.h>`):
+
+```cpp
+kimix::BinaryFileWriter writer("out.bin");       // create + truncate
+kimix::BinaryFileWriter patch("out.bin", false); // truncate = false: keeps existing content (positioned overwrite)
+if (!writer) { /* unopenable (empty path, missing dir, Windows >= 2 GiB) */ }
+size_t n = writer.write(buf, size);             // all-or-nothing: n == size, or 0
+n = writer.write(std::span<const kimix::byte>(buf));
+writer.set_pos(4096);                           // an offset beyond EOF extends the file
+uint64_t pos = writer.position();
+if (!writer.sync()) { /* fsync / FlushFileBuffers failed */ }
+writer.close();                                 // note: close() does NOT sync
+```
+
+Batching — record first, issue later (both families):
+
+```cpp
+kimix::DeferredBinaryFileStream batch;
+kimix::vector<kimix::byte> a(4096), b(1024);
+batch.add_read("a.bin", 12345, a.size(), a.data()); // dst is CALLER-owned, valid + unmodified until commit()
+batch.add_read("b.bin", 0, b.size(), b.data());
+size_t done = batch.commit();                       // groups by path, one open/close per path; == 2 when both fully read
+
+kimix::DeferredBinaryWriter dw;
+kimix::vector<std::byte> head = ...;
+kimix::vector<std::byte> body = ...;
+dw.add_write("out.bin", 0, std::move(head));    // MOVES the payload (source left empty); no I/O yet
+dw.add_write("out.bin", 4096, std::move(body)); // same path, another offset: one open, both writes
+size_t written = dw.commit();                   // opens WITHOUT truncation, writes each offset, syncs, closes
+```
+
+- `commit()` always clears the recorded commands (releasing the payloads / dropping the `dst` references) and returns the number that completed **fully**; a failed or unopenable path just does not count and does not stop the other commands. `pending_count()` / `clear()` manage the queue without any I/O.
+- `DeferredBinaryWriter::add_write` takes `vector<std::byte>` (`std::byte`) while the stream APIs use `kimix::byte` — intentional, do not "fix" one to match the other.
+- Owning a recorded payload means the writer's `commit()` writes straight out of the command's vector — no payload copy on the path.
+- **A batch is grouping, not parallelism**: no two reads overlap in this build. On Linux the batch goes to xnvme's *emulated* async queue, which drains the commands serially; on Windows it is a sequence of positioned `ReadFile()` calls on a non-overlapped handle. On a page-cached regular file the benchmark measures the batch at ~85–87 % of the same reads issued one by one (`tests/unit/core/bench_binary_file_stream.cpp`), so use it for one-open-per-path / decoupled recording, not for throughput. Real overlap needs an NVMe device plus io_uring/libaio, which this build does not enable.
+- For the same reason xnvme is **not faster than `fread` on regular files**: sequential reads are a tie, seek-heavy random reads are ~2–4 % ahead (a positioned-read effect — `set_pos()` costs no syscall — not an NVMe effect). Choose these classes for the API shape (64-bit offsets, positioned writes, batching) or for a future NVMe device path, not for expected throughput on ordinary files.
+
+Platform limits (identical in the read and write classes):
+
+- **Windows: a file of 2 GiB or more cannot be opened at all** (the vendored xnvme open path stats with a 32-bit `stat`), so `is_open()` stays false, writes return 0 and recorded reads of that path never complete. Linux has no such limit.
+- **Platforms without a wired xnvme backend (macOS, FreeBSD, …)**: every open fails and the shim's reads/writes report `-ENOSYS`. Such a platform still builds; the classes are just unusable there.
+- Windows: a file cannot be deleted while a `BinaryFileWriter` still holds it open (xnvme's `CreateFile` share mode omits `FILE_SHARE_DELETE`) — `close()` first.
+- The vendored xnvme revision drops the offset of file-system reads (and the shim pre-empts the same issue for writes); `_win_pread` / `_win_pwrite` in the shim already work around it, so caller code needs nothing.
+- Build prerequisite (Windows): `kimix-xnvme` and `kimix-xnvme-shim` are MinGW-compiled and need a WinLibs/MSYS2 UCRT gcc on `PATH` at configure time; `kimix-core` then links their static archives plus the MinGW runtime archives.
+
+Tests / benchmark: `tests/unit/core/test_xnvme_file_stream.cpp`, `test_deferred_binary_file_stream.cpp` and `test_binary_file_writer.cpp` are registered suites; `bench_binary_file_stream` is a plain `main()` throughput benchmark, deliberately **not** registered with `add_tests` (it reads several GiB per run).
 
 ## 12. Dynamic Module Loading
 
@@ -447,5 +523,5 @@ Prefer fixed-width integer types:
 
 - Use: `int32_t`, `uint32_t`, `int64_t`, `uint64_t`, `int16_t`, `uint16_t`, `int8_t`, `uint8_t`
 - `size_t` is acceptable for sizes/indices per STL convention.
-- Prefer `std::byte` for raw byte data (`kimix::vector<std::byte>` is the runtime/FFI convention, e.g. `src/api/detail.h`). Note core file I/O (`BinaryFileStream`, `BinaryIO`) still speaks `kimix::byte` (= `int8_t`).
+- Prefer `std::byte` for raw byte data (`kimix::vector<std::byte>` is the runtime/FFI convention, e.g. `src/api/detail.h`). Note core file I/O (`BinaryFileStream`, `BinaryIO`, the xNVMe readers and `BinaryFileWriter`) still speaks `kimix::byte` (= `int8_t`); the one exception is `DeferredBinaryWriter::add_write`, which takes `kimix::vector<std::byte>`.
 - Avoid `unsigned int`, `long long`, `unsigned long`, `short`, and `char` for arithmetic. `kimix::byte/ubyte/ushort/uint/slong/ulong` (and `half`) exist in `basic_traits.h` but are essentially unused in `src/` — prefer the fixed-width `std::` types in new code.
