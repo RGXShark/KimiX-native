@@ -12,10 +12,15 @@
 //          prebuilt pool — the no-false-sharing payoff, the number that must
 //          scale; (c) mixed: one structural writer thread plus the content
 //          updaters, reported as two separate rates.
-// - SERIALIZE: 100k and a large pass (1M in release, 200k in debug): full save,
-//          dual-stage load and a 1 %-dirty incremental save, each run twice
-//          (warmup then measured), timed by steady_clock AND compared against the
-//          serializer's own save_ms / load_ms, with bytes_written printed.
+// - SERIALIZE: 100k and a large pass (1M in release, 200k in debug), EACH RUN ON
+//          BOTH COLD-STORE BACKENDS (lmdb and the opt-in xnvme_file flat file):
+//          full save, dual-stage load and a 1 %-dirty incremental save, each run
+//          twice (warmup then measured), timed by steady_clock AND compared
+//          against the serializer's own save_ms / load_ms, with bytes_written
+//          printed. The workload and the scale constants are identical for both
+//          backends and to the pre-backend row, so the two rows are comparable
+//          cell for cell; the [bench] name carries the backend
+//          (graphdb/serialize/<scale>/<backend>/<op>).
 //
 // Every measurement goes to stderr as a [bench] line in tests/unit/native/
 // bench_util.h's format (single-threaded cases through kimix_bench::run, the
@@ -52,6 +57,25 @@
 // (the fiber skill's root-main pattern: declared first so it outlives every suite
 // Boost.UT runs from the _test destructors at the end of main()).
 //
+// BACKENDS (serialization only): the two cold-store backends behind the internal
+// cold_store.h seam are benchmarked through the SAME serializer/deserializer and
+// the SAME workload, so the save/load/incremental cells differ only in the store.
+//   lmdb       ColdStorage (utils.h) — GraphOptions' default backend, one LMDB
+//              write transaction per save. On Windows LMDB opens its data file
+//              FILE_FLAG_WRITE_THROUGH, so a commit is a chain of synchronous
+//              page flushes.
+//   xnvme_file FileColdStore (<dir>\graph.xdb) — GraphOptions::store_backend ==
+//              ColdStoreBackend::xnvme_file, one APPENDED frame per save batch
+//              with ONE sync() at the end, and one open + positioned sequential
+//              reads on load.
+// The honest expectation (cpp skill §11) is asymmetric and is what the rows must
+// be read against: the deferred/batched writer is GROUPING, not parallelism, and
+// xnvme is NOT faster than fread on a page-cached regular file, so the load side
+// is expected to be a tie or a small positioned-I/O win; the save side is where a
+// single end-of-batch sync can beat a write-through commit. Neither number is
+// assumed here — the bench measures it and the README §6 verdict is written from
+// the measurement, not the expectation.
+//
 // CONTRACT HYGIENE (graph.h): structural writes come from exactly one thread per
 // phase. The content pool is built by the bench thread BEFORE any worker starts,
 // and update_content is a level-2 operation that is explicitly exempt from the
@@ -75,7 +99,9 @@
 #include <core/fiber.h>
 #include <core/platform.h>
 
+#include <graph_db/cold_store.h> // ColdStore seam: ColdStorage | FileColdStore
 #include <graph_db/database.h>
+#include <graph_db/file_cold_store.h> // the xnvme_file backend + kColdFileName
 #include <graph_db/graph.h>
 #include <graph_db/graph_db.h>
 #include <graph_db/serialize.h>
@@ -102,6 +128,8 @@ using namespace boost::ut;
 using namespace boost::ut::literals;
 using namespace kimix;
 using graph_db::ColdStorage;
+using graph_db::ColdStore;
+using graph_db::FileColdStore;
 using graph_db::Graph;
 using graph_db::GraphDeserializer;
 using graph_db::GraphSerializeStats;
@@ -184,12 +212,14 @@ inline void print_rate(char const *name, double ops, double seconds,
 }
 
 // One whole-operation measurement (a save, a load, an incremental save): the
-// "ops/s" column is then "operations of this kind per second" (fractional — a
-// 1.4 s save really is 0.7 saves/s).
-inline void print_elapsed(char const *name, double ms, char const *suffix) noexcept {
-    double const safe_ms = ms > 0.0 ? ms : 1e-9;
-    std::fprintf(stderr, "[bench] %-44s %12.3f ms   %14.3f ops/s  (%s)\n", name, ms,
-                 1000.0 / safe_ms, suffix);
+    // "ops/s" column is then "operations of this kind per second" (fractional — a
+    // 1.4 s save really is 0.7 saves/s). The name column is wider than
+    // print_rate's: a serialization line carries scale AND backend
+    // (graphdb/serialize/100k/xnvme_file/incremental_1pct = 49 chars).
+    inline void print_elapsed(char const *name, double ms, char const *suffix) noexcept {
+        double const safe_ms = ms > 0.0 ? ms : 1e-9;
+        std::fprintf(stderr, "[bench] %-52s %12.3f ms %14.3f ops/s  (%s)\n", name, ms,
+                     1000.0 / safe_ms, suffix);
 }
 
 // ---------------------------------------------------------------------------
@@ -786,9 +816,68 @@ void gdi_rate(char const *name, size_t ops, char const *suffix, Body &&body) {
 
 // ---------------------------------------------------------------------------
 // SERIALIZATION pass: build -> full save (warmup + measured) -> dual-stage load
-// (warmup + measured) -> 1 % dirty -> incremental save. Prints its own [bench]
-// lines and returns the numbers so the caller can assert the exact counts.
+// (warmup + measured) -> 1 % dirty -> incremental save, run once per COLD-STORE
+// BACKEND. Prints its own [bench] lines and returns the numbers so the caller can
+// assert the exact counts.
 // ---------------------------------------------------------------------------
+
+// The two backends behind the internal cold_store.h seam. `lmdb` is
+// GraphOptions' default; `xnvme_file` is the opt-in append-only graph.xdb.
+enum class serialize_backend { lmdb, xnvme_file };
+
+inline char const *backend_name(serialize_backend backend) noexcept {
+    return backend == serialize_backend::xnvme_file ? "xnvme_file" : "lmdb";
+}
+
+// Owns BOTH backends (exactly one is ever open) and the NON-OWNING ColdStore
+// handle the serializer and the deserializer talk to — that is how the same pass
+// body serves both backends without a virtual call or a second code path.
+// ColdStore is a two-pointer variant that is copy-assignable, so the handle is
+// re-pointed at whichever backend open() just opened (Database::open does the
+// same thing, database.cpp).
+struct serialize_store {
+    ColdStorage cold;   // lmdb backend (utils.h)
+    FileColdStore file; // xnvme_file backend (file_cold_store.h)
+    ColdStore handle;   // points at the backend that is open
+
+    serialize_store() noexcept : handle{cold} {}
+
+    [[nodiscard]] bool open(kimix::filesystem::path const &dir,
+                            serialize_backend backend) noexcept {
+        if (backend == serialize_backend::xnvme_file) {
+            if (!file.open(dir)) {
+                return false;
+            }
+            handle = ColdStore{file};
+            return file.valid();
+        }
+        if (!cold.open(dir)) {
+            return false;
+        }
+        handle = ColdStore{cold};
+        return cold.valid();
+    }
+
+    // A FULL save REPLACES the file backend's file (it is a complete snapshot)
+    // instead of appending to it; the seam's save_batch() cannot tell a full batch
+    // from an incremental one, so the store is told — byte for byte what
+    // Database::persist(full=true) does (database.cpp). The arm is consumed by the
+    // next save_batch() that reaches this store, and cleared right after the save,
+    // so an lmdb run can never inherit it.
+    void arm_full_save(serialize_backend backend, bool full) noexcept {
+        file.set_rebuild_next_batch(full && backend == serialize_backend::xnvme_file);
+    }
+};
+
+// The file backend's on-disk size (<dir>\graph.xdb): the append log keeps the
+// superseded records a map store would have overwritten, so this is where the two
+// backends differ on disk. 0 when the file is absent (the lmdb run).
+inline size_t store_file_bytes(kimix::filesystem::path const &dir) noexcept {
+    std::error_code ec;
+    auto const size = kimix::filesystem::file_size(
+        dir / kimix::filesystem::path{graph_db::kColdFileName}, ec);
+    return ec ? size_t{0} : static_cast<size_t>(size);
+}
 
 struct serialize_numbers {
     size_t vertices{0};
@@ -804,10 +893,25 @@ struct serialize_numbers {
     size_t incremental_count{0};
     size_t incremental_bytes{0};
     double incremental_ms{0.0};
+    size_t store_file_bytes{0}; // xnvme_file only: graph.xdb after the appends
     bool ok{false};
 };
 
-serialize_numbers run_serialize_pass(size_t vertices, char const *tag, uint32_t seed) {
+// One [bench] row name: graphdb/serialize/<scale>/<backend>/<op>.
+inline kimix::string serialize_row(char const *tag, serialize_backend backend,
+                                   char const *op) {
+    return kimix::string{"graphdb/serialize/"} + tag + "/" + backend_name(backend) + "/" + op;
+}
+
+// One whole pass on ONE backend. The graph is built here, from the same seed and
+// the same constants, for every backend — so each backend starts from a FRESH
+// graph and a fresh store, and no dirty flag (vertex OR edge) can leak from the
+// previous backend's save into this one. That is the exact hazard the Phase-3
+// note warns about (a save clears the flags of every record it wrote), and
+// building per pass is what makes it structurally impossible instead of relying
+// on a re-mark.
+serialize_numbers run_serialize_pass(size_t vertices, char const *tag, uint32_t seed,
+                                     serialize_backend backend) {
     serialize_numbers numbers;
     numbers.vertices = vertices;
 
@@ -816,11 +920,15 @@ serialize_numbers run_serialize_pass(size_t vertices, char const *tag, uint32_t 
         std::fprintf(stderr, "[bench] graphdb/serialize/%s: temp dir unavailable\n", tag);
         return numbers;
     }
-    ColdStorage cold;
-    if (!cold.open(dir.path())) {
+    serialize_store store;
+    if (!store.open(dir.path(), backend)) {
+        // A backend that cannot open on this platform (xnvme with no backend, or a
+        // path at the 2 GiB wall) reports it instead of silently printing zeros.
+        std::fprintf(stderr, "[bench] %s: backend open FAILED\n",
+                     serialize_row(tag, backend, "open").c_str());
         return numbers;
     }
-    GraphSerializer serializer{cold};
+    GraphSerializer serializer{store.handle};
     GraphDeserializer deserializer;
     Graph source;
     auto built = build_random_dag(source, vertices, kGraphDegreeMin,
@@ -829,13 +937,17 @@ serialize_numbers run_serialize_pass(size_t vertices, char const *tag, uint32_t 
         return numbers;
     }
 
-    // Warmup save (untimed), then the measured one: the first pass pays the LMDB
-    // page-allocation and mimalloc warm-up costs, which is exactly why the plan
-    // asks for a warmup run.
+    // Warmup save (untimed), then the measured one: the first pass pays the store
+    // page-allocation (LMDB map growth / the xdb file creation) and the mimalloc
+    // warm-up costs, which is exactly why the plan asks for a warmup run. Both are
+    // FULL saves, so the file backend replaces its file in both (arm_full_save).
+    store.arm_full_save(backend, true);
     serializer.save(source);
+    store.arm_full_save(backend, true);
     auto const save_start = clock_type::now();
     GraphSerializeStats saved = serializer.save(source);
     auto const save_end = clock_type::now();
+    store.arm_full_save(backend, false);
     numbers.full_save_ms = elapsed_ms(save_start, save_end);
     numbers.serializer_save_ms = saved.save_ms;
     numbers.full_save_count = saved.saved_count;
@@ -851,19 +963,19 @@ serialize_numbers run_serialize_pass(size_t vertices, char const *tag, uint32_t 
                       "workers=%zu",
                       vertices, saved.bytes_written, mbytes_per_s, saved.save_ms,
                       saved.worker_count);
-        print_elapsed((kimix::string{"graphdb/serialize/"} + tag + "/full_save").c_str(),
+        print_elapsed(serialize_row(tag, backend, "full_save").c_str(),
                       numbers.full_save_ms, suffix);
     }
 
     // Warmup load (untimed) into a throw-away graph, then the measured load.
     {
         Graph warmup_target;
-        deserializer.load(cold, warmup_target);
+        deserializer.load(store.handle, warmup_target);
     }
     {
         Graph target;
         auto const load_start = clock_type::now();
-        GraphSerializeStats loaded = deserializer.load(cold, target);
+        GraphSerializeStats loaded = deserializer.load(store.handle, target);
         auto const load_end = clock_type::now();
         numbers.load_ms = elapsed_ms(load_start, load_end);
         numbers.serializer_load_ms = loaded.load_ms;
@@ -877,7 +989,7 @@ serialize_numbers run_serialize_pass(size_t vertices, char const *tag, uint32_t 
                       "serializer stats.load_ms=%.3f, workers=%zu",
                       vertices, loaded.bytes_read, mbytes_per_s, loaded.loaded_count,
                       loaded.skipped_count, loaded.load_ms, loaded.worker_count);
-        print_elapsed((kimix::string{"graphdb/serialize/"} + tag + "/load").c_str(),
+        print_elapsed(serialize_row(tag, backend, "load").c_str(),
                       numbers.load_ms, suffix);
     }
 
@@ -897,14 +1009,25 @@ serialize_numbers run_serialize_pass(size_t vertices, char const *tag, uint32_t 
     numbers.incremental_ms = elapsed_ms(incremental_start, incremental_end);
     numbers.incremental_count = incremental.saved_count;
     numbers.incremental_bytes = incremental.bytes_written;
+    numbers.store_file_bytes = store_file_bytes(dir.path());
     {
         char suffix[512];
-        std::snprintf(suffix, sizeof(suffix),
-                      "1%% of %zu vertices dirtied (%zu), written=%zu, %zu bytes",
-                      vertices, numbers.dirtied, incremental.saved_count,
-                      incremental.bytes_written);
-        print_elapsed((kimix::string{"graphdb/serialize/"} + tag + "/incremental_1pct")
-                          .c_str(),
+        if (backend == serialize_backend::xnvme_file) {
+            // The append log keeps the superseded records of the earlier save
+            // rounds (LMDB's map would have overwritten them), so the file size is
+            // part of the honest picture: it is NOT bytes_written.
+            std::snprintf(suffix, sizeof(suffix),
+                          "1%% of %zu vertices dirtied (%zu), written=%zu, %zu bytes, "
+                          "graph.xdb=%zu bytes (append log: superseded records stay)",
+                          vertices, numbers.dirtied, incremental.saved_count,
+                          incremental.bytes_written, numbers.store_file_bytes);
+        } else {
+            std::snprintf(suffix, sizeof(suffix),
+                          "1%% of %zu vertices dirtied (%zu), written=%zu, %zu bytes",
+                          vertices, numbers.dirtied, incremental.saved_count,
+                          incremental.bytes_written);
+        }
+        print_elapsed(serialize_row(tag, backend, "incremental_1pct").c_str(),
                       numbers.incremental_ms, suffix);
     }
 
@@ -1832,35 +1955,54 @@ int main(int argc, char *argv[]) {
     // 3. SERIALIZATION — 100k and the large pass
     // -----------------------------------------------------------------------
     "bench_serialize_100k"_test = [] {
-        serialize_numbers numbers = run_serialize_pass(kSerializeVertices, "100k", 20240608u);
-        expect(numbers.ok) << "the 100k serialization pass completed";
-        if (!numbers.ok) {
-            return;
+        // ONE row set per cold-store backend, same workload, same constants: the
+        // two rows of README §6 are meant to be read cell against cell.
+        for (serialize_backend backend :
+             {serialize_backend::lmdb, serialize_backend::xnvme_file}) {
+            char const *const label = backend_name(backend);
+            serialize_numbers numbers =
+                run_serialize_pass(kSerializeVertices, "100k", 20240608u, backend);
+            expect(numbers.ok) << "the 100k serialization pass completed on " << label;
+            if (!numbers.ok) {
+                continue;
+            }
+            expect(eq(numbers.full_save_count, kSerializeVertices))
+                << label << ": a full save writes every vertex";
+            expect(gt(numbers.full_save_bytes, size_t{0}))
+                << label << ": the save wrote bytes";
+            expect(eq(numbers.loaded_count, kSerializeVertices))
+                << label << ": every vertex loads back";
+            expect(eq(numbers.loaded_skipped, size_t{0}))
+                << label << ": a clean store skips nothing";
+            expect(eq(numbers.dirtied, kSerializeVertices / 100))
+                << label << ": 1% was dirtied";
+            expect(eq(numbers.incremental_count, kSerializeVertices / 100))
+                << label << ": an incremental save writes exactly the dirty vertices";
+            expect(lt(numbers.incremental_bytes, numbers.full_save_bytes))
+                << label << ": the incremental save is a fraction of the full one";
+            kimix_bench::sink(numbers.incremental_bytes + numbers.full_save_bytes);
         }
-        expect(eq(numbers.full_save_count, kSerializeVertices))
-            << "a full save writes every vertex";
-        expect(gt(numbers.full_save_bytes, size_t{0})) << "the save wrote bytes";
-        expect(eq(numbers.loaded_count, kSerializeVertices)) << "every vertex loads back";
-        expect(eq(numbers.loaded_skipped, size_t{0})) << "a clean store skips nothing";
-        expect(eq(numbers.dirtied, kSerializeVertices / 100)) << "1% was dirtied";
-        expect(eq(numbers.incremental_count, kSerializeVertices / 100))
-            << "an incremental save writes exactly the dirty vertices";
-        expect(lt(numbers.incremental_bytes, numbers.full_save_bytes))
-            << "the incremental save is a fraction of the full one";
-        kimix_bench::sink(numbers.incremental_bytes + numbers.full_save_bytes);
     };
 
     "bench_serialize_large"_test = [] {
-        serialize_numbers numbers =
-            run_serialize_pass(kSerializeLargeVertices, "large", 20240609u);
-        expect(numbers.ok) << "the large serialization pass completed";
-        if (!numbers.ok) {
-            return;
+        for (serialize_backend backend :
+             {serialize_backend::lmdb, serialize_backend::xnvme_file}) {
+            char const *const label = backend_name(backend);
+            serialize_numbers numbers =
+                run_serialize_pass(kSerializeLargeVertices, "large", 20240609u, backend);
+            expect(numbers.ok) << "the large serialization pass completed on " << label;
+            if (!numbers.ok) {
+                continue;
+            }
+            expect(eq(numbers.full_save_count, kSerializeLargeVertices))
+                << label;
+            expect(eq(numbers.loaded_count, kSerializeLargeVertices))
+                << label;
+            expect(eq(numbers.loaded_skipped, size_t{0}))
+                << label << ": a clean store skips nothing at the large size";
+            expect(eq(numbers.incremental_count, kSerializeLargeVertices / 100))
+                << label << ": 1% dirty at the large size too";
+            kimix_bench::sink(numbers.incremental_bytes + numbers.full_save_bytes);
         }
-        expect(eq(numbers.full_save_count, kSerializeLargeVertices));
-        expect(eq(numbers.loaded_count, kSerializeLargeVertices));
-        expect(eq(numbers.incremental_count, kSerializeLargeVertices / 100))
-            << "1% dirty at the large size too";
-        kimix_bench::sink(numbers.incremental_bytes + numbers.full_save_bytes);
     };
 }

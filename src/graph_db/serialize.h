@@ -1,10 +1,13 @@
 /*
  * serialize.h — parallel incremental save and dual-stage load for kimix-graph-db.
  *
- * Two classes over the ColdStorage of utils.h:
+ * Two classes over the cold-store seam of cold_store.h — a non-owning handle
+ * over the LMDB environment of utils.h or over the flat file of
+ * file_cold_store.h:
  *
- *   GraphSerializer    Graph  -> LMDB  (full save / incremental save)
- *   GraphDeserializer  LMDB   -> Graph (dual-stage, cycle- and corruption-proof)
+ *   GraphSerializer    a Graph      -> the cold store (full / incremental save)
+ *   GraphDeserializer  the cold store -> a Graph     (dual-stage, cycle- and
+ *                      corruption-proof)
  *
  * The byte layout is entirely utils.h's: a value is the "GDB1" VertexRecord
  * written by encode_vertex_record() and read by decode_vertex_record(), and the
@@ -177,6 +180,7 @@
  */
 #pragma once
 
+#include "cold_store.h"
 #include "edge.h"
 #include "graph_db_api.h"
 #include "graph.h"
@@ -258,13 +262,14 @@ struct KIMIX_GRAPH_DB_API GraphSerializeStats {
 };
 
 /*
- * Writes a Graph into a cold store: parallel encode (stage A), one atomic LMDB
- * transaction on the calling thread (stage B). The store is referenced, not
- * owned — it must outlive the serializer.
+ * Writes a Graph into a cold store: parallel encode (stage A), one atomic store
+ * transaction (stage B). The store is referenced, not owned — it must outlive
+ * the serializer. A concrete ColdStorage converts to the ColdStore seam
+ * implicitly, so every existing call site keeps its spelling.
  */
 class KIMIX_GRAPH_DB_API GraphSerializer : public kimix::IOperatorNewBase {
 public:
-    explicit GraphSerializer(ColdStorage &cold) noexcept
+    explicit GraphSerializer(ColdStore cold) noexcept
         : _cold(cold) {
     }
     GraphSerializer(GraphSerializer const &) = delete;
@@ -322,7 +327,9 @@ private:
     // whether the meta record is written even when nothing else is.
     GraphSerializeStats _write(Graph &graph, bool full);
 
-    ColdStorage &_cold;
+    // A non-owning handle over the backend (cold_store.h): it refers to the
+    // caller's store, so the serializer never copies, closes or moves it.
+    ColdStore _cold;
     Schema *_schema{nullptr};
     MetaRecord _meta{};
     // The meta record of the call in flight (written in the same transaction as
@@ -356,7 +363,7 @@ public:
     // `schema` (optional) receives the store's label / property-type tables, so a
     // reload keeps its names and its id spaces. Without one the ids in the
     // records are still restored verbatim (they are just un-nameable).
-    GraphSerializeStats load(ColdStorage &cold, Graph &graph, Schema *schema = nullptr);
+    GraphSerializeStats load(ColdStore cold, Graph &graph, Schema *schema = nullptr);
 
     [[nodiscard]] GraphSerializeStats const &last_stats() const noexcept {
         return _last_stats;

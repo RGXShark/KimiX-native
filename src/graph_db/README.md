@@ -40,6 +40,8 @@ requirement it implements is `graph_db.md`.
 | `vertex.h` / `vertex.cpp` | One vertex: guid, opaque content blob + cached MD5, dependency links in **both** forms (guid vectors = the serialized source of truth; `Vertex*` sets = the resolved in-memory form), an `alignas(64)` `kimix::shared_atomic_mutex` and the atomic dirty flag. Also the `VertexUniqueLock` / `VertexSharedLock` RAII adapters. |
 | graph.h / graph.cpp | The vertex container: a 64-way SHARDED vertex map (kGraphShardCount, one std::shared_mutex + one bucketed kimix::HashMap per shard), structural CRUD with a cascading remove_vertex (one shard lock at a time), connect / disconnect (endpoint shards, ascending order), connect_bulk (epoch 3: one endpoint resolution, one ascending lock set and one writer check for a whole edge batch), reserve_links, a version-keyed cached roots(), neighbors / dependencies / dependents plus the non-allocating AdjacencyBuffer / caller-span forms, cycle-safe BFS has_path / shortest_path (one shard lock per visit), dirty bookkeeping (mark_dirty / clear_dirty / dirty_vertices), the single-writer contract check. graph.h carries the full concurrency contract, the deadlock-freedom argument and the epoch-1/2/3 results. |
 | `serialize.h` / `serialize.cpp` | `GraphSerializer` (full + incremental save, `copy_to` checkpoint) and `GraphDeserializer` (dual-stage load), plus `GraphSerializeStats`. Details in §4 and §5. |
+| cold_store.h | INTERNAL storage-backend seam (not in the umbrella, RTTI-free, non-virtual): `ColdStore`, a non-owning handle over exactly one of `ColdStorage` (LMDB) or `FileColdStore` (flat file), dispatching `valid` / `path` / `read_meta` / `save_batch` / `load_all_records` / `copy_to` through a `kimix::variant` of pointers. That is what lets the backend be selected without touching the serializer or the deserializer; `open()`/`close()` stay an owner concern (`Database`). |
+| file_cold_store.h / file_cold_store.cpp | The opt-in flat-file backend: ONE append-only `<dir>\graph.xdb` (magic "KXDB0001" + 20-byte header + frames of length-prefixed records), one sync per save batch, one open + positioned sequential reads per scan, duplicate keys collapsed last-wins, tombstones as empty values, a full save is a truncating `rebuild()`, and a Windows 2 GiB guard on the *projected* file size. Reads use `kimix::DeferredBinaryFileStream` / `BinaryFileWriter` (cpp skill §11). |
 | `edge.h` / `edge.cpp` | First-class edges: `EdgeId`, `Edge`, `EdgeLink`, `EdgeRecord`, `EdgeDirectionType` / `EdgeOrientation`, the sharded `EdgeTable` and the `"GDE2"` edge-record codec. |
 | `key.h` / `key.cpp` | `ExternalId` (16-byte SSO, arbitrary binary), `VertexKey` / `VertexKeyView` and the sharded `KeyIndex` (level 4). |
 | `status.h` / `status.cpp` | `GdiStatus`: the 63 GDI status codes with their pinned numeric values, names and messages. |
@@ -49,7 +51,7 @@ requirement it implements is `graph_db.md`.
 | `transaction.h` / `transaction.cpp` | The undo journal (`JournalEntry`) and the transaction state machine. |
 | `database.h` / `database.cpp` | `Database`: the GDI backend facade (one per session) — every command, its schema validation, its exact status code, the rollback replay and the save hooks. |
 | `capability.h` / `capability.cpp` | `Capability` (the honest advertisement) and `capability_name_diff`. |
-| `graph_db_options.h` | `GraphOptions` / `KeyMode`: key uniqueness policy, edge policy, journal cap, store map size, `persist_on_commit`, graph name. |
+| `graph_db_options.h` | `GraphOptions` / `KeyMode`: key uniqueness policy, edge policy, journal cap, store map size, **`store_backend`** (`ColdStoreBackend::lmdb` default / `ColdStoreBackend::xnvme_file` opt-in — C++ only, no C-ABI field), `persist_on_commit`, graph name. |
 | `graph_c_api.h` / `graph_c_api.cpp` | The C ABI (ASCII, C99-clean, no library allocation on read paths, two-phase buffers). |
 | `binary_le.h` | INTERNAL little-endian codec helpers shared by the record encoders (not part of the umbrella). |
 | `reports/gdi_alignment.md` | The `graph_report.md` §2.1–§2.16 checklist: what is closed, by which file, with which test. |
@@ -58,7 +60,8 @@ requirement it implements is `graph_db.md`.
 | `tests/unit/graph_db/graph_db_test_util.h` | Shared fixtures: byte helpers, `temp_dir_guard`, the known 6-vertex DAG, `build_layered_dag`, record/store hand-crafting helpers, raw-store snapshots, guid/adjacency comparison helpers. |
 | `tests/unit/graph_db/test_graph_db.cpp` | Container suite: CRUD, cascade remove, edge directions, roots, threaded content races, writer contract, traversals, record codec, cold-storage round trip, cache-line/alignment checks. |
 | `tests/unit/graph_db/test_graph_db_serialize.cpp` | Serializer suite: round trip, incremental writes, cycle/dangling stores, determinism, corruption, merge policy, checkpoint. |
-| `tests/unit/graph_db/test_graph_db_bench.cpp` | Read / write / serialization benchmarks (subtask S3). |
+| `tests/unit/graph_db/test_graph_db_file_store.cpp` | Flat-file backend + seam suite: the `graph.xdb` layout, frame/torn-tail atomicity, last-wins duplicates, tombstones, the 2 GiB projected-size guard, `rebuild()` vs append, `copy_to()`, `DeferredBinary*` staging lifetimes, determinism, and — the parity gate — the same persistence script replayed through `Database` on both backends (`GraphOptions::store_backend`) with byte-identical results. |
+| `tests/unit/graph_db/test_graph_db_bench.cpp` | Read / write / serialization benchmarks (subtask S3). The serialization section runs **both cold-store backends** (lmdb, xnvme_file) at 100k and 1M, named `graphdb/serialize/<scale>/<backend>/<op>`; §6.1 holds the resulting table. |
 
 ## 3. Concurrency contract (summary — `graph.h` is authoritative)
 
@@ -126,7 +129,7 @@ Serializer additions to the contract:
 |---|---|---|
 | 1 collect | caller | `graph.dirty_vertices()` — graph SHARED lock for the map, each vertex's SHARED lock for the cached hash. This vector **is** the write set. |
 | A encode | fiber fan-out | Per dirty vertex: `content_copy()` under the vertex SHARED lock, copy both guid lists, `encode_vertex_record` straight into its own `LMDBWriteCommand` slot. Jobs write disjoint slots, so no lock. |
-| B write | **calling thread** | One `ColdStorage::save_batch()` = one LMDB transaction ⇒ the batch is atomic. Kept out of the fan-out: it is a blocking syscall batch and would park a pool worker. |
+| B write | **calling thread** | One `ColdStore::save_batch()` = ONE atomic unit of the backend (an LMDB transaction, or one appended frame) ⇒ the batch is atomic. Kept out of the fan-out: it is a blocking syscall batch and would park a pool worker. Which store it is, is the backend choice — see below. |
 | settle | caller | Clear the dirty flag of each written vertex, but only when its cached hash still equals the written hash (a racing update stays dirty). |
 
 - `save_incremental(graph)` — the primary path: only the dirty vertices are
@@ -134,13 +137,26 @@ Serializer additions to the contract:
   its stored bytes stay bit-identical.
 - `save(graph)` — full save: marks every vertex dirty first, then runs the same
   pipeline, so the whole graph is rewritten in one transaction.
-- `copy_to(path)` — passthrough to `ColdStorage::copy_to()` (compacted snapshot).
+- `copy_to(path)` — passthrough to `ColdStore::copy_to()` (compacted snapshot; a
+  directory either way).
+
+Which store stage B writes to is a BACKEND choice, and it is the only stage the
+choice changes (the pipeline, the fan-out and the counters are shared):
+
+| `GraphOptions::store_backend` | stage B | disk unit |
+|---|---|---|
+| `ColdStoreBackend::lmdb` (default) | one `save_batch()` = one LMDB write transaction | the memory-mapped `data.mdb`; on Windows LMDB opens it `FILE_FLAG_WRITE_THROUGH`, so the commit is a chain of synchronous page flushes |
+| `ColdStoreBackend::xnvme_file` | one `save_batch()` = ONE appended frame of `<dir>\graph.xdb`, one open + one positioned write + **one `sync()`** + close | the append log; a FULL save replaces the file instead (`FileColdStore::rebuild()`, armed by `Database::persist(full=true)` because the seam's `save_batch()` cannot tell a full batch from an incremental one) |
+
+`Database::persist()` is the only caller that arms the rebuild, and it clears the
+arm right after the save, so an incremental save can never be mistaken for a full
+one. The measured consequence of the two shapes is §6.1.
 
 ## 5. Load pipeline (`GraphDeserializer`) — the dual-stage guarantee
 
 | Stage | Thread | Work |
 |---|---|---|
-| 1 collect | sequential scan | `ColdStorage::load_all_records()` — one LMDB cursor (the iterator is single-cursor), every `"v/"` key copied out with its value. |
+| 1 collect | sequential scan | `ColdStore::load_all_records()` — ONE pass over the store: on lmdb one LMDB cursor over the memory-mapped map (the iterator is single-cursor), on xnvme_file one open + positioned sequential reads over the frames. Every key is copied out with its value — see the backend table after the one below. |
 | 1' decode | fiber fan-out | `decode_vertex_record` per slot into (guid, hash, dependency guids, content, validity). No shared state. |
 | 2 materialize | fiber fan-out | Bare `Vertex` per valid slot: guid + content, **no dependency list, no pointer, no edge**. |
 | insert | caller | `Graph::add_vertex` per materialized vertex (a structural write, so single-threaded) + a staging guid→`Vertex*` index. |
@@ -160,8 +176,22 @@ exists in the target graph is skipped rather than overwriting the live vertex,
 while an edge may still resolve to a vertex the graph already held.
 
 Determinism: the fan-outs fill pre-sized slots by index, and the link pass walks
-the slots in LMDB key order, so loading the same store twice yields identical
+the slots in store key order, so loading the same store twice yields identical
 guid sets and identical adjacency regardless of scheduling.
+
+Stage 1 is the one stage the backend changes, and the two are the same contract
+with two mechanics:
+
+| backend | stage 1 |
+|---|---|
+| lmdb | `load_all_records()` = one LMDB cursor over the memory-mapped `data.mdb`; every key and value of the map comes out exactly once |
+| xnvme_file | `load_all_records()` = ONE xnvme open, then a positioned sequential pass over the complete frames (a torn tail is ignored), collapsing duplicate keys **last-wins** while it scans — that is what gives the append log LMDB's map semantics |
+
+A flat-file load therefore reads more bytes than the counters report: each record
+carries its 18-byte key (`"v/"`/`"e/"` + 16) and a 12-byte length prefix next to
+the value, whereas `bytes_read` counts values only (§6.1 has the measured file
+sizes). The append log's duplicates never reach the loader — one file always scans
+to the same record sequence, so the determinism argument above holds for it too.
 
 6. Benchmarks
 
@@ -186,10 +216,13 @@ Workload (all sizes are the constants at the top of the bench file):
   takes the vertex lock only (isolates the graph-lock tax from the level-2 path);
   (c) mixed: 1 structural writer + cores content updaters, plus the same
   structural loop alone as the starvation baseline.
-- SERIALIZE — fresh 100k graph and a fresh 1M graph: full save, dual-stage load
-  and a 1 %-dirty incremental save (saved_count == N/100 is asserted), warmup pass
-  then measured pass, timed by steady_clock and cross-checked against the
-  serializer's own save_ms / load_ms. bytes_written / bytes_read are reported.
+- SERIALIZE — fresh 100k graph and a fresh 1M graph, EACH PASS REPEATED ON BOTH
+  COLD-STORE BACKENDS (lmdb and xnvme_file, same seed, same constants): full save,
+  dual-stage load and a 1 %-dirty incremental save (saved_count == N/100 is
+  asserted), warmup pass then measured pass, timed by steady_clock and
+  cross-checked against the serializer's own save_ms / load_ms.
+  bytes_written / bytes_read are reported, and the file backend also reports the
+  size of its `graph.xdb`. §6.1 holds the resulting backend table.
 
 Table columns are fixed per epoch row so rows stay comparable:
 
@@ -683,6 +716,80 @@ result. What epoch 4 would attack, in measured order:
 None of those is a ≥5 % headline inside src/graph_db, so per the plan's stop rule
 the optimization loop is STOPPED at epoch 3: this is the final epoch. The next
 real step is a src/core sync-policy decision, not another src/graph_db epoch./n
+
+### 6.1 Backend dimension — `lmdb` vs `xnvme_file` (plan 05eff1f, Phase 4)
+
+`GraphOptions::store_backend` selects the cold store and nothing else changes: the
+same serializer, the same deserializer, the same workload (§4/§5). The bench now
+runs that workload on BOTH backends at BOTH scales, each with a fresh graph from
+the same seed and a fresh store, so every cell below is the same operation over the
+same graph bytes — the only difference is the store (and, on the file side, the
+extra key + frame bytes it writes, see "disk" below).
+
+Host/mode: AMD Ryzen 9 7950X3D (16C/32T, 64 GB), Windows 11, `mode=release` MSVC,
+2026-10-25 — the plan_v3 host, so these cells are NOT comparable with the
+Intel-host epoch rows above except as same-session ratios. Sources: one whole-suite
+run plus three filtered repeats (`test_graph_db_bench.exe bench_serialize_100k`,
+`... bench_serialize_large`); each cell is the MINIMUM of the four, as every row of
+this file is. Raw lines: `reports/xnvme_store.md` §8.3.
+
+| scale | row | lmdb | xnvme_file | delta (file vs lmdb) | graph.xdb |
+|---|---|---|---:|---:|---|
+| 100k | full save | 3 488.6 ms (20.2 MB/s) | **746.1 ms (94.4 MB/s)** | **-78.6 % (4.7x faster)** | 92.2 MB |
+| 100k | dual-stage load | **352.1 ms (199.9 MB/s)** | 395.2 ms (178.2 MB/s) | +12.2 % slower | — |
+| 100k | incremental 1 % (1 000 rec, 763 808 B) | 120.4 ms (6.3 MB/s) | **7.8 ms (98.3 MB/s)** | **-93.5 % (15.5x faster)** | — |
+| 1M | full save | 28 553.2 ms (24.7 MB/s) | **10 389.8 ms (67.8 MB/s)** | **-63.6 % (2.75x faster)** | 922.2 MB |
+| 1M | dual-stage load | **6 161.9 ms (114.3 MB/s)** | 7 897.0 ms (89.2 MB/s) | +28.2 % slower | — |
+| 1M | incremental 1 % (10 000 rec, 7 629 808 B) | 1 103.2 ms (6.9 MB/s) | **69.6 ms (109.6 MB/s)** | **-93.7 % (15.9x faster)** | — |
+
+MB/s is `bytes / wall_ms` for the value bytes the operator wrote or read (the
+bench's own convention, unchanged from §3 of the report); the file backend's
+on-disk footprint is larger because a record in the log carries its 18-byte key
+plus a 12-byte length prefix next to the value — 92.2 MB vs 70.4 MB of values at
+100k, 922.2 MB vs 704.2 MB at 1M.
+
+VERDICT (honest, and it does not go the way the pre-measurement expectation was
+hedged):
+
+- **The save wins, big and reproducibly.** 4.7x at 100k and 2.75x at 1M on the
+  full save, ~15x on the 1 % incremental. The cause is the sync policy, not the
+  storage medium: LMDB on Windows opens `data.mdb` `FILE_FLAG_WRITE_THROUGH`, so
+  each commit is a chain of synchronous page flushes (epoch 0-3 already showed the
+  commit is 95 % of a save), while the file backend writes ONE appended frame and
+  pays ONE `sync()` per batch. The incremental row is the purest form of that
+  (7.6 MB written in 69.6 ms vs 1 103 ms) — same bytes, one flush instead of a
+  write-through commit.
+- **The load does not win, and that was expected.** Per byte read the two backends
+  are a tie: at 100k 178 MB/s (file) vs 200 MB/s (lmdb), at 1M 117 MB/s (file, of
+  the 922 MB it actually reads) vs 114 MB/s (lmdb, of the 704 MB of values). This is
+  exactly the cpp skill §11 warning — xNVMe is not faster than `fread` on a
+  page-cached regular file, and the deferred/batched reader is grouping, not
+  parallelism (~85-87 % of the same reads issued one by one). The wall-clock LOSS
+  (+12 % at 100k, +28 % at 1M) has two causes, neither of which is a slower read:
+  (a) the log carries 18 B key + 12 B frame lengths next to every value, so a 1M
+  store is 922 MB to read instead of 704 MB, and (b) the log owes its map semantics
+  a last-wins dedupe, so its scan builds a ~7 M-entry key index that a B-tree gives
+  LMDB for free in key order (it is only built for a load, not for the meta pass).
+- **What the backend choice is for, therefore:** workloads dominated by saves —
+  checkpoint-heavy or incremental-persist-per-commit workloads, where 15x on the
+  incremental path changes what is affordable — and stores well under the 2 GiB
+  wall. It is NOT a load optimization and it is NOT free on disk.
+- **The default does NOT change.** `ColdStoreBackend::lmdb` stays the default.
+  The save win is real, but flipping the default would (a) hit the Windows 2 GiB
+  file wall at ~3 M vertices, where LMDB's default map is 64 GiB, (b) silently
+  produce an EMPTY graph for an existing LMDB store — a directory holding
+  `data.mdb` opened with `store_backend = xnvme_file` gets a fresh `graph.xdb`
+  beside it and an empty load, because there is no cross-backend detection or
+  migration, and (c) change the C-ABI behavior, which has no field for the option.
+  Flipping it is a planner decision with a migration story, not a benchmark
+  result; this phase records the numbers and leaves the switch opt-in.
+
+Stop rule (graph_db_plan.md §7 / §6 above, "stop when a full epoch yields < 5 %"):
+the backend work is not an epoch over existing code — the lmdb path is unchanged,
+cell for cell, so the loop stays STOPPED at epoch 3 for it. Read as a change, its
+headline move is -78.6 % / -63.6 % on save, far above the 5 % threshold, so the
+rule does not fire; the load cell is a 12-28 % REGRESSION and is reported as such,
+not as a tie.
 ---
 
 ### Plan v3 GDI epoch log (time-cost epochs, GDI-shaped rows)

@@ -321,6 +321,13 @@ struct KIMIX_GRAPH_DB_API ColdRecord {
  * Thin RAII wrapper over one kimix::LMDB environment. Move-only; a
  * default-constructed or closed instance reports false from valid() and every
  * operation returns false without touching the disk.
+ *
+ * This is one of the two backends behind the internal cold_store.h seam
+ * (kimix::graph_db::ColdStore): GraphSerializer and GraphDeserializer take their
+ * store through that handle, and Database is where the handle is built. This
+ * class stays a complete, standalone type — the seam borrows it, it does not
+ * wrap or hide it — because the test suites construct and drive a ColdStorage
+ * directly.
  */
 class KIMIX_GRAPH_DB_API ColdStorage : public kimix::IOperatorNewBase {
 public:

@@ -30,6 +30,7 @@
  */
 #pragma once
 
+#include "edge.h"
 #include "graph_db_api.h"
 #include "property.h"
 #include "schema.h"

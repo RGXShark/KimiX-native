@@ -59,15 +59,13 @@ namespace {
 // ---------------------------------------------------------------------------
 
 Database::Database() noexcept
-    : _serializer(_cold) {
-    _serializer.set_schema(&_schema);
+    : _store(_cold) {
 }
 
 Database::Database(GraphOptions const &options) noexcept
-    : _options(options),
-      _serializer(_cold) {
+    : _store(_cold),
+      _options(options) {
     _graph.set_options(_options);
-    _serializer.set_schema(&_schema);
 }
 
 Database::~Database() noexcept {
@@ -94,21 +92,44 @@ GdiStatus Database::open(kimix::filesystem::path const &dir,
         return GdiStatus::error_state;
     }
     set_options(options);
-    _serializer.set_schema(&_schema);
     if (dir.empty()) {
         // An in-memory database: no store, so persist() reports error_no_such_file
         // and nothing is ever read back. That is what a purely in-memory GDI
         // session wants.
         return GdiStatus::ok;
     }
-    size_t const map_size = _options.cold_map_size != 0 ? _options.cold_map_size
-                                                        : ColdStorage::default_map_size;
-    if (!_cold.open(dir, map_size)) {
-        return GdiStatus::error_io;
+    // --- backend selection (cold_store.h is the seam both backends implement) ---
+    // The two branches differ only in which store instance is opened and in which
+    // one the handle below points at: the save/load path behind it is the same
+    // code, so an lmdb database behaves exactly as it did before this choice
+    // existed. A failed open of either backend leaves the database closed, and
+    // every later persist()/load_store() reports error_no_such_file — the same
+    // observable state a bad store path has always produced.
+    if (_options.store_backend == ColdStoreBackend::xnvme_file) {
+        // cold_map_size is an LMDB knob: FileColdStore accepts and ignores it, and
+        // its own limit is the 2 GiB file wall (file_cold_store.h, amendment A8).
+        if (!_cold_file.open(dir, _options.cold_map_size)) {
+            return GdiStatus::error_io;
+        }
+        _backend = ColdStoreBackend::xnvme_file;
+        _store = ColdStore{_cold_file};
+    } else {
+        size_t const map_size = _options.cold_map_size != 0
+                                    ? _options.cold_map_size
+                                    : ColdStorage::default_map_size;
+        if (!_cold.open(dir, map_size)) {
+            return GdiStatus::error_io;
+        }
+        _backend = ColdStoreBackend::lmdb;
+        _store = ColdStore{_cold};
     }
+    // The serializer is built from the live handle here, not in the constructor:
+    // which backend it talks to is only known once the store is open.
+    _serializer.emplace(_store);
+    _serializer->set_schema(&_schema);
     MetaRecord meta;
-    if (_cold.read_meta(meta)) {
-        _serializer.set_meta(meta);
+    if (_store.read_meta(meta)) {
+        _serializer->set_meta(meta);
     }
     return load_store();
 }
@@ -117,22 +138,36 @@ void Database::close() noexcept {
     if (_tx != nullptr) {
         (void)abort();
     }
+    // Reset the serializer FIRST: it holds a copy of the handle, so it must not
+    // outlive the store it refers to.
+    _serializer.reset();
     _cold.close();
+    _cold_file.close();
+    _store = ColdStore{_cold};
+    _backend = ColdStoreBackend::lmdb;
 }
 
 GdiStatus Database::persist(bool full, GraphSerializeStats *out) {
-    if (!is_open()) {
+    if (!is_open() || !_serializer) {
         return GdiStatus::error_no_such_file;
     }
     // The schema and the options own the metadata a save stamps; hand them over so
     // a store is always self-describing.
-    MetaRecord meta = _serializer.meta();
+    MetaRecord meta = _serializer->meta();
     meta.format_version = kFormatVersion;
     meta.graph_name = _options.graph_name;
     meta.schema_version = _schema.version();
-    _serializer.set_meta(meta);
-    GraphSerializeStats const stats = full ? _serializer.save(_graph)
-                                           : _serializer.save_incremental(_graph);
+    _serializer->set_meta(meta);
+    // A FULL save replaces the file backend's file (it is a complete snapshot of
+    // the graph) instead of appending to it; the seam's save_batch() carries no
+    // such flag, so the store is told about it here. The store consumes the arm on
+    // its next save_batch() and it is cleared again below, so a save that writes
+    // nothing can never affect a later incremental one.
+    bool const rebuild = full && _backend == ColdStoreBackend::xnvme_file;
+    _cold_file.set_rebuild_next_batch(rebuild);
+    GraphSerializeStats const stats = full ? _serializer->save(_graph)
+                                           : _serializer->save_incremental(_graph);
+    _cold_file.set_rebuild_next_batch(false);
     _last_stats = stats;
     if (out != nullptr) {
         *out = stats;
@@ -144,7 +179,7 @@ GdiStatus Database::load_store(GraphSerializeStats *out) {
     if (!is_open()) {
         return GdiStatus::error_no_such_file;
     }
-    GraphSerializeStats const stats = _deserializer.load(_cold, _graph, &_schema);
+    GraphSerializeStats const stats = _deserializer.load(_store, _graph, &_schema);
     _last_stats = stats;
     if (out != nullptr) {
         *out = stats;

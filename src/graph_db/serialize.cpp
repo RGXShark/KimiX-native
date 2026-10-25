@@ -470,7 +470,7 @@ GraphSerializeStats GraphSerializer::_write(Graph &graph, bool full) {
 // Load
 // ===========================================================================
 
-GraphSerializeStats GraphDeserializer::load(ColdStorage &cold, Graph &graph,
+GraphSerializeStats GraphDeserializer::load(ColdStore cold, Graph &graph,
                                            Schema *schema) {
     _last_stats = GraphSerializeStats{};
     if (!cold.valid()) {

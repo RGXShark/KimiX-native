@@ -56,7 +56,9 @@
 #pragma once
 
 #include "capability.h"
+#include "cold_store.h"
 #include "edge.h"
+#include "file_cold_store.h"
 #include "graph.h"
 #include "graph_db_api.h"
 #include "graph_db_options.h"
@@ -71,6 +73,7 @@
 #include <core/guid.h>
 #include <core/memory.h>
 #include <core/stl/filesystem.h>
+#include <core/stl/optional.h>
 #include <core/stl/string.h>
 #include <core/stl/vector.h>
 
@@ -159,7 +162,9 @@ public:
                                  GraphOptions const &options);
     [[nodiscard]] GdiStatus open(kimix::filesystem::path const &dir);
     void close() noexcept;
-    [[nodiscard]] bool is_open() const noexcept { return _cold.valid(); }
+    // True while a store is open, whichever backend GraphOptions::store_backend
+    // selected for it.
+    [[nodiscard]] bool is_open() const noexcept { return _store.valid(); }
     // Write the graph into the store: full (every record) or incremental (only
     // the dirty ones). error_io when no store is open.
     [[nodiscard]] GdiStatus persist(bool full, GraphSerializeStats *out = nullptr);
@@ -171,7 +176,13 @@ public:
     [[nodiscard]] Graph const &graph() const noexcept { return _graph; }
     [[nodiscard]] Schema &schema() noexcept { return _schema; }
     [[nodiscard]] Schema const &schema() const noexcept { return _schema; }
+    // The LMDB backend instance — CLOSED (and unused) while the xnvme_file
+    // backend is the live one. Kept as the typed escape hatch for the LMDB
+    // store; a caller that needs the file store asks for its backend through
+    // GraphOptions instead.
     [[nodiscard]] ColdStorage &storage() noexcept { return _cold; }
+    // Which backend the currently open store is (lmdb while closed/in-memory).
+    [[nodiscard]] ColdStoreBackend store_backend() const noexcept { return _backend; }
     [[nodiscard]] GraphOptions const &options() const noexcept { return _options; }
     void set_options(GraphOptions const &options);
     [[nodiscard]] Capability capabilities() const noexcept { return current_capability(); }
@@ -403,10 +414,27 @@ private:
 
     Graph _graph;
     Schema _schema;
+    // The two cold-store backends, in declaration order so the handle below can
+    // be initialised from _cold. Exactly ONE of them is open at a time; which one
+    // is decided by GraphOptions::store_backend in open(), and both stay members
+    // (never heap-allocated) so the non-owning handle always points at live
+    // storage.
     ColdStorage _cold;
+    FileColdStore _cold_file;
+    // The seam handle over whichever backend is live (cold_store.h). open()
+    // re-points it; the serializer below is rebuilt from it, because a ColdStore
+    // is a copy of two pointers and re-pointing this one would not move the
+    // serializer's.
+    ColdStore _store;
     GraphOptions _options;
-    GraphSerializer _serializer;
+    // Built by open() from _store (GraphSerializer has no default constructor and
+    // its backend is chosen at open time), reset by close(). Empty while the
+    // database is closed or purely in-memory, which is exactly when persist() and
+    // load_store() report error_no_such_file anyway.
+    kimix::optional<GraphSerializer> _serializer;
     GraphDeserializer _deserializer;
+    // The backend the live store is; lmdb while closed.
+    ColdStoreBackend _backend{ColdStoreBackend::lmdb};
     GraphSerializeStats _last_stats{};
     // The one open transaction (nullptr outside one). Created and owned by
     // begin_transaction(); the Database only tracks it so a second begin is an

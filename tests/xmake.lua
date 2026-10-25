@@ -741,6 +741,15 @@ end)
 test_proj("test_graph_db_serialize", "unit/graph_db/test_graph_db_serialize.cpp", function()
     add_deps("kimix-graph-db")
 end)
+-- Behaviour-parity suite for the two cold-store backends behind cold_store.h (plan
+-- Phase 3): every persistence scenario of test_graph_db_serialize.cpp runs against
+-- BOTH the LMDB ColdStorage and the flat-file FileColdStore, plus the file backend's
+-- own contract (2 GiB wall, open-failure degradation, deferred-read staging lifetime,
+-- determinism, Database backend selection).
+test_proj("test_graph_db_file_store",
+  "unit/graph_db/test_graph_db_file_store.cpp", function()
+    add_deps("kimix-graph-db")
+end)
 test_proj("test_graph_db_bench", "unit/graph_db/test_graph_db_bench.cpp", function()
     add_deps("kimix-graph-db")
 end)
