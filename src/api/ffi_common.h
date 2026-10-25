@@ -128,10 +128,15 @@ typedef enum kimix_status {
      * argument was out of the accepted range (e.g. a length that overflows). */
     KIMIX_ERR_INVALID_ARG = 1,
     /* mimalloc could not satisfy the request.  The object is left exactly as it
-     * was before the call.  Produced today only by kimix_mem_posix_memalign():
-     * the other allocation entry points follow mimalloc's MI_XMALLOC build (see
-     * ffi_mem.h), and kimix's own container allocator reports exhaustion by
-     * aborting (core/stl/memory.h), so no container call can return this code. */
+     * was before the call.  Produced by kimix_mem_posix_memalign(), by the handle
+     * and buffer allocations of the file read/write area (api/ffi_read_write.h:
+     * an open handler, a recorded read destination, a recorded write payload, a
+     * copy staging buffer) and by the heap-placeholder constructors
+     * (kimix_vec_new, kimix_map_new, kimix_repair_new, which report it by
+     * returning NULL).  Every OTHER allocation entry point follows mimalloc's
+     * MI_XMALLOC build (see ffi_mem.h), and kimix's own container allocator
+     * reports exhaustion by aborting (core/stl/memory.h), so no container call
+     * can return this code. */
     KIMIX_ERR_OUT_OF_MEMORY = 2,
     /* An index / range argument is outside [0, size()). */
     KIMIX_ERR_OUT_OF_RANGE = 3,
@@ -147,9 +152,13 @@ typedef enum kimix_status {
      * input through their own out-parameters instead (a failed read, an empty
      * repair result). */
     KIMIX_ERR_INVALID_INPUT = 5,
-    /* A requested lookup did not hit (missing key, empty object).  Reserved for
-     * the same reason: the lookup entry points return the neutral value (NULL /
-     * 0 / false), which a C binding can test directly. */
+    /* A requested lookup did not hit (missing key, empty object), or a path
+     * cannot be opened/created.  The lookup entry points return the neutral value
+     * (NULL / 0 / false) instead, but the file read/write area
+     * (api/ffi_read_write.h) DOES produce this code: a foreign caller has no C++
+     * object to inspect, so "the path did not work" is reported explicitly at
+     * open time, and an open() that returns it writes nothing to its out
+     * parameter. */
     KIMIX_ERR_NOT_FOUND = 6,
     /* The library could not do what was asked for a reason that is not one of
      * the codes above; read the message out-parameter if the call has one.

@@ -57,6 +57,7 @@
 #include <core/stl/vector.h>
 
 #include <array>
+#include <atomic> // std::atomic<size_t> _size: MSVC pulls it in transitively, gcc does not
 #include <cstddef>
 #include <cstdint>
 #include <shared_mutex>

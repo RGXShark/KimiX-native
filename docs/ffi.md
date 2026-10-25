@@ -3,7 +3,7 @@
 `kimix_api` is a shared library (`src/api`) that puts a **plain C ABI** on top of
 `kimix-core`, so a caller in C, C#, Zig, Rust, Python (ctypes/cffi), Julia,
 Node `ffi-napi` or any other FFI host can use the kimix base facilities without
-C++ or pybind11 in the picture. It exports nine feature areas plus a small common
+C++ or pybind11 in the picture. It exports ten feature areas plus a small common
 header: the version/ABI/status/layout queries of
 `kimix_api_*` / `kimix_status_name`, the mimalloc allocator vocabulary
 (`kimix_mem_*`), the byte-buffer container `kimix::vector<std::byte>` as an inline
@@ -16,6 +16,10 @@ malformed LLM tool-call JSON (`kimix_repair*` / `kimix_json_*`), deterministic
 canonical JSON (`kimix_canonical_json*`), the SQLite3 database C API re-exported
 over the vendored amalgamation (`kimix_sqlite_*`), and the kimix-graph-db graph
 database C ABI re-exported from `src/graph_db/graph_c_api.h` (`kimix_graphdb_*`).
+and binary file read/write -- the reader and the writer of `kimix-core`'s file
+I/O plus the DEFERRED CONTEXT that records reads/writes/copies, owns the
+temporary buffers they need and releases them once the commit has written to
+disk (`kimix_rw_*`).
 Every entry point
 is declared in a pure-C header under `src/api`; this document is the searchable
 index of all of them.
@@ -28,7 +32,7 @@ index of all of them.
 | Build command | `xmake build kimix_api` (or `python bootstrap.py`) |
 | Output | `bin/<mode>/kimix_api.dll` + `kimix_api.lib` on Windows, `bin/<mode>/libkimix_api.so` on Linux (`<mode>` = `debug` / `release`) |
 | Umbrella header | `#include <api/kimix_api.h>` — include dir is `src/` |
-| Area headers | `<api/ffi_common.h>`, `<api/ffi_mem.h>`, `<api/ffi_vec.h>`, `<api/ffi_map.h>`, `<api/ffi_parallel.h>`, `<api/ffi_yyjson.h>`, `<api/ffi_repair.h>`, `<api/ffi_canonical.h>`, `<api/ffi_sqlite.h>`, `<api/ffi_graphdb.h>` |
+| Area headers | `<api/ffi_common.h>`, `<api/ffi_mem.h>`, `<api/ffi_vec.h>`, `<api/ffi_map.h>`, `<api/ffi_parallel.h>`, `<api/ffi_yyjson.h>`, `<api/ffi_repair.h>`, `<api/ffi_canonical.h>`, `<api/ffi_sqlite.h>`, `<api/ffi_graphdb.h>`, `<api/ffi_read_write.h>` |
 | Dependencies | `kimix-core` carries mimalloc / yyjson / marl (compiled **into** this image); `kimix-sqlite3` and `kimix-graph-db` are declared on this target directly, the same way `kimix-llm` declares its extra third-party deps |
 
 The headers are valid for a **C99/C11 compiler and for C++17 or newer**: opaque
@@ -2677,6 +2681,190 @@ N edge creates, the same shape without a per-row warning (a duplicate edge is no
 - Errors: `KIMIX_GDB_ERR_READ_ONLY_TRANSACTION` inside a collective tx; `KIMIX_GDB_ERR_ARGUMENT` for a NULL `specs` with `count > 0`.
 
 ---
+## File read/write -- `<api/ffi_read_write.h>` (`kimix_rw_*`)
+
+Binary file I/O over `kimix-core`'s own classes, plus the piece a managed caller
+cannot build for itself: a **deferred context** that owns the temporary buffers of
+a batch from the moment a command is recorded until the commit has written it to
+disk.
+
+| Object | Wraps | Lifetime |
+|---|---|---|
+| `kimix_rw_stream` | `kimix::BinaryFileStream` (`core/binary_file_stream.h`) | `kimix_rw_stream_open()` -> `kimix_rw_stream_close()` / `kimix_rw_stream_free()` |
+| `kimix_rw_writer` | `kimix::BinaryFileWriter` (`core/binary_file_writer.h`) | `kimix_rw_writer_open()` -> `kimix_rw_writer_close()` / `kimix_rw_writer_free()` |
+| `kimix_rw_context` | the deferred context in `src/api/ffi_read_write.cpp` | `kimix_rw_context_create()` -> `kimix_rw_context_clear()` / `kimix_rw_context_free()` |
+
+Both handles are allocated by the library (mimalloc, this image's heap) and
+released by the matching `*_free()`; `close()` releases the FILE* / xnvme device
+but keeps the handle object usable-but-closed, so a Windows caller can close
+before deleting the file and still free deterministically.
+
+**Why the deferred context exists.** A batch needs memory that survives from the
+RECORD call to the COMMIT: the destination of a read, the payload of a write, the
+staging buffer of a copy. A C++ caller keeps that in a local vector; a C# caller
+would have to pin a GC buffer across an indeterminate number of calls. The
+context takes it over instead: `kimix_rw_context_add_read()` allocates the
+destination, `..._add_write()` COPIES the caller's bytes, `..._add_copy()`
+allocates the staging buffer, and `kimix_rw_context_commit()` releases what the
+disk no longer needs -- the write payloads and the copy staging buffers, right
+after the write (and the fsync) that consumed them. A read destination is the
+RESULT, so it stays until it is taken with `kimix_rw_context_take_read()`, or
+released by `clear()` / `free()`. The ledger
+(`kimix_rw_context_owned_bytes()` / `..._owned_blocks()`, also reported by
+`kimix_rw_stats` after a commit) makes that automatic release observable.
+
+**Commit order** is fixed: pending reads (grouped by path), then the read half of
+every copy (grouped by source path), then the writes -- recorded writes plus the
+copies whose read landed fully -- grouped by destination path, each file synced
+and closed after its writes. Reads therefore always run before any write, which
+is what makes "read and write the same file in one commit" well defined. Writes
+and copies are consumed by a commit whatever their outcome; a read keeps its
+first result (record a new one to re-read).
+
+**Platform limits** (inherited from the C++ classes). Reading positions with a
+`long`, so on Windows an offset above `LONG_MAX` is refused with
+`KIMIX_ERR_OUT_OF_RANGE` rather than truncated. Writing goes through the vendored
+xNVMe, whose open path stats with a 32-bit `stat` on Windows: a file of 2 GiB or
+more cannot be opened there. A platform with no wired xnvme backend can read but
+never open a writer.
+
+### Reader -- `kimix_rw_stream_*`
+#### `kimix_status kimix_rw_stream_open(KIMIX_IN const char *path, KIMIX_OUT kimix_rw_stream **out)`
+Opens `path` read-only.
+- Wraps: the `kimix::BinaryFileStream(const string&)` constructor, which is `fopen(path, "rb")`.
+- Ownership: on success the caller owns `*out` and releases it with exactly one `kimix_rw_stream_free()` (or `close()` first, then `free()`); `*out` is written only on success.
+- Errors: `KIMIX_ERR_INVALID_ARG` for a NULL `path` / `out`; `KIMIX_ERR_NOT_FOUND` when the file cannot be opened (missing, a directory, permission, an over-long path); `KIMIX_ERR_OUT_OF_MEMORY` when the handle cannot be allocated.
+#### `void kimix_rw_stream_close(KIMIX_NULLABLE kimix_rw_stream *stream)`
+Closes the file and resets the handle (length 0, position 0); every later call reports its neutral value. There is no reopen -- open a new stream. NULL is a no-op.
+- Wraps: `kimix::BinaryFileStream::close()`.
+#### `void kimix_rw_stream_free(KIMIX_TRANSFER KIMIX_NULLABLE kimix_rw_stream *stream)`
+Releases the handle itself (closing the file first). NULL is a no-op. The pointer is dangling afterwards.
+#### `bool kimix_rw_stream_is_open(KIMIX_IN const kimix_rw_stream *stream)`
+True while a file is open; false for NULL and for a closed handle.
+#### `uint64_t kimix_rw_stream_length(KIMIX_IN const kimix_rw_stream *stream)`
+The size captured at open time, in bytes (0 for NULL/closed). Windows: 32-bit `ftell`.
+- Wraps: `kimix::BinaryFileStream::length()`.
+#### `uint64_t kimix_rw_stream_position(KIMIX_IN const kimix_rw_stream *stream)`
+Where the next read starts (0 for NULL; a negative `ftell` is reported as 0).
+- Wraps: `kimix::BinaryFileStream::position()`.
+#### `kimix_status kimix_rw_stream_set_pos(KIMIX_IN_OUT kimix_rw_stream *stream, uint64_t pos)`
+Seeks to an absolute byte position; past the end is allowed (the next read returns 0 bytes).
+- Wraps: `kimix::BinaryFileStream::set_pos(long)`.
+- Errors: `KIMIX_ERR_INVALID_ARG` for NULL, `KIMIX_ERR_INVALID_STATE` when no file is open, `KIMIX_ERR_OUT_OF_RANGE` when `pos` does not fit the underlying `long`.
+#### `size_t kimix_rw_stream_read(KIMIX_IN_OUT kimix_rw_stream *stream, KIMIX_OUT void *buffer, size_t size)`
+Reads up to `size` bytes at the current position into `buffer` and advances it. Returns the bytes that landed: a SHORT count is normal at end of file (loop until 0). 0 also covers NULL args, a closed stream and an unreadable file -- the reader shares one error channel with EOF.
+- Wraps: `kimix::BinaryFileStream::read(void *, size_t)`.
+- Ownership: `buffer` is caller-owned, writable for `size` bytes.
+#### `size_t kimix_rw_stream_read_at(KIMIX_IN_OUT kimix_rw_stream *stream, uint64_t pos, KIMIX_OUT void *buffer, size_t size)`
+`set_pos()` + `read()` in one call: reads at an absolute position, leaving the position just past the bytes read.
+#### `kimix_status kimix_rw_stream_read_all(KIMIX_IN_OUT kimix_rw_stream *stream, KIMIX_OUT kimix_vec *out)`
+Reads the WHOLE file from the beginning into `out` (the position ends at the end of the data).
+- Same behaviour as `kimix::BinaryFileStream::read_all()` (seek to 0, read the whole length, resize to the bytes that landed), performed by this library into the placeholder's own element type: one read straight into that buffer, so the file is copied once and never reinterpreted. (Calling core's `read_all()` and moving its `vector<kimix::byte>` into a `vector<std::byte>` would be a type-punned move the optimizer is allowed to break -- it silently lost the whole file under gcc -O2, so this area does not do it.)
+- Ownership: the caller's placeholder owns the bytes; release with `kimix_vec_destroy()` (heap form: `kimix_vec_free()`).
+- Errors: `KIMIX_ERR_INVALID_ARG` for NULL args; `KIMIX_ERR_INVALID_STATE` when no file is open or `out` already holds a LIVE vector (this entry point only initialises a raw placeholder).
+#### `kimix_status kimix_rw_read_file(KIMIX_IN const char *path, KIMIX_OUT kimix_vec *out)`
+open + `read_all` + free, in one call, for the "the whole file is one buffer" case.
+- Errors: as `kimix_rw_stream_open()` plus `KIMIX_ERR_INVALID_STATE` for a live placeholder.
+### Writer -- `kimix_rw_writer_*`
+#### `kimix_status kimix_rw_writer_open(KIMIX_IN const char *path, bool truncate, KIMIX_OUT kimix_rw_writer **out)`
+Opens (and creates) `path` for writing. `truncate` true empties an existing file, false KEEPS its content -- which is what positioned overwrites need.
+- Wraps: the `kimix::BinaryFileWriter(const string&, bool)` constructor.
+- Ownership: on success the caller owns `*out`, released with `kimix_rw_writer_free()` (after an optional `close()`); `*out` is written only on success.
+- Errors: `KIMIX_ERR_INVALID_ARG` for a NULL/empty `path` or a NULL `out`; `KIMIX_ERR_NOT_FOUND` when the file cannot be opened/created (missing directory, permission, a Windows 2 GiB+ file, a platform without an xnvme backend); `KIMIX_ERR_OUT_OF_MEMORY` for the handle.
+#### `void kimix_rw_writer_close(KIMIX_NULLABLE kimix_rw_writer *writer)`
+Closes the device handle and resets the position to 0. Does NOT fsync (the bytes already handed to the OS survive; only the durability guarantee needs `sync()`). NULL is a no-op.
+#### `void kimix_rw_writer_free(KIMIX_TRANSFER KIMIX_NULLABLE kimix_rw_writer *writer)`
+Releases the handle itself (closing first -- on Windows the file can only be deleted afterwards). NULL is a no-op.
+#### `bool kimix_rw_writer_is_open(KIMIX_IN const kimix_rw_writer *writer)`
+True while a file is open.
+#### `uint64_t kimix_rw_writer_position(KIMIX_IN const kimix_rw_writer *writer)`
+The position the next write goes to (0 for NULL/closed).
+#### `void kimix_rw_writer_set_pos(KIMIX_NULLABLE kimix_rw_writer *writer, uint64_t pos)`
+Sets the absolute position of the next write; past the end extends the file. NULL is a no-op.
+#### `size_t kimix_rw_writer_write(KIMIX_IN_OUT kimix_rw_writer *writer, KIMIX_IN const void *data, size_t size)`
+Writes at the current position and advances it. ALL-OR-NOTHING: returns `size` on success, 0 on failure (closed writer, NULL buffer, full disk). A 0-byte write is a no-op that returns 0.
+- Wraps: `kimix::BinaryFileWriter::write(const void *, size_t)`.
+#### `size_t kimix_rw_writer_write_at(KIMIX_IN_OUT kimix_rw_writer *writer, uint64_t pos, KIMIX_IN const void *data, size_t size)`
+`set_pos()` + `write()` in one call; the position ends just past the bytes written.
+#### `bool kimix_rw_writer_sync(KIMIX_IN_OUT kimix_rw_writer *writer)`
+Flushes to stable storage (fsync / FlushFileBuffers). False for NULL, a closed writer or an I/O error.
+#### `kimix_status kimix_rw_write_file(KIMIX_IN const char *path, KIMIX_IN const void *data, size_t size, bool truncate)`
+open + write + sync + close, in one call.
+- Errors: `KIMIX_ERR_INVALID_ARG`, `KIMIX_ERR_NOT_FOUND` (as `kimix_rw_writer_open()`), `KIMIX_ERR_FAILED` when the write or the sync failed.
+### Deferred context -- `kimix_rw_context_*`
+#### `kimix_status kimix_rw_context_create(KIMIX_OUT kimix_rw_context **out)`
+Creates an empty context (no commands, no memory).
+- Errors: `KIMIX_ERR_INVALID_ARG` for a NULL `out`; `KIMIX_ERR_OUT_OF_MEMORY` when the context cannot be allocated.
+#### `void kimix_rw_context_free(KIMIX_TRANSFER KIMIX_NULLABLE kimix_rw_context *ctx)`
+Releases the context and EVERY byte it still owns -- pending commands, read slots that were not taken, staging buffers -- then the handle. Buffers taken with `kimix_rw_context_take_read()` belong to the caller and are untouched. NULL is a no-op.
+#### `kimix_status kimix_rw_context_add_read(KIMIX_IN_OUT kimix_rw_context *ctx, KIMIX_IN const char *path, uint64_t offset, size_t size, KIMIX_OUT KIMIX_NULLABLE size_t *out_index)`
+Records one positioned read and ALLOCATES its destination (`size` bytes, zero-filled, on this library's heap). Nothing is opened and no I/O happens here.
+- Ownership: the destination is the context's until the slot is taken or the context is cleared/freed.
+- Errors: `KIMIX_ERR_INVALID_ARG` for a NULL `ctx` / `path`; `KIMIX_ERR_OUT_OF_MEMORY` when the destination cannot be allocated (the context is unchanged). `out_index` (optional) receives the slot index, stable until `clear()`.
+#### `kimix_status kimix_rw_context_add_write(KIMIX_IN_OUT kimix_rw_context *ctx, KIMIX_IN const char *path, uint64_t offset, KIMIX_IN const void *data, size_t size)`
+Records one positioned write and COPIES `data` onto the library heap NOW, so the caller's buffer may be released, reused or collected the moment the call returns. The copy lives until the commit's disk write and is released by that commit. The destination is opened at commit time (created if missing, NEVER truncated).
+- Errors: `KIMIX_ERR_INVALID_ARG` for a NULL `ctx` / `path`, or a NULL `data` with a non-zero `size`; `KIMIX_ERR_OUT_OF_MEMORY` for the payload copy.
+#### `kimix_status kimix_rw_context_add_copy(KIMIX_IN_OUT kimix_rw_context *ctx, KIMIX_IN const char *src_path, uint64_t src_offset, KIMIX_IN const char *dst_path, uint64_t dst_offset, size_t size)`
+Records a file-to-file copy: the commit reads `size` bytes of `src_path` at `src_offset` into a library-owned staging buffer and writes it to `dst_path` at `dst_offset`. The staging buffer is released by the commit right after the write; a copy whose read did not deliver every byte is NOT written and counts as a failed copy.
+- Errors: `KIMIX_ERR_INVALID_ARG` for a NULL `ctx` or path; `KIMIX_ERR_OUT_OF_MEMORY` for the staging buffer.
+#### `kimix_status kimix_rw_context_commit(KIMIX_IN_OUT kimix_rw_context *ctx, KIMIX_OUT KIMIX_NULLABLE kimix_rw_stats *out_stats)`
+Executes every pending command in the fixed order described above, then releases the temp memory the disk no longer needs. Failures are COUNTED, not returned: a missing path, a short read or a rejected write fails only that command and never aborts the batch.
+- Errors: `KIMIX_ERR_INVALID_ARG` for a NULL `ctx`. Never `KIMIX_ERR_OUT_OF_MEMORY`: allocation happens in the `add_*` calls, so a commit only ever frees.
+- `kimix_rw_stats` (filled when `out_stats` is not NULL): `reads_requested` / `reads_completed` / `reads_failed`, `writes_requested` / `writes_completed` / `writes_failed`, `copies_requested` / `copies_completed` / `copies_failed`, `bytes_read`, `bytes_written`, and the ledger `owned_bytes` / `owned_blocks` as of AFTER the commit (0 when only writes and copies were committed).
+#### `kimix_status kimix_rw_context_read_result(KIMIX_IN const kimix_rw_context *ctx, size_t index, KIMIX_OUT const void **data, KIMIX_OUT size_t *size)`
+The BORROWED result of an executed read slot; `*size` is what actually landed (0 -- and possibly a NULL `*data` -- when the read delivered nothing). Valid until the slot is taken, the context is cleared or freed.
+- Errors: `KIMIX_ERR_INVALID_ARG` for NULL out-params, `KIMIX_ERR_OUT_OF_RANGE` for an unknown index, `KIMIX_ERR_INVALID_STATE` for a slot that was never committed or was already taken.
+#### `kimix_status kimix_rw_context_take_read(KIMIX_IN_OUT kimix_rw_context *ctx, size_t index, KIMIX_OUT void **data, KIMIX_OUT size_t *size)`
+Hands the bytes of an executed read slot to the caller: the context stops owning (and counting) them, so `clear()` / `free()` will not touch them. One take per slot.
+- Ownership: `*data` (may be NULL for a 0-byte result) is the caller's; release it with `kimix_mem_free()`.
+- Errors: as `kimix_rw_context_read_result()`, where `KIMIX_ERR_INVALID_STATE` also covers a second take.
+#### `kimix_status kimix_rw_context_clear(KIMIX_IN_OUT kimix_rw_context *ctx)`
+Drops every recorded command and releases EVERY byte the context still owns (pending and executed reads, uncommitted write payloads, staging buffers). The handle stays usable and the read index space restarts at 0; buffers taken with `take_read()` are untouched.
+- Errors: `KIMIX_ERR_INVALID_ARG` for a NULL `ctx`.
+#### `size_t kimix_rw_context_read_count(KIMIX_IN const kimix_rw_context *ctx)`
+The number of recorded read slots: the valid index range of `read_result()` / `take_read()` (0 for NULL).
+#### `size_t kimix_rw_context_pending_reads(KIMIX_IN const kimix_rw_context *ctx)`
+Read slots the NEXT commit will execute (never executed and not taken). 0 for NULL.
+#### `size_t kimix_rw_context_pending_writes(KIMIX_IN const kimix_rw_context *ctx)` / `size_t kimix_rw_context_pending_copies(KIMIX_IN const kimix_rw_context *ctx)`
+Recorded commands the next commit will consume. 0 for NULL.
+#### `size_t kimix_rw_context_owned_bytes(KIMIX_IN const kimix_rw_context *ctx)` / `size_t kimix_rw_context_owned_blocks(KIMIX_IN const kimix_rw_context *ctx)`
+What the context currently owns: total bytes and the number of live allocations behind them (0/0 for NULL, for an empty context, and for one whose temp memory the commit / clear / take_read already released). This is the observable half of the automatic release.
+
+### A complete round trip
+```c
+/* write 4096 bytes in one call */
+if (kimix_rw_write_file("payload.bin", buf, 4096, true) != KIMIX_OK) { /* ... */ }
+
+/* read it back in pieces through a handle */
+kimix_rw_stream *in = NULL;
+if (kimix_rw_stream_open("payload.bin", &in) == KIMIX_OK) {
+    unsigned char chunk[1024];
+    size_t n = kimix_rw_stream_read_at(in, 1024, chunk, sizeof chunk); /* 1024 bytes */
+    kimix_rw_stream_free(in);
+}
+
+/* record work, then commit it: the library owns the buffers in between */
+kimix_rw_context *ctx = NULL;
+kimix_rw_stats stats;
+size_t slot = 0;
+if (kimix_rw_context_create(&ctx) == KIMIX_OK) {
+    kimix_rw_context_add_read(ctx, "payload.bin", 0, 512, &slot);      /* library allocates */
+    kimix_rw_context_add_write(ctx, "copy.bin", 0, buf, 512);          /* library copies    */
+    kimix_rw_context_add_copy(ctx, "payload.bin", 512, "copy.bin", 512, 1024);
+    kimix_rw_context_commit(ctx, &stats);
+    /* stats.copies_completed == 1; stats.owned_bytes is the read slot only,
+       because the write payload and the copy staging buffer were freed here. */
+    const void *data = NULL;
+    size_t size = 0;
+    if (kimix_rw_context_read_result(ctx, slot, &data, &size) == KIMIX_OK) {
+        /* use `size` bytes at `data` ... they are BORROWED */
+    }
+    kimix_rw_context_free(ctx); /* releases the read slots too */
+}
+```
+
+---
+
 ## Quick start
 
 ## Quick start
@@ -3040,6 +3228,42 @@ sub-section) the declaration lives in.
 | `kimix_repair_str`                       | repair   | The NUL-terminated spelling of `kimix_repair()`; the input length is `strlen(nul_terminated_json)`. |
 | `kimix_repaired_cstr`                    | repair   | The same text as a NUL-terminated C string — a non-empty result already ends with `'\0'` inside its buffer… |
 | `kimix_repaired_view`                    | repair   | The repaired text WITHOUT its trailing `'\0'` — the first `size() - 1` bytes of `result`. |
+| `kimix_rw_context_add_copy` | read/write | Records a file-to-file copy: the commit reads `size` bytes of `src_path` at `src_offset` into a library-owned staging buffer and writes it to `dst_path` at `dst_offset`; the buffer is released right after the write. |
+| `kimix_rw_context_add_read` | read/write | Records a positioned read and ALLOCATES its destination on the library heap; the slot is filled by `commit()`. |
+| `kimix_rw_context_add_write` | read/write | Records a positioned write and COPIES `data` onto the library heap, so the caller's buffer is free as soon as the call returns. |
+| `kimix_rw_context_clear` | read/write | Drops every recorded command and releases every byte the context still owns; buffers taken with `take_read()` are untouched. |
+| `kimix_rw_context_commit` | read/write | Executes the pending reads, the copy reads and then all writes, grouped one open per path, and releases the temp memory the disk no longer needs. |
+| `kimix_rw_context_create` | read/write | Creates an empty deferred context. |
+| `kimix_rw_context_free` | read/write | Releases the context and every byte it still owns (a no-op for NULL). |
+| `kimix_rw_context_owned_blocks` | read/write | How many live allocations the context currently owns (0 after a commit that had no read slots, and after `clear()`). |
+| `kimix_rw_context_owned_bytes` | read/write | How many bytes the context currently owns -- the ledger that makes the automatic release after a commit observable. |
+| `kimix_rw_context_pending_copies` | read/write | Recorded copies the next commit will consume. |
+| `kimix_rw_context_pending_reads` | read/write | Read slots the next commit will execute (never executed and not taken). |
+| `kimix_rw_context_pending_writes` | read/write | Recorded writes the next commit will consume. |
+| `kimix_rw_context_read_count` | read/write | The number of recorded read slots: the valid index range of `read_result()` / `take_read()`. |
+| `kimix_rw_context_read_result` | read/write | The BORROWED result of an executed read slot (`*size` is what actually landed). |
+| `kimix_rw_context_take_read` | read/write | Hands an executed read slot's bytes to the caller, who releases them with `kimix_mem_free()`; one take per slot. |
+| `kimix_rw_read_file` | read/write | open + read the whole file + free, in one call, into a caller-owned `kimix_vec`. |
+| `kimix_rw_stream_close` | read/write | Closes the FILE* and resets the handle; the handle object stays allocatable-but-closed. |
+| `kimix_rw_stream_free` | read/write | Releases the reader handle itself (closing first); a no-op for NULL. |
+| `kimix_rw_stream_is_open` | read/write | True while a file is open. |
+| `kimix_rw_stream_length` | read/write | The file size captured at open time, in bytes. |
+| `kimix_rw_stream_open` | read/write | Opens a path read-only behind an opaque reader handle. |
+| `kimix_rw_stream_position` | read/write | The position the next read starts at. |
+| `kimix_rw_stream_read` | read/write | Reads at the current position; a short count is normal at end of file (loop until 0). |
+| `kimix_rw_stream_read_all` | read/write | Reads the whole file into a caller-owned `kimix_vec` (the position ends at the end of the data). |
+| `kimix_rw_stream_read_at` | read/write | `set_pos()` + `read()` in one call: reads at an absolute position. |
+| `kimix_rw_stream_set_pos` | read/write | Seeks to an absolute byte position; a position a 32-bit `long` cannot express is refused with `KIMIX_ERR_OUT_OF_RANGE`. |
+| `kimix_rw_write_file` | read/write | open + write the whole buffer + fsync + close, in one call. |
+| `kimix_rw_writer_close` | read/write | Closes the device handle and resets the position (does not fsync). |
+| `kimix_rw_writer_free` | read/write | Releases the writer handle itself (closing first -- required before deleting the file on Windows). |
+| `kimix_rw_writer_is_open` | read/write | True while a file is open. |
+| `kimix_rw_writer_open` | read/write | Opens (and creates) a path for writing, truncating it or keeping its content. |
+| `kimix_rw_writer_position` | read/write | The absolute position the next write goes to. |
+| `kimix_rw_writer_set_pos` | read/write | Sets the absolute position of the next write; past the end extends the file. |
+| `kimix_rw_writer_sync` | read/write | Flushes the written data to stable storage (fsync / FlushFileBuffers). |
+| `kimix_rw_writer_write` | read/write | Writes at the current position, all-or-nothing: the return value is `size` on success or 0. |
+| `kimix_rw_writer_write_at` | read/write | `set_pos()` + `write()` in one call: writes at an absolute position. |
 | `kimix_status_name`                      | ABI      | The textual name of a status code (`"KIMIX_OK"`, `"KIMIX_ERR_OUT_OF_MEMORY"`, …). |
 | `kimix_vec_abi_align`                    | vec      | The fixed alignment a caller must give the placeholder (`KIMIX_VEC_ALIGN`, 16). |
 | `kimix_vec_abi_bytes`                    | vec      | The fixed inline-storage size a caller must reserve (`KIMIX_VEC_BYTES`, 64). |
@@ -3218,4 +3442,4 @@ sub-section) the declaration lives in.
 | `kimix_yyjson_write`                     | json §6  | Serialises a whole document into a freshly allocated, NUL-terminated UTF-8 string. |
 | `kimix_yyjson_write_buf`                 | json §6  | Serialises a document into the caller's own buffer: no allocation at all, nothing to free. |
 
-Total: **336 functions** — ABI 5, `kimix_mem_*` 35, `kimix_vec_*` 36, `kimix_map_*` 11, `kimix_fiber_*` 2, `kimix_yyjson_*` 140, repair 8, canonical 2, sqlite 33, graphdb 64. Any of these is a valid Ctrl-F target for the section above.
+Total: **372 functions** — ABI 5, `kimix_mem_*` 35, `kimix_vec_*` 36, `kimix_map_*` 11, `kimix_fiber_*` 2, `kimix_yyjson_*` 140, repair 8, canonical 2, sqlite 33, graphdb 64, read/write 36. Any of these is a valid Ctrl-F target for the section above.
