@@ -123,6 +123,11 @@ target("kimix_api")
         -- target must likewise resolve KIMIX_CORE_API as dllimport.
         if target:is_plat("windows") then
             target:add("defines", "NOMINMAX", "_CRT_SECURE_NO_WARNINGS", {public = true})
+        elseif target:is_plat("linux") then
+            -- libkimix_api.so NEEDEDs libkimix-core.so; an $ORIGIN RUNPATH lets a
+            -- dlopen by absolute path resolve it from the same directory, as the
+            -- lua target already does (Windows searches the DLL's own directory).
+            target:add("rpathdirs", "$ORIGIN")
         end
     end)
     _config_project({batch_size = 8, project_kind = "shared"})
