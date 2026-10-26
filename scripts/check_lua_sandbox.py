@@ -69,7 +69,14 @@ SOURCE_EXTENSIONS = (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", "
 SKIP_DIRECTORIES = {".git", ".deps", "build", "bin", "out", "node_modules", ".kimix_cache", ".vscode"}
 
 # Files (relative, forward slashes) where an occurrence is allowed.
-ALLOWED_FILES = {"tests/unit/ext/test_lua.cpp"}
+ALLOWED_FILES = {
+    "tests/unit/ext/test_lua.cpp",
+    # the arena / table-memory suites embed a hosted interpreter on purpose:
+    # they compare an arena state with a plain luaL_newstate one
+    "tests/unit/ext/test_lua_arena.cpp",
+    "tests/unit/ext/test_lua_table_mem.cpp",
+    "tests/unit/ext/bench_lua_mem.cpp",
+}
 # Directory prefixes (relative, forward slashes) where an occurrence is allowed.
 ALLOWED_PREFIXES = ("src/ext/", "src/script/", "docs/")
 

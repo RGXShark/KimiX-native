@@ -1,69 +1,1989 @@
-diff --git a/lauxlib.c b/lauxlib.c
-index 8620c8b3..34e73868 100644
---- a/lauxlib.c
-+++ b/lauxlib.c
-@@ -27,6 +27,10 @@
- #include "lauxlib.h"
- #include "llimits.h"
- 
-+#if defined(KIMIX_LUA_USE_MIMALLOC)	/* { */
-+#include <mimalloc.h>	/* kimix: default allocator backed by mimalloc */
-+#endif					/* } */
-+
- 
- /*
- ** {======================================================
-@@ -1061,12 +1065,21 @@ LUALIB_API const char *luaL_gsub (lua_State *L, const char *s,
- 
- void *luaL_alloc (void *ud, void *ptr, size_t osize, size_t nsize) {
-   UNUSED(ud); UNUSED(osize);
-+#if defined(KIMIX_LUA_USE_MIMALLOC)				/* { */
-+  if (nsize == 0) {
-+  mi_free(ptr);
-+  return NULL;
-+  }
-+  else
-+  return mi_realloc(ptr, nsize);
-+#else						/* }{ */
-   if (nsize == 0) {
--    free(ptr);
--    return NULL;
-+ free(ptr);
-+ return NULL;
+diff --git a/lapi.c b/lapi.c
+index 8bc2ddd1..2fb787ab 100644
+--- a/lapi.c
++++ b/lapi.c
+@@ -1241,7 +1241,18 @@ LUA_API int lua_gc (lua_State *L, int what, ...) {
+         g->gcparams[param] = luaO_codeparam(cast_uint(value));
+       break;
+     }
+-    default: res = -1;  /* invalid option */
++    #if defined(KIMIX_LUA_ARENA)		/* { */
++    case LUA_GCTRIM: {  /* kimix: return empty segments to mimalloc */
++      int level = va_arg(argp, int);
++      res = cast_int(lua_ArenaTrim(L, level));
++      break;
++    }
++    case LUA_GCCOMPACT: {  /* kimix: pack table blocks out of sparse slabs */
++      int saving = va_arg(argp, int);
++      res = cast_int(luaC_compact(L, saving));
++      break;
++    }
++    #endif					/* } */    default: res = -1;  /* invalid option */
    }
-   else
--    return realloc(ptr, nsize);
-+ return realloc(ptr, nsize);
-+#endif					/* } */
+   va_end(argp);
+   lua_unlock(L);
+@@ -1332,6 +1343,19 @@ LUA_API lua_Alloc lua_getallocf (lua_State *L, void **ud) {
  }
  
  
-diff --git a/luaconf.h b/luaconf.h
-index bdac085c..3961531d 100644
---- a/luaconf.h
-+++ b/luaconf.h
-@@ -302,7 +302,23 @@
- ** the libraries, you may want to use the following definition (define
- ** LUA_BUILD_AS_DLL to get it).
- */
--#if defined(LUA_BUILD_AS_DLL)	/* { */
-+#if defined(KIMIX_LUA_BUILD_SHARED)	/* { */
++#if defined(KIMIX_LUA_ARENA)		/* { */
++/*
++** Shrink the array part of the table at 'idx'; returns the number of
++** bytes released. A no-op for a non-table, for a table with no array
++** part and for one that is not sparse enough to be worth a move.
++*/
++LUA_API size_t lua_shrinktable (lua_State *L, int idx) {
++  const TValue *o = index2value(L, idx);
++  if (!ttistable(o))
++    return 0;
++  return luaH_shrink(L, hvalue(o));
++}
++#endif					
+ LUA_API void lua_setallocf (lua_State *L, lua_Alloc f, void *ud) {
+   lua_lock(L);
+   G(L)->ud = ud;
+diff --git a/larena.c b/larena.c
+new file mode 100644
+index 00000000..485db907
+--- /dev/null
++++ b/larena.c
+@@ -0,0 +1,1025 @@
++/*
++** $Id: larena.c $
++** kimix extension: per-lua_State memory arena (KIMIX_LUA_ARENA)
++** See Copyright Notice in lua.h
++*/
 +
-+#if defined(_WIN32)
-+#define LUA_API __declspec(dllexport)
-+#else						/* }{ */
-+#define LUA_API	extern __attribute__((visibility("default")))
-+#endif						/* } */
++#define larena_c
++#define LUA_CORE
++#define LUA_LIB
 +
-+#elif defined(KIMIX_LUA_USE_SHARED)	/* { */
++#include "lprefix.h"
 +
-+#if defined(_WIN32)
-+#define LUA_API __declspec(dllimport)
-+#else						/* }{ */
-+#define LUA_API		extern
-+#endif						/* } */
 +
-+#elif defined(LUA_BUILD_AS_DLL)	/* { */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "lua.h"
++
++#include "lauxlib.h"
++#include "larena.h"
++#include "lstate.h"
++
++#include <mimalloc.h>		/* the one heap of the process */
++
++
++#if defined(KIMIX_LUA_ARENA)		/* { */
++
++/*
++** {==================================================================
++** Small helpers
++** ===================================================================
++*/
++
++static unsigned arena_align16 (size_t n) {
++  return cast_uint((n + 15u) & ~cast_sizet(15u));
++}
++
++
++static int arena_log2 (size_t v) {
++  int l = 0;
++  while (v > 1) {
++    v >>= 1;
++    l++;
++  }
++  return l;
++}
++
++
++static int arena_ispow2 (size_t v) {
++  return v != 0 && (v & (v - 1)) == 0;
++}
++
++
++static int arena_hasenv (const char *name) {
++  const char *v = getenv(name);
++  return v != NULL && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
++}
++
++
++void lua_arena_defaults (lua_ArenaConfig *cfg) {
++  cfg->segment_bytes = ARENA_DEF_SEGMENT;
++  cfg->small_max = ARENA_DEF_SMALL_MAX;
++  cfg->huge_cache = ARENA_DEF_HUGE_CACHE;
++  cfg->dry_run = 0;
++  cfg->gc_pause_pct = 0;
++  cfg->gc_stepmul = 0;
++  cfg->enable_compaction = 0;
++}
++
++/* }================================================================== */
++
++
++/*
++** {==================================================================
++** Class table (built once per arena)
++** ===================================================================
++*/
++
++static int arena_addclass (lua_Arena *a, unsigned slot, int tier) {
++  int i;
++  ArenaClass *c;
++  if (slot == 0 || slot > (unsigned)a->cfg.small_max)
++    return ARENA_CLASS_NONE;
++  for (i = 0; i < a->nclasses; i++) {
++    if (a->classes[i].slot_size == slot)
++      return i;  /* a slot size is one class, whatever its tier label */
++  }
++  if (a->nclasses >= ARENA_MAX_CLASSES)
++    return ARENA_CLASS_NONE;
++  c = &a->classes[a->nclasses];
++  memset(c, 0, sizeof(*c));
++  c->slot_size = slot;
++  c->nslots_per_seg = (unsigned)(a->cfg.segment_bytes / slot);
++  if (c->nslots_per_seg == 0)
++    c->nslots_per_seg = 1;  /* a big slot: one slot per segment */
++  c->seg_payload = c->nslots_per_seg * slot;
++  c->tier = tier;
++  return a->nclasses++;
++}
++
++
++static void arena_addgeneric (lua_Arena *a, unsigned slot, int tier) {
++  int cid = arena_addclass(a, slot, tier);
++  if (cid < 0)
++    return;
++  if (a->ngeneric > 0 && a->generic_slot[a->ngeneric - 1] >= slot)
++    return;  /* built in ascending order, so duplicates cannot happen */
++  if (a->ngeneric >= ARENA_MAX_CLASSES)
++    return;
++  a->generic_slot[a->ngeneric] = slot;
++  a->generic_class[a->ngeneric] = cid;
++  a->ngeneric++;
++}
++
++
++static void arena_build (lua_Arena *a) {
++  int log;
++  unsigned s;
++  a->nclasses = 0;
++  a->ngeneric = 0;
++  for (log = 0; log < 32; log++) {
++    a->arr_by_log[log] = ARENA_CLASS_NONE;
++    a->node_by_log[log] = ARENA_CLASS_NONE;
++    a->nodex_by_log[log] = ARENA_CLASS_NONE;
++  }
++  /* tiny tier: 16, 32, ..., 512 -> class ids 0..31, in this order, so
++     that 'lua_arena_classof' can index them directly */
++  for (s = ARENA_TINY_MIN; s <= ARENA_TINY_LIMIT; s += 16)
++    (void)arena_addclass(a, s, ARENA_TIER_TINY);
++  /* small + medium: x1.25 ladder snapped to 16 bytes, ending exactly at
++     'small_max' so that every inexact request below it finds a slot */
++  s = ARENA_TINY_LIMIT;
++  while (s < (unsigned)a->cfg.small_max) {
++    unsigned next = arena_align16(cast_sizet(s) + (s >> 2));
++    if (next <= s)
++      next = s + 16;
++    if (next > (unsigned)a->cfg.small_max)
++      next = (unsigned)a->cfg.small_max;
++    arena_addgeneric(a, next,
++                     (next <= ARENA_SMALL_TIER) ? ARENA_TIER_SMALL
++                                                : ARENA_TIER_MEDIUM);
++    s = next;
++  }
++  /* exact-size classes: table array blocks (9*N+4, N = 2^k) */
++  for (log = 0; log < 32; log++) {
++    size_t bytes = (cast_sizet(9) << log) + 4;
++    if (bytes > (size_t)a->cfg.small_max)
++      break;
++    a->arr_by_log[log] = arena_addclass(a, cast_uint(bytes), ARENA_TIER_ARR);
++  }
++  /* exact-size classes: table node blocks (32*2^k, plus the '+16' variant
++     when the node array carries a 'lastfree' prefix) */
++  for (log = 0; log < 32; log++) {
++    size_t bytes = cast_sizet(32) << log;
++    if (bytes > (size_t)a->cfg.small_max)
++      break;
++    a->node_by_log[log] = arena_addclass(a, cast_uint(bytes), ARENA_TIER_NODE);
++    if (bytes + 16 <= (size_t)a->cfg.small_max)
++      a->nodex_by_log[log] = arena_addclass(a, cast_uint(bytes + 16),
++                                           ARENA_TIER_NODE);
++  }
++}
++
++
++unsigned lua_arena_slotsize (lua_Arena *a, int cid) {
++  if (cid < 0 || cid >= a->nclasses)
++    return 0;
++  return a->classes[cid].slot_size;
++}
++
++
++/*
++** Pure function of the requested size. The same function maps 'osize'
++** back on free, so a block always returns to the class it came from and
++** no per-block metadata is needed.
++*/
++static int arena_exact_class (lua_Arena *a, size_t n) {
++  if (n > 4 && (n - 4) % 9 == 0) {	/* exact array block? */
++    size_t k = (n - 4) / 9;
++    if (arena_ispow2(k)) {
++      int log = arena_log2(k);
++      if (log < 32 && a->arr_by_log[log] != ARENA_CLASS_NONE)
++        return a->arr_by_log[log];
++    }
++  }
++  if (n % 32 == 0) {			/* exact node block? */
++    size_t k = n / 32;
++    if (arena_ispow2(k)) {
++      int log = arena_log2(k);
++      if (log < 32 && a->node_by_log[log] != ARENA_CLASS_NONE)
++        return a->node_by_log[log];
++    }
++  }
++  else if ((n - 16) % 32 == 0 && n > 16) {	/* ...with a prefix */
++    size_t k = (n - 16) / 32;
++    if (arena_ispow2(k)) {
++      int log = arena_log2(k);
++      if (log < 32 && a->nodex_by_log[log] != ARENA_CLASS_NONE)
++        return a->nodex_by_log[log];
++    }
++  }
++  return ARENA_CLASS_NONE;		/* not a table block size */
++}
++
++
++int lua_arena_classof (lua_Arena *a, size_t n) {
++  int cid;
++  if (n == 0)
++    return ARENA_CLASS_NONE;
++  if (n > (size_t)a->cfg.small_max)
++    return ARENA_CLASS_NONE;		/* huge tier */
++  /* An exact table-block class must win over the rounded one, or an
++     N-element array block would not be reused verbatim by the next one.
++     Below 512 the granule is 16 bytes, so the check is only needed for a
++     size that is not already a multiple of it. */
++  if (n > ARENA_TINY_LIMIT || (n & 15u) != 0) {
++    cid = arena_exact_class(a, n);
++    if (cid != ARENA_CLASS_NONE)
++      return cid;
++  }
++  if (n <= ARENA_TINY_LIMIT)		/* tiny: 16-byte granule */
++    return cast_int((n + 15u) >> 4) - 1;
++  {  /* generic ladder: the smallest slot size >= n */
++    int lo = 0, hi = a->ngeneric;
++    while (lo < hi) {
++      int mid = (lo + hi) >> 1;
++      if (a->generic_slot[mid] < n)
++        lo = mid + 1;
++      else
++        hi = mid;
++    }
++    if (lo < a->ngeneric)
++      return a->generic_class[lo];
++  }
++  return ARENA_CLASS_NONE;
++}
++
++/* }================================================================== */
++
++
++/*
++** {==================================================================
++** Segments and free lists
++** ===================================================================
++*/
++
++#if defined(KIMIX_LUA_MEMCHECK)
++#define arena_bit_test(s,i)	((s)->bits[(i) >> 3] & (1u << ((i) & 7)))
++#define arena_bit_set(s,i)	((s)->bits[(i) >> 3] |= cast(lu_byte, 1u << ((i) & 7)))
++#define arena_bit_clear(s,i)	((s)->bits[(i) >> 3] &= cast(lu_byte, ~(1u << ((i) & 7))))
++#endif
++
++
++static unsigned arena_slot_index (ArenaClass *c, ArenaSeg *s, void *p) {
++  return cast_uint((cast_charp(p) - cast_charp(s->base)) / c->slot_size);
++}
++
++
++static ArenaSeg *arena_new_segment (lua_Arena *a, int cid) {
++  ArenaClass *c = &a->classes[cid];
++  ArenaSeg *s;
++  void *base;
++  unsigned i;
++  if (c->seg_count >= c->seg_cap) {
++    unsigned ncap = (c->seg_cap == 0) ? 4u : c->seg_cap * 2u;
++    ArenaSeg **ns = cast(ArenaSeg **, mi_malloc(sizeof(ArenaSeg *) * ncap));
++    if (ns == NULL)
++      return NULL;
++    if (c->seg_count > 0)
++      memcpy(ns, c->segs, sizeof(ArenaSeg *) * c->seg_count);
++    if (c->segs != NULL)
++      mi_free(c->segs);
++    c->segs = ns;
++    c->seg_cap = ncap;
++  }
++  base = mi_malloc(c->seg_payload);
++  if (base == NULL)
++    return NULL;
++  s = cast(ArenaSeg *, mi_malloc(sizeof(ArenaSeg)));
++  if (s == NULL) {
++    mi_free(base);
++    return NULL;
++  }
++  memset(s, 0, sizeof(*s));
++  s->base = base;
++  s->nslots = c->nslots_per_seg;
++  s->nfree = s->nslots;
++  for (i = 0; i < s->nslots; i++) {	/* carve the segment into slots */
++    void *slot = cast_voidp(cast_charp(base) + cast_sizet(i) * c->slot_size);
++    *cast(void **, slot) = s->freelist;
++    s->freelist = slot;
++  }
++#if defined(KIMIX_LUA_MEMCHECK)
++  s->bits = cast(unsigned char *, mi_malloc((s->nslots >> 3) + 1));
++  if (s->bits == NULL) {
++    mi_free(base);
++    mi_free(s);
++    return NULL;
++  }
++  memset(s->bits, 0, (s->nslots >> 3) + 1);
++#endif
++  {  /* keep 'segs' sorted by base address (binary search on free) */
++    unsigned at = c->seg_count;
++    while (at > 0 && c->segs[at - 1]->base > base)
++      at--;
++    if (at < c->seg_count)
++      memmove(&c->segs[at + 1], &c->segs[at],
++              sizeof(ArenaSeg *) * (c->seg_count - at));
++    c->segs[at] = s;
++  }
++  c->seg_count++;
++  c->slots_total += s->nslots;
++  c->slots_free += s->nslots;
++  c->cur = s;
++  return s;
++}
++
++
++static void arena_drop_segment (ArenaClass *c, unsigned at) {
++  ArenaSeg *s = c->segs[at];
++  lua_arena_check(s->nfree == s->nslots);	/* only a wholly free segment */
++  c->seg_count--;
++  if (at < c->seg_count)
++    memmove(&c->segs[at], &c->segs[at + 1],
++            sizeof(ArenaSeg *) * (c->seg_count - at));
++  c->slots_total -= s->nslots;
++  c->slots_free -= s->nfree;
++  if (c->cur == s)
++    c->cur = NULL;
++#if defined(KIMIX_LUA_MEMCHECK)
++  mi_free(s->bits);
++#endif
++  mi_free(s->base);
++  mi_free(s);
++}
++
++
++static ArenaSeg *arena_find_seg (ArenaClass *c, const void *p) {
++  unsigned lo = 0, hi = c->seg_count;
++  const char *q = cast_charp(p);
++  while (lo < hi) {
++    unsigned mid = (lo + hi) >> 1;
++    const char *base = cast_charp(c->segs[mid]->base);
++    if (q < base)
++      hi = mid;
++    else if (q >= base + c->seg_payload)
++      lo = mid + 1;
++    else
++      return c->segs[mid];
++  }
++  return NULL;
++}
++
++
++void *lua_arena_take_slot (lua_Arena *a, int cid) {
++  ArenaClass *c = &a->classes[cid];
++  ArenaSeg *s = c->cur;
++  void *p;
++  if (s == NULL || s->nfree == 0 || (s->flags & ARENA_SEG_NOSLOT) != 0) {
++    unsigned i;
++    s = NULL;
++    for (i = 0; i < c->seg_count; i++) {
++      ArenaSeg *cand = c->segs[i];
++      if (cand->nfree > 0 && (cand->flags & ARENA_SEG_NOSLOT) == 0) {
++        s = cand;
++        break;
++      }
++    }
++    if (s == NULL) {
++      s = arena_new_segment(a, cid);	/* may return NULL */
++      if (s == NULL)
++        return NULL;
++      s->flags &= ~ARENA_SEG_NOSLOT;
++    }
++  }
++  c->cur = s;
++  p = s->freelist;
++  s->freelist = *cast(void **, p);
++  s->nfree--;
++  c->slots_free--;
++  c->slots_used++;
++  if (c->slots_used > c->high_water)
++    c->high_water = c->slots_used;
++#if defined(KIMIX_LUA_MEMCHECK)
++  arena_bit_set(s, arena_slot_index(c, s, p));
++#endif
++  return p;
++}
++
++
++void lua_arena_give_slot (lua_Arena *a, int cid, void *p) {
++  ArenaClass *c = &a->classes[cid];
++  ArenaSeg *s = arena_find_seg(c, p);
++  lua_arena_check(s != NULL);
++  if (s == NULL)			/* cannot happen */
++    return;
++#if defined(KIMIX_LUA_MEMCHECK)
++  {
++    unsigned idx = arena_slot_index(c, s, p);
++    lua_arena_check(arena_bit_test(s, idx));	/* double free? */
++    arena_bit_clear(s, idx);
++  }
++#endif
++  *cast(void **, p) = s->freelist;
++  s->freelist = p;
++  s->nfree++;
++  c->slots_free++;
++  c->slots_used--;
++  if (s->nfree == s->nslots)		/* prefer draining empty segments */
++    c->cur = s;
++  else if (c->cur == NULL)
++    c->cur = s;
++}
++
++
++ArenaSeg *lua_arena_segment (ArenaClass *c, const void *p) {
++  return arena_find_seg(c, p);
++}
++
++
++unsigned lua_arena_segment_index (ArenaClass *c, ArenaSeg *s) {
++  unsigned i;
++  for (i = 0; i < c->seg_count; i++) {
++    if (c->segs[i] == s)
++      return i;
++  }
++  return c->seg_count;
++}
++
++
++int lua_arena_release_segment (lua_Arena *a, int cid, ArenaSeg *s) {
++  ArenaClass *c = &a->classes[cid];
++  unsigned i = lua_arena_segment_index(c, s);
++  if (i >= c->seg_count || s->nfree != s->nslots)
++    return 0;			/* not whole, or not ours: leave it alone */
++  arena_drop_segment(c, i);
++  return 1;
++}
++
++/* }================================================================== */
++
++
++/*
++** {==================================================================
++** The huge tier: one exact run per request + a per-size LRU of freed runs
++** ===================================================================
++*/
++
++static void *arena_huge_acquire (lua_Arena *a, size_t n) {
++  unsigned i;
++  for (i = 0; i < a->nhuge; i++) {
++    if (a->huge[i].size == n) {
++      void *p = a->huge[i].p;
++      a->huge[i] = a->huge[--a->nhuge];	/* order does not matter */
++      a->huge_cached--;
++      a->huge_cached_bytes -= n;
++      a->huge_live_count++;
++      a->huge_live_bytes += n;
++      a->would_huge_reuse++;
++      return p;
++    }
++  }
++  {
++    void *p = mi_malloc(n);
++    if (p != NULL) {
++      a->huge_live_count++;
++      a->huge_live_bytes += n;
++    }
++    return p;
++  }
++}
++
++
++static void arena_huge_release (lua_Arena *a, void *p, size_t n) {
++  unsigned i, same = 0;
++  a->huge_live_count--;
++  a->huge_live_bytes -= n;
++  for (i = 0; i < a->nhuge; i++) {	/* keep 'huge_cache' runs per size */
++    if (a->huge[i].size == n)
++      same++;
++  }
++  if (same < (unsigned)a->cfg.huge_cache && a->nhuge < ARENA_MAX_HUGE) {
++    a->huge[a->nhuge].p = p;
++    a->huge[a->nhuge].size = n;
++    a->nhuge++;
++    a->huge_cached++;
++    a->huge_cached_bytes += n;
++  }
++  else
++    mi_free(p);
++}
++
++/* }================================================================== */
++
++
++/*
++** {==================================================================
++** Dry-run simulation (cfg.dry_run == 1): the same decisions, counters
++** only, memory straight from mimalloc
++** ===================================================================
++*/
++
++static void arena_dry_acquire (lua_Arena *a, int cid) {
++  ArenaClass *c = &a->classes[cid];
++  a->would_alloc++;
++  c->slots_used++;
++  if (c->slots_free > 0) {
++    c->slots_free--;
++    a->would_reuse++;
++  }
++  else {
++    c->slots_total += c->nslots_per_seg;
++    c->seg_count++;
++    c->slots_free = c->nslots_per_seg - 1;
++    a->would_segments++;
++  }
++  if (c->slots_used > c->high_water)
++    c->high_water = c->slots_used;
++}
++
++
++static void arena_dry_release (lua_Arena *a, int cid) {
++  ArenaClass *c = &a->classes[cid];
++  a->would_free++;
++  if (c->slots_used > 0)
++    c->slots_used--;
++  c->slots_free++;
++}
++
++
++static void arena_dry_huge_acquire (lua_Arena *a, size_t n) {
++  unsigned i;
++  a->would_alloc++;
++  a->huge_live_count++;
++  a->huge_live_bytes += n;
++  for (i = 0; i < a->nhuge_shadow; i++) {
++    if (a->huge_shadow[i] == n) {
++      a->huge_shadow[i] = a->huge_shadow[--a->nhuge_shadow];
++      a->would_huge_reuse++;
++      return;
++    }
++  }
++}
++
++
++static void arena_dry_huge_release (lua_Arena *a, size_t n) {
++  unsigned i, same = 0;
++  a->would_free++;
++  if (a->huge_live_count > 0)
++    a->huge_live_count--;
++  a->huge_live_bytes -= n;
++  for (i = 0; i < a->nhuge_shadow; i++) {
++    if (a->huge_shadow[i] == n)
++      same++;
++  }
++  if (same < (unsigned)a->cfg.huge_cache && a->nhuge_shadow < ARENA_MAX_HUGE)
++    a->huge_shadow[a->nhuge_shadow++] = n;
++}
++
++/* }================================================================== */
++
++
++/*
++** {==================================================================
++** Allocation trace (KIMIX_LUA_MEMTRACE=<path>, bounded, off by default)
++** ===================================================================
++*/
++
++static void arena_trace (lua_Arena *a, void *ptr, size_t osize,
++                         size_t nsize) {
++  int written;
++  if (a->trace_done)
++    return;
++  if (a->trace == NULL) {
++    const char *path = getenv("KIMIX_LUA_MEMTRACE");
++    const char *limit;
++    long mb = 64;
++    if (path == NULL || path[0] == '\0') {
++      a->trace_done = 1;		/* no tracing: out of the hot path */
++      return;
++    }
++    limit = getenv("KIMIX_LUA_MEMTRACE_MAX_MB");
++    if (limit != NULL) {
++      long v = strtol(limit, NULL, 10);
++      if (v > 0)
++        mb = v;
++    }
++    a->trace = fopen(path, "wb");
++    a->trace_limit = cast_sizet(mb) * 1024u * 1024u;
++    if (a->trace == NULL) {
++      a->trace_done = 1;
++      return;
++    }
++  }
++  if (a->trace_written >= a->trace_limit) {
++    fclose(a->trace);
++    a->trace = NULL;
++    a->trace_done = 1;
++    return;
++  }
++  written = fprintf(a->trace,
++                    "{\"op\":\"%s\",\"cls\":%d,\"osize\":%lu,\"nsize\":%lu}\n",
++                    (nsize == 0) ? "f" : ((ptr == NULL) ? "a" : "r"),
++                    lua_arena_classof(a, (nsize == 0) ? osize : nsize),
++                    (unsigned long)osize, (unsigned long)nsize);
++  if (written > 0)
++    a->trace_written += cast_sizet(written);
++}
++
++/* }================================================================== */
++
++
++/*
++** {==================================================================
++** The allocator itself
++** ===================================================================
++*/
++
++static void *arena_acquire (lua_Arena *a, size_t n) {
++  int cid = lua_arena_classof(a, n);
++  if (cid == ARENA_CLASS_NONE) {		/* huge tier */
++    if (a->cfg.dry_run) {
++      arena_dry_huge_acquire(a, n);
++      return mi_malloc(n);
++    }
++    return arena_huge_acquire(a, n);
++  }
++  if (a->cfg.dry_run) {
++    arena_dry_acquire(a, cid);
++    return mi_malloc(n);
++  }
++  return lua_arena_take_slot(a, cid);
++}
++
++
++static void arena_release (lua_Arena *a, void *p, size_t osize) {
++  int cid = lua_arena_classof(a, osize);
++  if (cid == ARENA_CLASS_NONE) {
++    if (a->cfg.dry_run) {
++      arena_dry_huge_release(a, osize);
++      mi_free(p);
++      return;
++    }
++    arena_huge_release(a, p, osize);
++    return;
++  }
++  if (a->cfg.dry_run) {
++    arena_dry_release(a, cid);
++    mi_free(p);
++    return;
++  }
++  lua_arena_give_slot(a, cid, p);
++}
++
++
++static void arena_live_add (lua_Arena *a, size_t osize, size_t nsize) {
++  if (nsize >= osize)
++    a->logical_live += nsize - osize;
++  else
++    a->logical_live -= osize - nsize;
++}
++
++
++/*
++** The lua_Alloc the arena installs. Contract unchanged:
++** frealloc(ud, p, osize, 0) frees, frealloc(ud, NULL, x, s) creates,
++** frealloc(ud, b, x, y) reallocates; NULL means failure and a failed
++** reallocation leaves the old block untouched.
++*/
++void *lua_arena_alloc (void *ud, void *ptr, size_t osize, size_t nsize) {
++  lua_Arena *a = cast(lua_Arena *, ud);
++  a->calls++;
++  arena_trace(a, ptr, osize, nsize);
++  if (nsize == 0) {				/* free */
++    if (ptr != NULL) {
++      arena_release(a, ptr, osize);
++      a->logical_live -= osize;
++    }
++    return NULL;
++  }
++  if (ptr == NULL) {				/* fresh block */
++    void *p = arena_acquire(a, nsize);
++    if (p != NULL)
++      a->logical_live += nsize;
++    return p;
++  }
++  {						/* reallocate */
++    int oc = lua_arena_classof(a, osize);
++    int nc = lua_arena_classof(a, nsize);
++    void *p;
++    if (oc == nc && oc != ARENA_CLASS_NONE && a->cfg.dry_run == 0) {
++      /* the same slot serves both (a dry run cannot do this: mimalloc got
++         exactly 'osize' bytes, so the block has to be replaced) */
++      arena_live_add(a, osize, nsize);
++      return ptr;
++    }
++    if (oc == ARENA_CLASS_NONE && nc == ARENA_CLASS_NONE && osize == nsize &&
++        a->cfg.dry_run == 0)
++      return ptr;				/* same huge run, unchanged */
++    p = arena_acquire(a, nsize);
++    if (p == NULL)
++      return NULL;				/* old block still valid */
++    memcpy(p, ptr, (osize < nsize) ? osize : nsize);
++    arena_release(a, ptr, osize);
++    arena_live_add(a, osize, nsize);
++    return p;
++  }
++}
++
++/* }================================================================== */
++
++
++/*
++** {==================================================================
++** Trim / purge
++** ===================================================================
++*/
++
++static size_t arena_dry_trim (lua_Arena *a, ArenaClass *c) {
++  size_t freed = 0;
++  unsigned target, need;
++  if (c->seg_count == 0) {
++    c->high_water = 0;
++    return 0;
++  }
++  target = c->high_water / 2u;
++  if (target < c->slots_used)
++    target = c->slots_used;
++  need = (target + c->nslots_per_seg - 1u) / c->nslots_per_seg;
++  c->high_water = target;
++  while (c->seg_count > need && c->slots_free >= c->nslots_per_seg) {
++    c->seg_count--;
++    c->slots_total -= c->nslots_per_seg;
++    c->slots_free -= c->nslots_per_seg;
++    freed += c->seg_payload;
++  }
++  return freed;
++}
++
++
++size_t lua_arena_trim (lua_Arena *a, int level) {
++  size_t freed = 0;
++  int i;
++  if (a == NULL)
++    return 0;
++  a->trims++;
++  for (i = 0; i < a->nclasses; i++) {
++    ArenaClass *c = &a->classes[i];
++    unsigned target, need, j;
++    if (a->cfg.dry_run) {
++      freed += arena_dry_trim(a, c);
++      continue;
++    }
++    if (c->seg_count == 0) {
++      c->high_water = 0;
++      continue;
++    }
++    /* the high water decays by 1/2 on every trim, so repeated trims
++       converge instead of oscillating */
++    target = c->high_water / 2u;
++    if (target < c->slots_used)
++      target = c->slots_used;
++    need = (target + c->nslots_per_seg - 1u) / c->nslots_per_seg;
++    c->high_water = target;
++    j = c->seg_count;
++    while (j-- > 0 && c->seg_count > need) {
++      ArenaSeg *s = c->segs[j];
++      if (s->nfree == s->nslots) {	/* a whole empty segment */
++        freed += c->seg_payload;
++        arena_drop_segment(c, j);
++      }
++    }
++  }
++  if (level >= 1) {			/* also drop the huge cache */
++    for (i = 0; i < cast_int(a->nhuge); i++)
++      mi_free(a->huge[i].p);
++    a->huge_cached = 0;
++    a->huge_cached_bytes = 0;
++    a->nhuge = 0;
++    a->nhuge_shadow = 0;
++    mi_collect(true);			/* purge what is free right now */
++    a->purges++;
++  }
++  a->trim_bytes += freed;
++  return freed;
++}
++
++/* }================================================================== */
++
++
++/*
++** {==================================================================
++** Lifecycle and stats
++** ===================================================================
++*/
++
++lua_Arena *lua_arena_new (const lua_ArenaConfig *cfg) {
++  lua_Arena *a;
++  a = cast(lua_Arena *, mi_malloc(sizeof(lua_Arena)));
++  if (a == NULL)
++    return NULL;
++  memset(a, 0, sizeof(*a));
++  if (cfg != NULL)
++    a->cfg = *cfg;
++  else
++    lua_arena_defaults(&a->cfg);
++  /* sanity: the tiers assume a segment that can hold a tiny slot and a
++     'small_max' the generic ladder can reach */
++  if (a->cfg.segment_bytes < ARENA_TINY_MIN)
++    a->cfg.segment_bytes = ARENA_DEF_SEGMENT;
++  if (a->cfg.small_max < cast_int(ARENA_TINY_LIMIT))
++    a->cfg.small_max = ARENA_DEF_SMALL_MAX;
++  if (a->cfg.small_max > ARENA_DEF_SMALL_MAX * 16)
++    a->cfg.small_max = ARENA_DEF_SMALL_MAX * 16;
++  if (a->cfg.huge_cache < 0)
++    a->cfg.huge_cache = 0;
++  if (a->cfg.huge_cache > ARENA_MAX_HUGE)
++    a->cfg.huge_cache = ARENA_MAX_HUGE;
++  if (a->cfg.dry_run == 0 && arena_hasenv("KIMIX_LUA_ARENA_DRYRUN"))
++    a->cfg.dry_run = 1;
++  arena_build(a);
++  return a;
++}
++
++
++void lua_arena_free (lua_Arena *a) {
++  int i;
++  if (a == NULL)
++    return;
++  for (i = 0; i < a->nclasses; i++) {
++    ArenaClass *c = &a->classes[i];
++    if (a->cfg.dry_run == 0) {
++      while (c->seg_count > 0)
++        arena_drop_segment(c, c->seg_count - 1);
++    }
++    else  /* a dry run counted the segments, it never carved them */
++      c->seg_count = 0;
++    if (c->segs != NULL)
++      mi_free(c->segs);
++    c->segs = NULL;
++    c->seg_cap = 0;
++  }
++  for (i = 0; i < cast_int(a->nhuge); i++)
++    mi_free(a->huge[i].p);
++  if (a->trace != NULL)
++    fclose(a->trace);
++  mi_free(a);
++}
++
++
++void lua_arena_attach (lua_State *L, lua_Arena *a) {
++  G(L)->arena = a;
++}
++
++
++void lua_arena_stats (lua_Arena *a, lua_ArenaStats *st) {
++  int i;
++  size_t slotted = 0, commit = 0;
++  memset(st, 0, sizeof(*st));
++  st->segment_bytes = a->cfg.segment_bytes;
++  st->dry_run = a->cfg.dry_run;
++  st->enabled = 1;
++  for (i = 0; i < a->nclasses; i++) {
++    ArenaClass *c = &a->classes[i];
++    st->slots_used += c->slots_used;
++    st->slots_free += c->slots_free;
++    st->seg_count += c->seg_count;
++    slotted += cast_sizet(c->slots_used) * c->slot_size;
++    commit += cast_sizet(c->seg_count) * c->seg_payload;
++  }
++  st->slots_total = st->slots_used + st->slots_free;
++  st->logical_live = a->logical_live;
++  st->huge_live_bytes = a->huge_live_bytes;
++  st->huge_live_count = a->huge_live_count;
++  st->huge_cached = a->huge_cached;
++  st->huge_cached_bytes = a->huge_cached_bytes;
++  if (a->cfg.dry_run) {		/* the shadow cache stands in for the real one */
++    unsigned k;
++    size_t sum = 0;
++    for (k = 0; k < a->nhuge_shadow; k++)
++      sum += a->huge_shadow[k];
++    st->huge_cached = a->nhuge_shadow;
++    st->huge_cached_bytes = sum;
++  }
++  st->commit_bytes = commit + a->huge_live_bytes + st->huge_cached_bytes;
++  st->internal_waste = (slotted + a->huge_live_bytes >= a->logical_live)
++                       ? slotted + a->huge_live_bytes - a->logical_live : 0;
++  st->calls = a->calls;
++  st->trims = a->trims;
++  st->trim_bytes = a->trim_bytes;
++  st->purges = a->purges;
++  st->would_segments = a->would_segments;
++  st->would_alloc = a->would_alloc;
++  st->would_free = a->would_free;
++  st->would_reuse = a->would_reuse;
++  st->would_huge_reuse = a->would_huge_reuse;
++  st->would_shrink_bytes = a->would_shrink_bytes;
++  st->would_compact_bytes = a->would_compact_bytes;
++  st->compacted_bytes = a->compacted_bytes;
++  st->compactions = a->compactions;
++  st->compaction_skips = a->compaction_skips;
++}
++
++/* }================================================================== */
++
++
++/*
++** {==================================================================
++** Public entry points (lua.h / lauxlib.h)
++** ===================================================================
++*/
++
++int lua_ArenaClassCount (void *arena) {
++  return (arena != NULL) ? cast(lua_Arena *, arena)->nclasses : 0;
++}
++
++
++int lua_ArenaClassOf (void *arena, size_t size) {
++  if (arena == NULL)
++    return ARENA_CLASS_NONE;
++  return lua_arena_classof(cast(lua_Arena *, arena), size);
++}
++
++
++int lua_ArenaClassInfoGet (void *arena, int cid, lua_ArenaClassInfo *info) {
++  lua_Arena *a = cast(lua_Arena *, arena);
++  ArenaClass *c;
++  if (a == NULL || info == NULL || cid < 0 || cid >= a->nclasses)
++    return 0;
++  c = &a->classes[cid];
++  info->slot_size = c->slot_size;
++  info->seg_payload = c->seg_payload;
++  info->seg_count = c->seg_count;
++  info->slots_used = c->slots_used;
++  info->slots_free = c->slots_free;
++  info->tier = c->tier;
++  return 1;
++}
++
++
++void lua_ArenaConfigDefault (lua_ArenaConfig *cfg) {
++  if (cfg != NULL)
++    lua_arena_defaults(cfg);
++}
++
++
++void lua_ArenaStatsOf (void *arena, lua_ArenaStats *st) {
++  if (st == NULL)
++    return;
++  if (arena == NULL) {
++    memset(st, 0, sizeof(*st));
++    return;
++  }
++  lua_arena_stats(cast(lua_Arena *, arena), st);
++}
++
++
++void lua_ArenaStatsGet (lua_State *L, lua_ArenaStats *st) {
++  lua_Arena *a = (L != NULL) ? G(L)->arena : NULL;
++  lua_ArenaStatsOf(a, st);
++}
++
++
++size_t lua_ArenaTrimHandle (void *arena, int level) {
++  if (arena == NULL)
++    return 0;
++  return lua_arena_trim(cast(lua_Arena *, arena), level);
++}
++
++
++size_t lua_ArenaTrim (lua_State *L, int level) {
++  return lua_ArenaTrimHandle((L != NULL) ? G(L)->arena : NULL, level);
++}
++
++
++void lua_ArenaFree (void *arena) {
++  lua_arena_free(cast(lua_Arena *, arena));
++}
++
++
++/*
++** Create a state served by a memory arena. Everything else is what
++** 'luaL_newstate' does; the GC pacing knobs of the configuration, when
++** set, are applied through the public API so that a memory-tight host
++** (a sandbox run) can trade speed for footprint without touching the
++** compiled-in defaults.
++*/
++lua_State *luaL_newstate_arena (const lua_ArenaConfig *cfg) {
++  lua_Arena *a = lua_arena_new(cfg);
++  lua_State *L;
++  if (a == NULL)
++    return NULL;
++  L = lua_newstate(lua_arena_alloc, a, luaL_makeseed(NULL));
++  if (L == NULL) {
++    lua_arena_free(a);
++    return NULL;
++  }
++  lua_arena_attach(L, a);
++  if (a->cfg.gc_pause_pct > 0)
++    (void)lua_gc(L, LUA_GCPARAM, LUA_GCPPAUSE, a->cfg.gc_pause_pct);
++  if (a->cfg.gc_stepmul > 0)
++    (void)lua_gc(L, LUA_GCPARAM, LUA_GCPSTEPMUL, a->cfg.gc_stepmul);
++  return L;
++}
++
++
++void *luaL_arena (lua_State *L) {
++  return (L != NULL) ? cast(void *, G(L)->arena) : NULL;
++}
++
++
++/* close the state and release the arena that served it */
++void luaL_freestate_arena (lua_State *L) {
++  lua_Arena *a = (L != NULL) ? G(L)->arena : NULL;
++  if (L != NULL) {
++    G(L)->arena = NULL;		/* nothing may look at it after this */
++    lua_close(L);
++  }
++  lua_arena_free(a);
++}
++
++/* }================================================================== */
++
++#endif					/* } */
+diff --git a/larena.h b/larena.h
+new file mode 100644
+index 00000000..09dd7680
+--- /dev/null
++++ b/larena.h
+@@ -0,0 +1,199 @@
++/*
++** $Id: larena.h $
++** kimix extension: per-lua_State memory arena (KIMIX_LUA_ARENA)
++** See Copyright Notice in lua.h
++*/
++
++/*
++** {==================================================================
++** Design (see .kimix_cache/lua_memory_opt_plan.md, sections 4.1-4.6)
++** ===================================================================
++** The arena is a 'lua_Alloc'. Everything below is a pure function of
++** the requested size: 'lua_arena_classof' maps a request to a size class
++** and the same function maps 'osize' back on free, so no per-block
++** header is needed (a header would cost 8-16 bytes on every 9*N+4 array
++** block). A slot is never smaller than the request, so even a
++** mis-classified block is a valid, correctly sized slot.
++**
++** Tiers (all sizes in bytes):
++**   tiny       <= 512       : 16-byte granule, 32 classes
++**   small      <= small_max : x1.25 steps snapped to 16
++**   medium     <= small_max : the same ladder (it is continuous;
++**                             tiny/small/medium only label it)
++**   exact-ARR  <= small_max : 9*N+4 with N a power of two, no rounding
++**   exact-NODE <= small_max : 32*2^k (+16 for the 'lastfree' prefix)
++**   huge       >  small_max : one exact run from mimalloc + a per-size
++**                             LRU of freed runs
++**
++** A class owns whole segments of 'segment_bytes' (64 KiB by default),
++** carved into 'nslots_per_seg' slots at first use. Each segment keeps its
++** own intrusive LIFO free list (the first pointer-sized bytes of a free
++** slot hold 'next'), so an empty segment is exactly a segment whose free
++** count equals its slot count -- which is what 'trim' hands back to
++** mimalloc. No locks: one arena per lua_State.
++*/
++
++#ifndef larena_h
++#define larena_h
++
++#include <stddef.h>
++#include <stdio.h>
++
++#include "lua.h"
++#include "llimits.h"
++
++#if defined(KIMIX_LUA_ARENA)		/* { */
++
++/*
++** Double-free / invalid-free checking: on whenever the build is not an
++** NDEBUG one, or explicitly through KIMIX_LUA_MEMCHECK.
++*/
++#if !defined(KIMIX_LUA_MEMCHECK) && !defined(NDEBUG)
++#define KIMIX_LUA_MEMCHECK	1
++#endif
++
++#if defined(KIMIX_LUA_MEMCHECK)
++#include <assert.h>
++#define lua_arena_check(c)	assert(c)
++#else
++#define lua_arena_check(c)	((void)0)
++#endif
++
++/* tiers, for diagnostics and for the compaction planner */
++#define ARENA_TIER_TINY		0
++#define ARENA_TIER_SMALL	1
++#define ARENA_TIER_MEDIUM	2
++#define ARENA_TIER_ARR		3
++#define ARENA_TIER_NODE		4
++
++/* 'lua_arena_classof' result for "not slotted" (the huge tier) */
++#define ARENA_CLASS_NONE	(-1)
++
++#define ARENA_MAX_CLASSES	192
++#define ARENA_MAX_HUGE		32	/* hard cap on cached huge runs */
++#define ARENA_TINY_MIN		16u
++#define ARENA_TINY_LIMIT	512u	/* tiny classes: 16, 32, ... 512 */
++#define ARENA_SMALL_TIER	8192u	/* 'small' tier label boundary */
++#define ARENA_DEF_SEGMENT	(64u * 1024u)
++#define ARENA_DEF_SMALL_MAX	65536	/* 'small_max' default */
++#define ARENA_DEF_HUGE_CACHE	4
++
++/* segment flags */
++#define ARENA_SEG_NOSLOT	1u	/* the compaction planner fenced it off */
++
++typedef struct ArenaSeg {
++  void *base;		/* start of the payload */
++  void *freelist;	/* intrusive LIFO of this segment's free slots */
++  unsigned char *bits;	/* occupancy bitmap (KIMIX_LUA_MEMCHECK only) */
++  unsigned nslots;
++  unsigned nfree;
++  unsigned flags;
++} ArenaSeg;
++
++typedef struct ArenaClass {
++  unsigned slot_size;		/* bytes handed out per slot */
++  unsigned nslots_per_seg;	/* slots carved out of one segment */
++  unsigned seg_payload;		/* nslots_per_seg * slot_size */
++  int tier;			/* ARENA_TIER_* */
++  unsigned seg_count;
++  unsigned slots_total;		/* seg_count * nslots_per_seg */
++  unsigned slots_used;
++  unsigned slots_free;
++  unsigned high_water;		/* peak 'slots_used', decays on trim */
++  ArenaSeg **segs;		/* sorted by 'base', ascending */
++  unsigned seg_cap;
++  ArenaSeg *cur;		/* allocation hint */
++} ArenaClass;
++
++/* one cached huge run: exact size only, so it is reusable verbatim */
++typedef struct ArenaHuge {
++  void *p;
++  size_t size;
++} ArenaHuge;
++
++typedef struct lua_Arena {
++  lua_ArenaConfig cfg;
++  ArenaClass classes[ARENA_MAX_CLASSES];
++  int nclasses;
++  /* generic ladder: ascending slot sizes and their class ids */
++  unsigned generic_slot[ARENA_MAX_CLASSES];
++  int generic_class[ARENA_MAX_CLASSES];
++  int ngeneric;
++  int arr_by_log[32];		/* exact array classes, by log2(N) */
++  int node_by_log[32];		/* exact node classes, by log2(slots) */
++  int nodex_by_log[32];		/* the '+16' variant, by log2(slots) */
++  /* accounting */
++  size_t logical_live;		/* requested bytes, live */
++  unsigned long calls;		/* lua_Alloc calls served */
++  unsigned long huge_live_count;
++  size_t huge_live_bytes;
++  unsigned long huge_cached;
++  size_t huge_cached_bytes;
++  /* trim / purge */
++  unsigned long trims;
++  size_t trim_bytes;
++  unsigned long purges;
++  /* plan / dry-run counters */
++  unsigned long would_segments;
++  unsigned long would_alloc;
++  unsigned long would_free;
++  unsigned long would_reuse;
++  unsigned long would_huge_reuse;
++  size_t would_shrink_bytes;
++  size_t would_compact_bytes;
++  size_t compacted_bytes;
++  unsigned long compactions;
++  unsigned long compaction_skips;
++  int in_compaction;
++  /* the huge tier */
++  ArenaHuge huge[ARENA_MAX_HUGE];
++  unsigned nhuge;
++  size_t huge_shadow[ARENA_MAX_HUGE];	/* dry-run mirror of 'huge' */
++  unsigned nhuge_shadow;
++  /* allocation trace (KIMIX_LUA_MEMTRACE=<path>) */
++  FILE *trace;
++  size_t trace_written;
++  size_t trace_limit;
++  int trace_done;
++} lua_Arena;
++
++
++/* create/destroy an arena; 'cfg' may be NULL for the defaults */
++LUAI_FUNC lua_Arena *lua_arena_new (const lua_ArenaConfig *cfg);
++LUAI_FUNC void lua_arena_free (lua_Arena *a);
++
++/* the 'lua_Alloc' the arena installs */
++LUAI_FUNC void *lua_arena_alloc (void *ud, void *ptr, size_t osize,
++                                 size_t nsize);
++
++/* pure size -> class mapping; ARENA_CLASS_NONE for the huge tier */
++LUAI_FUNC int lua_arena_classof (lua_Arena *a, size_t n);
++/* the slot size a class hands out (0 for an invalid class) */
++LUAI_FUNC unsigned lua_arena_slotsize (lua_Arena *a, int cid);
++
++/* return whole empty segments (level 0) and, at level 1, also drop the
++** huge cache and purge free mimalloc pages; returns bytes released */
++LUAI_FUNC size_t lua_arena_trim (lua_Arena *a, int level);
++
++LUAI_FUNC void lua_arena_stats (lua_Arena *a, lua_ArenaStats *st);
++LUAI_FUNC void lua_arena_defaults (lua_ArenaConfig *cfg);
++
++/* attach the arena to a state created with 'lua_arena_alloc' and this
++** arena as its 'ud' */
++LUAI_FUNC void lua_arena_attach (lua_State *L, lua_Arena *a);
++
++/* slot-level primitives, used by luaC_compact (lgc.c) to move a block
++** from one slot of a class to another: take allocates, give frees (the
++** caller has already copied the payload) */
++LUAI_FUNC void *lua_arena_take_slot (lua_Arena *a, int cid);
++LUAI_FUNC void lua_arena_give_slot (lua_Arena *a, int cid, void *block);
++
++/* segment introspection, used by the compaction planner in lgc.c */
++LUAI_FUNC ArenaSeg *lua_arena_segment (ArenaClass *c, const void *p);
++LUAI_FUNC unsigned lua_arena_segment_index (ArenaClass *c, ArenaSeg *s);
++/* return a segment to mimalloc when it is wholly free; 1 when dropped */
++LUAI_FUNC int lua_arena_release_segment (lua_Arena *a, int cid, ArenaSeg *s);
++
++#endif					/* } */
++
++#endif
+diff --git a/lauxlib.h b/lauxlib.h
+index 2d015362..3d9a9800 100644
+--- a/lauxlib.h
++++ b/lauxlib.h
+@@ -102,6 +102,20 @@ LUALIB_API int (luaL_loadbufferx) (lua_State *L, const char *buff, size_t sz,
+ LUALIB_API int (luaL_loadstring) (lua_State *L, const char *s);
  
- #if defined(LUA_CORE) || defined(LUA_LIB)	/* { */
- #define LUA_API __declspec(dllexport)
+ LUALIB_API lua_State *(luaL_newstate) (void);
++#if defined(KIMIX_LUA_ARENA)		/* { */
++/*
++** kimix extension: create a state whose 'lua_Alloc' is the memory arena.
++** 'cfg' may be NULL for the defaults; see lua_ArenaConfig in lua.h.
++** The state behaves exactly like one from 'luaL_newstate' (same
++** libraries available, same semantics); only the footprint differs.
++** 'luaL_arena' borrows the arena so a host can read stats and trim after
++** 'lua_close', and 'lua_ArenaFree' releases it (the host owns it).
++*/
++LUALIB_API lua_State *luaL_newstate_arena (const lua_ArenaConfig *cfg);
++LUALIB_API void *luaL_arena (lua_State *L);
++LUALIB_API void luaL_freestate_arena (lua_State *L);
++#endif					/* } */
++
+ 
+ LUALIB_API unsigned (luaL_makeseed) (lua_State *L);
+ 
+diff --git a/lgc.c b/lgc.c
+index cf4160c1..f2fc5c73 100644
+--- a/lgc.c
++++ b/lgc.c
+@@ -24,7 +24,10 @@
+ #include "lstring.h"
+ #include "ltable.h"
+ #include "ltm.h"
+-
++#if defined(KIMIX_LUA_ARENA)		/* { */
++#include <mimalloc.h>		/* mi_malloc/mi_free for the planner */
++#include "larena.h"
++#endif					/* } */
+ 
+ /*
+ ** Maximum number of elements to sweep in each single step.
+@@ -296,7 +299,11 @@ void luaC_fix (lua_State *L, GCObject *o) {
+ */
+ GCObject *luaC_newobjdt (lua_State *L, lu_byte tt, size_t sz, size_t offset) {
+   global_State *g = G(L);
++    #if defined(KIMIX_LUA_ARENA)		/* { */
++  char *p = cast_charp(luaM_newobjectx(L, novariant(tt), sz, LUA_MEMCLS_GCOBJ));
++  #else					/* }{ */
+   char *p = cast_charp(luaM_newobject(L, novariant(tt), sz));
++  #endif					/* } */
+   GCObject *o = cast(GCObject *, p + offset);
+   o->marked = luaC_white(g);
+   o->tt = tt;
+@@ -1803,3 +1810,210 @@ void luaC_fullgc (lua_State *L, int isemergency) {
+ /* }====================================================== */
+ 
+ 
++
++
++#if defined(KIMIX_LUA_ARENA)		/* { */
++/*
++** {==================================================================
++** Slab compaction (kimix extension)
++** ===================================================================
++** Only table array blocks may move. A Table is a GCObject -- its address
++** is what lua_topointer returns and what the GC lists hold -- a TString
++** payload has to stay put while the value lives (lua_tostring's 'const
++** char *'), and every other block is reachable from a C frame. A table
++** array block, in contrast, is referenced only by 't->array', so moving
++** it is a memcpy plus one pointer assignment; no interior pointer has to
++** be rewritten.
++**
++** The pass therefore runs only from lua_gc(LUA_GCCOMPACT) -- never from
++** luaC_checkGC, luaC_step or the emergency collection in 'tryagain' --
++** and only at a quiescent point: main thread, no C call in flight
++** (nCcalls == 0), no finalizer pending. At such a point no interior
++** pointer into an array block can exist, because the only functions that
++** form one (luaH_get*, luaH_next, luaH_pset*, luaH_resize) are entered
++** from a Lua or C call. Any precondition failure is a no-op that bumps
++** 'compaction_skips', never a crash.
++**
++** Plan, then move, then publish: a source segment is only emptied when
++** every slot it holds belongs to a table array block (so the movable
++** count equals the live count) and a target segment has room for all of
++** them. A failed step leaves the state untouched.
++*/
++size_t luaC_compact (lua_State *L, int min_saving_pct) {
++  global_State *g = G(L);
++  lua_Arena *a = g->arena;
++  unsigned offs[ARENA_MAX_CLASSES];
++  unsigned *counts;
++  unsigned nseg = 0;
++  unsigned i;
++  size_t commit = 0;
++  size_t would = 0;
++  size_t done = 0;
++  if (a == NULL)
++    return 0;
++  if (a->in_compaction || g->gcstopem != 0 || g->gcstp != 0 ||
++      L != mainthread(g) || getCcalls(L) != 0 || g->tobefnz != NULL) {
++    /* 'getCcalls' is the C-call nesting depth: the high half of nCcalls
++       only marks the main thread as non-yieldable */
++    a->compaction_skips++;
++    return 0;
++  }
++  for (i = 0; i < cast_uint(a->nclasses); i++) {
++    offs[i] = nseg;
++    nseg += a->classes[i].seg_count;
++    commit += cast_sizet(a->classes[i].seg_count) * a->classes[i].seg_payload;
++  }
++  if (nseg == 0)
++    return 0;
++  counts = cast(unsigned *, mi_malloc(sizeof(unsigned) * nseg));
++  if (counts == NULL) {
++    a->compaction_skips++;
++    return 0;
++  }
++  memset(counts, 0, sizeof(unsigned) * nseg);
++  {  /* ---- plan: count live table array blocks per (class, segment) ---- */
++    GCObject *o;
++    for (o = g->allgc; o != NULL; o = o->next) {
++      Table *t;
++      size_t bytes;
++      int cid;
++      ArenaClass *c;
++      ArenaSeg *seg;
++      if (o->tt != LUA_VTABLE)
++        continue;
++      t = gco2t(o);
++      if (t->array == NULL)
++        continue;
++      bytes = cast_sizet(t->asize) * (sizeof(Value) + 1) + sizeof(unsigned);
++      cid = lua_arena_classof(a, bytes);
++      if (cid == ARENA_CLASS_NONE)
++        continue;			/* the huge tier: not movable */
++      c = &a->classes[cid];
++      seg = lua_arena_segment(c, cast_voidp(t->array - t->asize));
++      if (seg == NULL)
++        continue;
++      counts[offs[cid] + lua_arena_segment_index(c, seg)]++;
++    }
++  }
++  {  /* ---- decide: which segments can be emptied, and where to ---- */
++    /*
++    ** A segment is a source only when every slot it holds is a movable
++    ** table array block; it is chosen sparsest first (the most free slots,
++    ** hence the fewest blocks to move), and only while the slots left in
++    ** the remaining segments can host them. Once the sparsest candidate no
++    ** longer fits, no other candidate can: every other one has fewer free
++    ** slots and therefore more blocks to move. Fenced sources are flagged
++    ** so the mover never allocates into them.
++    */
++    unsigned j;
++    for (i = 0; i < cast_uint(a->nclasses); i++) {
++      ArenaClass *c = &a->classes[i];
++      unsigned target_free = 0;	/* free slots in the segments left alone */
++      unsigned to_move = 0;	/* blocks the chosen sources contribute */
++      if (c->seg_count < 2)
++        continue;			/* nothing to move into */
++      for (j = 0; j < c->seg_count; j++)
++        target_free += c->segs[j]->nfree;
++      for (;;) {
++        unsigned best = c->seg_count;
++        unsigned best_free = 0;
++        for (j = 0; j < c->seg_count; j++) {
++          ArenaSeg *seg = c->segs[j];
++          unsigned live = seg->nslots - seg->nfree;
++          unsigned movable = counts[offs[i] + j];
++          if ((seg->flags & ARENA_SEG_NOSLOT) != 0)
++            continue;			/* already picked as a source */
++          if (!(seg->nfree > 0 && live > 0 && movable == live))
++            continue;			/* holds something that cannot move */
++          if (best == c->seg_count || seg->nfree > best_free) {
++            best = j;
++            best_free = seg->nfree;
++          }
++        }
++        if (best >= c->seg_count)
++          break;			/* no candidate left */
++{
++          ArenaSeg *seg = c->segs[best];
++          unsigned live = seg->nslots - seg->nfree;
++          /* its blocks must fit in the free slots of the segments that stay */
++          if (to_move + live > target_free - seg->nfree)
++            break;
++          to_move += live;
++          target_free -= seg->nfree;
++          would += c->seg_payload;
++          seg->flags |= ARENA_SEG_NOSLOT;	/* a source, not a target */
++        }
++      }
++    }
++  }
++  a->would_compact_bytes = would;
++  if (a->cfg.dry_run || a->cfg.enable_compaction == 0 ||
++      (min_saving_pct > 0 &&
++       would * 100 < cast_sizet(min_saving_pct) * commit)) {
++    /* plan only: report it, move nothing */
++    for (i = 0; i < cast_uint(a->nclasses); i++) {
++      ArenaClass *c = &a->classes[i];
++      unsigned j;
++      for (j = 0; j < c->seg_count; j++)
++        c->segs[j]->flags &= ~ARENA_SEG_NOSLOT;
++    }
++    mi_free(counts);
++    return 0;
++  }
++  a->in_compaction = 1;
++  {  /* ---- move every live block out of the fenced segments ---- */
++    GCObject *o;
++    for (o = g->allgc; o != NULL; o = o->next) {
++      Table *t;
++      size_t bytes;
++      int cid;
++      ArenaClass *c;
++      ArenaSeg *seg;
++      void *block;
++      void *nblock;
++      if (o->tt != LUA_VTABLE)
++        continue;
++      t = gco2t(o);
++      if (t->array == NULL)
++        continue;
++      bytes = cast_sizet(t->asize) * (sizeof(Value) + 1) + sizeof(unsigned);
++      cid = lua_arena_classof(a, bytes);
++      if (cid == ARENA_CLASS_NONE)
++        continue;
++      c = &a->classes[cid];
++      block = cast_voidp(t->array - t->asize);
++      seg = lua_arena_segment(c, block);
++      if (seg == NULL || (seg->flags & ARENA_SEG_NOSLOT) == 0)
++        continue;
++      nblock = lua_arena_take_slot(a, cid);
++      if (nblock == NULL)
++        continue;			/* out of targets: leave this one */
++      memcpy(nblock, block, bytes);
++      t->array = cast(Value *, cast_charp(nblock) +
++                                 cast_sizet(t->asize) * sizeof(Value));
++      lua_arena_give_slot(a, cid, block);
++    }
++  }
++  {  /* ---- publish: drop the segments that are now wholly free ---- */
++    for (i = 0; i < cast_uint(a->nclasses); i++) {
++      ArenaClass *c = &a->classes[i];
++      unsigned j = c->seg_count;
++      while (j-- > 0) {
++        ArenaSeg *seg = c->segs[j];
++        if ((seg->flags & ARENA_SEG_NOSLOT) == 0)
++          continue;
++        seg->flags &= ~ARENA_SEG_NOSLOT;
++        if (lua_arena_release_segment(a, cast_int(i), seg))
++          done += c->seg_payload;
++      }
++    }
++  }
++  a->in_compaction = 0;
++  a->compactions++;
++  a->compacted_bytes += done;
++  mi_free(counts);
++  return done;
++}
++
++/* }================================================================== */
++#endif					/* } */
+diff --git a/lgc.h b/lgc.h
+index 193ac0fc..38f3f833 100644
+--- a/lgc.h
++++ b/lgc.h
+@@ -253,6 +253,11 @@
+ 	iscollectable(v) ? luaC_objbarrierback(L, p, gcvalue(v)) : cast_void(0))
+ 
+ LUAI_FUNC void luaC_fix (lua_State *L, GCObject *o);
++#if defined(KIMIX_LUA_ARENA)		/* { */
++/* kimix extension: move table array blocks out of sparse segments;
++** 'min_saving_pct' is the minimum gain required to act (0 = always) */
++LUAI_FUNC size_t luaC_compact (lua_State *L, int min_saving_pct);
++#endif					
+ LUAI_FUNC void luaC_freeallobjects (lua_State *L);
+ LUAI_FUNC void luaC_step (lua_State *L);
+ LUAI_FUNC void luaC_runtilstate (lua_State *L, int state, int fast);
+diff --git a/lmem.c b/lmem.c
+index de8503d9..c2c3c3ba 100644
+--- a/lmem.c
++++ b/lmem.c
+@@ -20,6 +20,9 @@
+ #include "lmem.h"
+ #include "lobject.h"
+ #include "lstate.h"
++#if defined(KIMIX_LUA_ARENA)		/* { */
++#include "larena.h"
++#endif					/* } */
+ 
+ 
+ 
+@@ -213,3 +216,37 @@ void *luaM_malloc_ (lua_State *L, size_t size, int tag) {
+     return newblock;
+   }
+ }
++
++#if defined(KIMIX_LUA_ARENA)		/* { */
++/*
++** kimix extension: the hint-carrying allocation funnel.
++**
++** A block's size class is a pure function of the requested size
++** ('lua_arena_classof'), and the very same function maps 'osize' back
++** when the block is freed, so a hint cannot and must not change where a
++** block lands -- if it could, a mismatched hint would corrupt the heap.
++** What the hint does is record the intent at the call site, which is
++** what 'test_lua_arena' checks by walking these files for alloc/free
++** pairs, and it is the place a future compaction pass would consult to
++** know whether a block may move.
++*/
++void *luaM_mallocx_ (lua_State *L, size_t size, int tag, int cls) {
++  UNUSED(cls);
++  return luaM_malloc_(L, size, tag);
++}
++
++
++void *luaM_reallocx_ (lua_State *L, void *block, size_t osize, size_t nsize,
++                      int cls) {
++  UNUSED(cls);
++  return luaM_realloc_(L, block, osize, nsize);
++}
++
++
++void luaM_freex_ (lua_State *L, void *block, size_t osize, int cls) {
++  UNUSED(cls);
++  luaM_free_(L, block, osize);
++}
++
++/* }================================================================== */
++#endif					/* } */
+diff --git a/lmem.h b/lmem.h
+index dc714fb2..b8f59ba5 100644
+--- a/lmem.h
++++ b/lmem.h
+@@ -77,6 +77,34 @@
+ #define luaM_shrinkvector(L,v,size,fs,t) \
+    ((v)=cast(t *, luaM_shrinkvector_(L, v, &(size), fs, sizeof(t))))
+ 
++#if defined(KIMIX_LUA_ARENA)		/* { */
++/*
++** kimix extension: size-class hints.
++** The arena derives a block's size class from the requested size alone
++** (the same function maps 'osize' back on free), so these hints cannot
++** change where a block lands; they document the intent at the call site
++** and let a KIMIX_LUA_MEMCHECK build assert the invariant "the class
++** derived on alloc equals the class derived on free".
++*/
++#define LUA_MEMCLS_GENERIC	0	/* parser, stack, buffers */
++#define LUA_MEMCLS_GCOBJ	1	/* a fixed-size GCObject */
++#define LUA_MEMCLS_STR		2	/* long-string payload */
++#define LUA_MEMCLS_ARR		3	/* table array block (9*N+4) */
++#define LUA_MEMCLS_NODE		4	/* table node block (32*2^k [+16]) */
++
++LUAI_FUNC void *luaM_mallocx_ (lua_State *L, size_t size, int tag, int cls);
++LUAI_FUNC void *luaM_reallocx_ (lua_State *L, void *block, size_t osize,
++                                size_t nsize, int cls);
++LUAI_FUNC void luaM_freex_ (lua_State *L, void *block, size_t osize, int cls);
++
++#define luaM_newvectorx(L,n,t,cls)  \
++	cast(t*, luaM_mallocx_(L, cast_sizet(n)*sizeof(t), 0, (cls)))
++#define luaM_newblockx(L,size,cls)  \
++	cast(char*, luaM_mallocx_(L, (size), 0, (cls)))
++#define luaM_freememx(L,b,s,cls)  luaM_freex_(L, (b), (s), (cls))
++#define luaM_newobjectx(L,tag,s,cls)  luaM_mallocx_(L, (s), tag, (cls))
++#endif					/* } */
++
+ LUAI_FUNC l_noret luaM_toobig (lua_State *L);
+ 
+ /* not to be called directly */
+diff --git a/lstate.h b/lstate.h
+index 30a560a7..efa3bbaf 100644
+--- a/lstate.h
++++ b/lstate.h
+@@ -327,6 +327,12 @@ typedef struct LX {
+ typedef struct global_State {
+   lua_Alloc frealloc;  /* function to reallocate memory */
+   void *ud;         /* auxiliary data to 'frealloc' */
++#if defined(KIMIX_LUA_ARENA)		/* { */
++  /* kimix extension: the per-state memory arena that 'frealloc' serves,
++     or NULL when the state was built with a plain allocator
++     (luaL_newstate / luaL_alloc -> mimalloc) */
++  struct lua_Arena *arena;
++#endif					/* } */
+   l_mem GCtotalbytes;  /* number of bytes currently allocated + debt */
+   l_mem GCdebt;  /* bytes counted but not yet allocated */
+   l_mem GCmarked;  /* number of objects marked in a GC cycle */
+diff --git a/ltable.c b/ltable.c
+index 2f2b5c1f..8b7ee875 100644
+--- a/ltable.c
++++ b/ltable.c
+@@ -35,6 +35,9 @@
+ #include "lmem.h"
+ #include "lobject.h"
+ #include "lstate.h"
++#if defined(KIMIX_LUA_ARENA)		/* { */
++#include "larena.h"
++#endif					
+ #include "lstring.h"
+ #include "ltable.h"
+ #include "lvm.h"
+@@ -393,8 +396,12 @@ static size_t sizehash (Table *t) {
+ static void freehash (lua_State *L, Table *t) {
+   if (!isdummy(t)) {
+     /* get pointer to the beginning of Node array */
+-    char *arr = cast_charp(t->node) - extraLastfree(t);
+-    luaM_freearray(L, arr, sizehash(t));
++          char *arr = cast_charp(t->node) - extraLastfree(t);
++      #if defined(KIMIX_LUA_ARENA)		/* { */
++      luaM_freememx(L, arr, sizehash(t), LUA_MEMCLS_NODE);
++      #else					/* }{ */
++      luaM_freearray(L, arr, sizehash(t));
++      #endif					/* } */
+   }
+ }
+ 
+@@ -566,14 +573,22 @@ static Value *resizearray (lua_State *L , Table *t,
+   if (oldasize == newasize)
+     return t->array;  /* nothing to be done */
+   else if (newasize == 0) {  /* erasing array? */
+-    Value *op = t->array - oldasize;  /* original array's real address */
+-    luaM_freemem(L, op, concretesize(oldasize));  /* free it */
++          Value *op = t->array - oldasize;  /* original array's real address */
++      #if defined(KIMIX_LUA_ARENA)		/* { */
++      luaM_freememx(L, op, concretesize(oldasize), LUA_MEMCLS_ARR);
++      #else					/* }{ */
++      luaM_freemem(L, op, concretesize(oldasize));  /* free it */
++      #endif					/* } */
+     return NULL;
+   }
+   else {
+-    size_t newasizeb = concretesize(newasize);
+-    Value *np = cast(Value *,
+-                  luaM_reallocvector(L, NULL, 0, newasizeb, lu_byte));
++          size_t newasizeb = concretesize(newasize);
++      #if defined(KIMIX_LUA_ARENA)		/* { */
++      Value *np = cast(Value *, luaM_newblockx(L, newasizeb, LUA_MEMCLS_ARR));
++      #else					/* }{ */
++      Value *np = cast(Value *,
++                    luaM_reallocvector(L, NULL, 0, newasizeb, lu_byte));
++      #endif					/* } */
+     if (np == NULL)  /* allocation error? */
+       return NULL;
+     np += newasize;  /* shift pointer to the end of value segment */
+@@ -611,11 +626,19 @@ static void setnodevector (lua_State *L, Table *t, unsigned size) {
+     if (lsize > MAXHBITS || (1 << lsize) > MAXHSIZE)
+       luaG_runerror(L, "table overflow");
+     size = twoto(lsize);
+-    if (lsize < LIMFORLAST)  /* no 'lastfree' field? */
+-      t->node = luaM_newvector(L, size, Node);
+-    else {
+-      size_t bsize = size * sizeof(Node) + sizeof(Limbox);
+-      char *node = luaM_newblock(L, bsize);
++          #if defined(KIMIX_LUA_ARENA)		/* { */
++      if (lsize < LIMFORLAST)  /* no 'lastfree' field? */
++        t->node = luaM_newvectorx(L, size, Node, LUA_MEMCLS_NODE);
++      else {
++        size_t bsize = size * sizeof(Node) + sizeof(Limbox);
++        char *node = luaM_newblockx(L, bsize, LUA_MEMCLS_NODE);
++      #else					/* }{ */
++      if (lsize < LIMFORLAST)  /* no 'lastfree' field? */
++        t->node = luaM_newvector(L, size, Node);
++      else {
++        size_t bsize = size * sizeof(Node) + sizeof(Limbox);
++        char *node = luaM_newblock(L, bsize);
++      #endif					/* } */
+       t->node = cast(Node *, node + sizeof(Limbox));
+       getlastfree(t) = gnode(t, size);  /* all positions are free */
+     }
+@@ -747,6 +770,51 @@ void luaH_resize (lua_State *L, Table *t, unsigned newasize,
+ }
+ 
+ 
++#if defined(KIMIX_LUA_ARENA)		/* { */
++/*
++** Shrink the array part of 't' to the smallest power of two that still
++** holds every live element. Capacity is invisible to scripts (#t and the
++** traversal order of the array part do not change), so this is a pure
++** memory policy. Elements that would fall outside the new array part are
++** re-inserted into the hash part by 'luaH_resize', so a shrink can never
++** lose a key.
++*/
++size_t luaH_shrink (lua_State *L, Table *t) {
++  unsigned asize = t->asize;
++  unsigned last = 0;
++  unsigned newasize = 1;
++  size_t before, after;
++  if (asize < 64)			/* too small to be worth a walk */
++    return 0;
++  {  /* find the last non-empty slot: O(asize) over the array we shrink */
++    unsigned i = asize;
++    while (i > 0) {
++      if (!tagisempty(*getArrTag(t, i - 1))) {
++        last = i;
++        break;
++      }
++      i--;
++    }
++  }
++  while (newasize < last)
++    newasize <<= 1;
++  /* policy: only when the array is at most half full and the gain is
++     real (a few slots are not worth a block move) */
++  if (last > asize / 2 || asize - newasize < 16)
++    return 0;
++  before = concretesize(asize);
++  after = concretesize(newasize);
++  {  /* in a dry run, only report what a shrink would return */
++    lua_Arena *a = G(L)->arena;
++    if (a != NULL && a->cfg.dry_run) {
++      a->would_shrink_bytes += before - after;
++      return 0;
++    }
++  }
++  luaH_resize(L, t, newasize, allocsizenode(t));
++  return (before > after) ? before - after : 0;
++}
++#endif					
+ void luaH_resizearray (lua_State *L, Table *t, unsigned int nasize) {
+   unsigned nsize = allocsizenode(t);
+   luaH_resize(L, t, nasize, nsize);
+diff --git a/ltable.h b/ltable.h
+index f3b7bc7e..a03370b7 100644
+--- a/ltable.h
++++ b/ltable.h
+@@ -167,6 +167,11 @@ LUAI_FUNC void luaH_set (lua_State *L, Table *t, const TValue *key,
+ LUAI_FUNC void luaH_finishset (lua_State *L, Table *t, const TValue *key,
+                                               TValue *value, int hres);
+ LUAI_FUNC Table *luaH_new (lua_State *L);
++#if defined(KIMIX_LUA_ARENA)		/* { */
++/* shrink the array part to the smallest power of two that still holds
++** every live element; returns the bytes released (0 = nothing to do) */
++LUAI_FUNC size_t luaH_shrink (lua_State *L, Table *t);
++#endif					/* } */
+ LUAI_FUNC void luaH_resize (lua_State *L, Table *t, unsigned nasize,
+                                                     unsigned nhsize);
+ LUAI_FUNC void luaH_resizearray (lua_State *L, Table *t, unsigned nasize);
+diff --git a/ltablib.c b/ltablib.c
+index 15c3c09f..a3cd9bb7 100644
+--- a/ltablib.c
++++ b/ltablib.c
+@@ -409,6 +409,37 @@ static int sort (lua_State *L) {
+ /* }====================================================== */
+ 
+ 
++#if defined(KIMIX_LUA_ARENA)		/* { */
++/*
++** kimix extensions.
++**
++** table.new(narr [, nrec]) presizes a fresh table, so building a big one
++** costs a single allocation instead of the block chain that the implicit
++** growth walk (1 -> 2 -> 4 -> ...) leaves behind. It is the script-side
++** twin of lua_createtable; 'table.create' is the same function under its
++** Lua 5.5 name.
++**
++** table.shrink(t) releases array-part capacity that 't' no longer needs.
++** Capacity is not observable from a script (#t and the traversal order of
++** the array part are unchanged), so this only gives memory back; it
++** returns the number of bytes released.
++*/
++static int tnew (lua_State *L) {
++  lua_Unsigned sizeseq = (lua_Unsigned)luaL_checkinteger(L, 1);
++  lua_Unsigned sizerest = (lua_Unsigned)luaL_optinteger(L, 2, 0);
++  luaL_argcheck(L, sizeseq <= cast_uint(INT_MAX), 1, "out of range");
++  luaL_argcheck(L, sizerest <= cast_uint(INT_MAX), 2, "out of range");
++  lua_createtable(L, cast_int(sizeseq), cast_int(sizerest));
++  return 1;
++}
++
++
++static int tshrink (lua_State *L) {
++  luaL_checktype(L, 1, LUA_TTABLE);
++  lua_pushinteger(L, cast(lua_Integer, lua_shrinktable(L, 1)));
++  return 1;
++}
++#endif					
+ static const luaL_Reg tab_funcs[] = {
+   {"concat", tconcat},
+   {"create", tcreate},
+@@ -417,7 +448,11 @@ static const luaL_Reg tab_funcs[] = {
+   {"unpack", tunpack},
+   {"remove", tremove},
+   {"move", tmove},
+-  {"sort", sort},
++  #if defined(KIMIX_LUA_ARENA)		/* { */
++{"new", tnew},
++  {"shrink", tshrink},
++  #endif					/* } */
++{"sort", sort},
+   {NULL, NULL}
+ };
+ 
+diff --git a/lua.h b/lua.h
+index 6deaed49..d5972d75 100644
+--- a/lua.h
++++ b/lua.h
+@@ -355,6 +355,111 @@ LUA_API void (lua_warning)  (lua_State *L, const char *msg, int tocont);
+ 
+ /* number of parameters */
+ #define LUA_GCPN		6
++#if defined(KIMIX_LUA_ARENA)	/* { */
++/*
++** {==================================================================
++** kimix extension: per-state memory arena
++** ===================================================================
++** A lua_Alloc implementation with size-class recycling for small
++** blocks, exact-size recycling for table array/node blocks, a cached
++** "huge" tier above 'small_max' and a trim/purge policy. It is opt-in:
++** 'luaL_newstate' (luaL_alloc -> mimalloc) is untouched, and a state
++** built with 'luaL_newstate_arena' behaves identically from Lua's
++** point of view -- only the footprint differs.
++**
++** Two extra 'lua_gc' opcodes drive it from a plain C host:
++**   lua_gc(L, LUA_GCTRIM, level)  - level 0: return empty segments;
++**                                   level 1: also drop the huge cache
++**                                   and purge free mimalloc pages
++**                                   (mi_collect(true))
++**   lua_gc(L, LUA_GCCOMPACT, pct) - plan/move table blocks out of
++**                                   sparse segments; 'pct' is the
++**                                   minimum saving required to act
++**                                   (0 = act whenever it can)
++** Neither opcode changes lua_Alloc's public contract.
++*/
++#define LUA_GCTRIM		10
++#define LUA_GCCOMPACT		11
++
++/* shrink a table's array part to what its live elements need; 'idx' is
++** a stack index and the result is the number of bytes released */
++LUA_API size_t (lua_shrinktable) (lua_State *L, int idx);
++/* shrink a table's array part to what its live elements need; 'idx' is
++** a stack index and the result is the number of bytes released */
++LUA_API size_t (lua_shrinktable) (lua_State *L, int idx);
++
++
++typedef struct lua_ArenaConfig {
++  size_t segment_bytes;  /* bytes carved per segment (default 64 KiB) */
++  int small_max;  /* largest slotted size; above it: the huge tier */
++  int huge_cache;  /* freed huge runs kept, per exact size (default 4) */
++  int dry_run;  /* decide/count only, allocate from mimalloc */
++  int gc_pause_pct;  /* LUA_GCPPAUSE to apply (0: leave the default) */
++  int gc_stepmul;  /* LUA_GCPSTEPMUL to apply (0: leave the default) */
++  int enable_compaction;  /* allow lua_gc(LUA_GCCOMPACT) to move blocks */
++} lua_ArenaConfig;
++
++
++typedef struct lua_ArenaStats {
++  size_t logical_live;  /* bytes requested by Lua (what GCCOUNT counts) */
++  size_t commit_bytes;  /* segments + huge runs, live or cached */
++  size_t internal_waste;  /* slot rounding + unusable segment tail */
++  size_t segment_bytes;  /* configured segment size */
++  unsigned long slots_used;
++  unsigned long slots_free;
++  unsigned long slots_total;
++  unsigned long seg_count;
++  unsigned long huge_live_bytes;
++  unsigned long huge_live_count;
++  unsigned long huge_cached;
++  unsigned long huge_cached_bytes;
++  unsigned long calls;  /* lua_Alloc calls served */
++  unsigned long trims;  /* lua_ArenaTrim calls */
++  size_t trim_bytes;  /* bytes returned to mimalloc by the trims */
++  unsigned long purges;  /* mi_collect(true) calls */
++  /* plan/dry-run counters: what the engine would do */
++  unsigned long would_segments;  /* segments it would carve */
++  unsigned long would_alloc;
++  unsigned long would_free;
++  unsigned long would_reuse;  /* hits on an existing free slot */
++  unsigned long would_huge_reuse;  /* hits on a cached huge run */
++  size_t would_shrink_bytes;  /* table capacity a shrink would return */
++  size_t would_compact_bytes;  /* segments a compaction would return */
++  size_t compacted_bytes;  /* segments a compaction did return */
++  unsigned long compactions;
++  unsigned long compaction_skips;  /* preconditions not met */
++  int dry_run;
++  int enabled;  /* 1 when an arena serves this state */
++} lua_ArenaStats;
++
++
++/* introspection for embedders and tests: the class table */
++typedef struct lua_ArenaClassInfo {
++  unsigned slot_size;  /* bytes handed out per slot */
++  unsigned seg_payload;  /* bytes in one segment of this class */
++  unsigned seg_count;
++  unsigned slots_used;
++  unsigned slots_free;
++  int tier;  /* 0 tiny, 1 small, 2 medium, 3 exact-ARR, 4 exact-NODE */
++} lua_ArenaClassInfo;
++
++LUA_API int (lua_ArenaClassCount) (void *arena);
++/* the class a request of 'size' bytes lands in; -1 = the huge tier */
++LUA_API int (lua_ArenaClassOf) (void *arena, size_t size);
++LUA_API int (lua_ArenaClassInfoGet) (void *arena, int cid,
++                                     lua_ArenaClassInfo *info);
++LUA_API void (lua_ArenaConfigDefault) (lua_ArenaConfig *cfg);
++/* fill 'st' from the arena behind 'L' (zeroed when there is none) */
++LUA_API void (lua_ArenaStatsGet) (lua_State *L, lua_ArenaStats *st);
++/* trim the arena of 'L'; returns the bytes returned to mimalloc */
++LUA_API size_t (lua_ArenaTrim) (lua_State *L, int level);
++/* handle-based entry points, usable after lua_close ('arena' is the
++** handle borrowed through luaL_arena, see lauxlib.h) */
++LUA_API void (lua_ArenaStatsOf) (void *arena, lua_ArenaStats *st);
++LUA_API size_t (lua_ArenaTrimHandle) (void *arena, int level);
++LUA_API void (lua_ArenaFree) (void *arena);
++/* }================================================================== */
++#endif						/* } */
+ 
+ 
+ LUA_API int (lua_gc) (lua_State *L, int what, ...);

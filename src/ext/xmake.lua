@@ -312,6 +312,16 @@ target("lua")
     add_deps("kimix-core")
     -- Building this dll: dllexport/visibility branch + the mimalloc allocator.
     add_defines("KIMIX_LUA_BUILD_SHARED", "KIMIX_LUA_USE_MIMALLOC")
+      -- The memory arena is opt-in per configuration (root option lua_arena, default
+      -- on). Off = the vendored sources compile unchanged: every edit in src/ext/lua
+      -- is #if defined(KIMIX_LUA_ARENA)-guarded, so a stock build is unaffected.
+      if has_config("lua_arena") then
+          -- public: the arena API lives in lua.h / lauxlib.h under this guard, so
+    -- every consumer must see the same define the library was built with.
+    add_defines("KIMIX_LUA_ARENA", {
+        public = true
+    })
+      end
     -- Consumers: dllimport/extern branch for the C API.
     add_defines("KIMIX_LUA_USE_SHARED", {
         public = true
@@ -337,6 +347,44 @@ target("lua")
     end)
 target_end()
 
+-- lua-tests: the upstream interpreter WITH Lua's internal test library (T),
+-- built exactly like upstream's "make test" -- lua.c + ltests.c + every library
+-- source, compiled with LUA_USER_H='"ltests.h"'. It is what runs
+-- src/ext/lua/testes/ (36 scripts: gc.lua, gengc.lua, heavy.lua, big.lua,
+-- nextvar.lua, sort.lua, strings.lua, api.lua, ...) and it is the e2e gate for
+-- any memory change: ltests.h turns on LUAI_ASSERT and routes luaL_newstate
+-- through debug_realloc, so T.checkmemory() verifies block sizes and types at
+-- the end of every suite. Declared only when the tests are enabled (a plain
+-- interpreter is not a shipped artifact).
+if has_config("kimix_enable_tests") then
+    target("lua-tests")
+        set_kind("binary")
+        -- No unity build: ltests.h redefines luaL_newstate()/luai_openlibs()
+        -- as macros and keeping every unit separate is what upstream tests.
+        add_rules("kimix_basic_settings")
+        add_files(path.join(lua_dir, "*.c"))
+        remove_files(path.join(lua_dir, "onelua.c"))
+        add_includedirs(lua_dir, {
+            public = true
+        })
+        -- The hosted allocator is mimalloc (the same heap as kimix-core), and
+        -- the memory arena is compiled in when the configuration asks for it,
+        -- so both builds can run the same suite.
+        add_defines("KIMIX_LUA_USE_MIMALLOC")
+        add_defines("LUA_USER_H=\"ltests.h\"")
+        if has_config("lua_arena") then
+            add_defines("KIMIX_LUA_ARENA")
+        end
+        add_deps("kimix-core")
+        -- testes/all.lua opens its sibling scripts by relative name.
+        set_rundir(path.join(lua_dir, "testes"))
+        if is_plat("windows") then
+            add_defines("_CRT_SECURE_NO_WARNINGS")
+        elseif is_plat("linux") then
+            add_syslinks("dl", "m", "pthread")
+        end
+    target_end()
+end
 -- SQLite3 amalgamation (vendored pregenerated amalgamation at
 -- sqlite_amalgamation/) — see the header comment in sqlite_xmake.lua.
 includes("sqlite_xmake.lua")

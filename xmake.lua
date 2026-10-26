@@ -144,6 +144,19 @@ option("graph_db_walk_counters")
     set_description("compile the edge-filtered walk's [ctr] counters into kimix-graph-db")
 option_end()
 
+-- Lua memory arena (src/ext/lua/larena.c, KIMIX_LUA_ARENA).
+-- ON by default. It is an extra entry point (luaL_newstate_arena), not a
+-- behaviour change: luaL_newstate keeps using luaL_alloc -> mimalloc, so every
+-- existing embedder (src/script, src/api, tests) is untouched. Off means the
+-- vendored sources build completely unchanged, because every edit in
+-- src/ext/lua is #if-guarded -- that is the compatibility gate (build the test
+-- matrix both ways, run test_lua both ways).
+-- See docs/lua_memory_arena.md and src/ext/lua.kimix.patch.
+option("lua_arena")
+    set_default(true)
+    set_showmenu(true)
+    set_description("compile the Lua memory arena (KIMIX_LUA_ARENA) into the lua target")
+option_end()
 -- disable Windows message box (redirect asserts/errors to stderr instead)
 option("kimix_disable_win_message_box", {
     default = true

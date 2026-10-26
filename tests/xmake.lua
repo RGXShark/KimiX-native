@@ -115,14 +115,43 @@ test_proj("test_xxhash", "unit/ext/test_xxhash.cpp")
 test_proj("test_lua", "unit/ext/test_lua.cpp", function()
     add_deps("lua")
 end)
-
+      
 -- unit/script (kimix-script): the Lua script sandbox (src/script).
---   test_script_sandbox -- lifecycle, isolation, budgets, marshalling
---   test_script_hostile -- the abort contract: 17 forbidden APIs x 7 wrappers
---   test_script_surface -- golden capability allowlist (fails on any new global)
+-- test_script_sandbox -- lifecycle, isolation, budgets, marshalling
+-- test_script_hostile -- the abort contract: 17 forbidden APIs x 7 wrappers
+-- test_script_surface -- golden capability allowlist (fails on any new global)
 test_proj("test_script_sandbox", "unit/script/test_script_sandbox.cpp", function()
     add_deps("kimix-script")
 end)
+
+-- unit/ext (the kimix Lua memory arena, src/ext/lua/larena.c): size classes,
+-- segment/free-list accounting, the huge tier, trim/purge, dry-run, and the
+-- allocator's conservation invariants. Compiled only when the arena is on.
+if has_config("lua_arena") then
+    test_proj("test_lua_arena", "unit/ext/test_lua_arena.cpp", function()
+        add_deps("lua")
+    end)
+-- unit/ext (table memory policy): array/node block sizes against
+-- concretesize()/sizehash(), table.new/table.shrink, compaction plan+move
+    test_proj("test_lua_table_mem", "unit/ext/test_lua_table_mem.cpp", function()
+        add_deps("lua")
+    end)
+-- bench_lua_mem.cpp is deliberately NOT registered as a Boost.UT suite:
+-- it is a benchmark with thresholds (its own main(), prints bands, exits
+-- non-zero when a band is missed), built as a plain binary so CI can run
+-- it without turning a measurement into a unit test.
+    target("bench_lua_mem")
+        set_kind("binary")
+        add_rules("kimix_basic_settings")
+        add_files("unit/ext/bench_lua_mem.cpp")
+        add_includedirs(".", {
+            public = true
+        })
+        add_deps("lua")
+        set_values("kimix_enable_exception", true)
+        target_end()
+    end
+
 test_proj("test_script_hostile", "unit/script/test_script_hostile.cpp", function()
     add_deps("kimix-script")
 end)
