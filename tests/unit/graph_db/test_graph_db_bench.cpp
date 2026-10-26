@@ -13,7 +13,7 @@
 //          scale; (c) mixed: one structural writer thread plus the content
 //          updaters, reported as two separate rates.
 // - SERIALIZE: 100k and a large pass (1M in release, 200k in debug), EACH RUN ON
-//          BOTH COLD-STORE BACKENDS (lmdb and the opt-in xnvme_file flat file):
+//          BOTH COLD-STORE BACKENDS (lmdb and the opt-in flat_file append-only file):
 //          full save, dual-stage load and a 1 %-dirty incremental save, each run
 //          twice (warmup then measured), timed by steady_clock AND compared
 //          against the serializer's own save_ms / load_ms, with bytes_written
@@ -64,15 +64,13 @@
 //              write transaction per save. On Windows LMDB opens its data file
 //              FILE_FLAG_WRITE_THROUGH, so a commit is a chain of synchronous
 //              page flushes.
-//   xnvme_file FileColdStore (<dir>\graph.xdb) — GraphOptions::store_backend ==
-//              ColdStoreBackend::xnvme_file, one APPENDED frame per save batch
+//   flat_file FileColdStore (<dir>\graph.xdb) — GraphOptions::store_backend ==
+//              ColdStoreBackend::flat_file, one APPENDED frame per save batch
 //              with ONE sync() at the end, and one open + positioned sequential
 //              reads on load.
-// The honest expectation (cpp skill §11) is asymmetric and is what the rows must
-// be read against: the deferred/batched writer is GROUPING, not parallelism, and
-// xnvme is NOT faster than fread on a page-cached regular file, so the load side
-// is expected to be a tie or a small positioned-I/O win; the save side is where a
-// single end-of-batch sync can beat a write-through commit. Neither number is
+// The honest expectation is what the rows must be read against: both backends read
+// the same page-cached file, so the load side is expected to be a tie, and the save
+// side is where a single end-of-batch sync can beat a write-through commit. Neither number is
 // assumed here — the bench measures it and the README §6 verdict is written from
 // the measurement, not the expectation.
 //
@@ -101,7 +99,7 @@
 
 #include <graph_db/cold_store.h> // ColdStore seam: ColdStorage | FileColdStore
 #include <graph_db/database.h>
-#include <graph_db/file_cold_store.h> // the xnvme_file backend + kColdFileName
+#include <graph_db/file_cold_store.h> // the flat_file backend + kColdFileName
 #include <graph_db/graph.h>
 #include <graph_db/graph_db.h>
 #include <graph_db/serialize.h>
@@ -215,7 +213,7 @@ inline void print_rate(char const *name, double ops, double seconds,
     // "ops/s" column is then "operations of this kind per second" (fractional — a
     // 1.4 s save really is 0.7 saves/s). The name column is wider than
     // print_rate's: a serialization line carries scale AND backend
-    // (graphdb/serialize/100k/xnvme_file/incremental_1pct = 49 chars).
+    // (graphdb/serialize/100k/flat_file/incremental_1pct = 49 chars).
     inline void print_elapsed(char const *name, double ms, char const *suffix) noexcept {
         double const safe_ms = ms > 0.0 ? ms : 1e-9;
         std::fprintf(stderr, "[bench] %-52s %12.3f ms %14.3f ops/s  (%s)\n", name, ms,
@@ -822,11 +820,11 @@ void gdi_rate(char const *name, size_t ops, char const *suffix, Body &&body) {
 // ---------------------------------------------------------------------------
 
 // The two backends behind the internal cold_store.h seam. `lmdb` is
-// GraphOptions' default; `xnvme_file` is the opt-in append-only graph.xdb.
-enum class serialize_backend { lmdb, xnvme_file };
+// GraphOptions' default; `flat_file` is the opt-in append-only graph.xdb.
+enum class serialize_backend { lmdb, flat_file };
 
 inline char const *backend_name(serialize_backend backend) noexcept {
-    return backend == serialize_backend::xnvme_file ? "xnvme_file" : "lmdb";
+    return backend == serialize_backend::flat_file ? "flat_file" : "lmdb";
 }
 
 // Owns BOTH backends (exactly one is ever open) and the NON-OWNING ColdStore
@@ -837,14 +835,14 @@ inline char const *backend_name(serialize_backend backend) noexcept {
 // same thing, database.cpp).
 struct serialize_store {
     ColdStorage cold;   // lmdb backend (utils.h)
-    FileColdStore file; // xnvme_file backend (file_cold_store.h)
+    FileColdStore file; // flat_file backend (file_cold_store.h)
     ColdStore handle;   // points at the backend that is open
 
     serialize_store() noexcept : handle{cold} {}
 
     [[nodiscard]] bool open(kimix::filesystem::path const &dir,
                             serialize_backend backend) noexcept {
-        if (backend == serialize_backend::xnvme_file) {
+        if (backend == serialize_backend::flat_file) {
             if (!file.open(dir)) {
                 return false;
             }
@@ -865,7 +863,7 @@ struct serialize_store {
     // next save_batch() that reaches this store, and cleared right after the save,
     // so an lmdb run can never inherit it.
     void arm_full_save(serialize_backend backend, bool full) noexcept {
-        file.set_rebuild_next_batch(full && backend == serialize_backend::xnvme_file);
+        file.set_rebuild_next_batch(full && backend == serialize_backend::flat_file);
     }
 };
 
@@ -893,7 +891,7 @@ struct serialize_numbers {
     size_t incremental_count{0};
     size_t incremental_bytes{0};
     double incremental_ms{0.0};
-    size_t store_file_bytes{0}; // xnvme_file only: graph.xdb after the appends
+    size_t store_file_bytes{0}; // flat_file only: graph.xdb after the appends
     bool ok{false};
 };
 
@@ -922,8 +920,8 @@ serialize_numbers run_serialize_pass(size_t vertices, char const *tag, uint32_t 
     }
     serialize_store store;
     if (!store.open(dir.path(), backend)) {
-        // A backend that cannot open on this platform (xnvme with no backend, or a
-        // path at the 2 GiB wall) reports it instead of silently printing zeros.
+        // A backend whose store cannot be opened here (directory not creatable, file not
+        // readable) reports it instead of silently printing zeros.
         std::fprintf(stderr, "[bench] %s: backend open FAILED\n",
                      serialize_row(tag, backend, "open").c_str());
         return numbers;
@@ -1012,7 +1010,7 @@ serialize_numbers run_serialize_pass(size_t vertices, char const *tag, uint32_t 
     numbers.store_file_bytes = store_file_bytes(dir.path());
     {
         char suffix[512];
-        if (backend == serialize_backend::xnvme_file) {
+        if (backend == serialize_backend::flat_file) {
             // The append log keeps the superseded records of the earlier save
             // rounds (LMDB's map would have overwritten them), so the file size is
             // part of the honest picture: it is NOT bytes_written.
@@ -1958,7 +1956,7 @@ int main(int argc, char *argv[]) {
         // ONE row set per cold-store backend, same workload, same constants: the
         // two rows of README §6 are meant to be read cell against cell.
         for (serialize_backend backend :
-             {serialize_backend::lmdb, serialize_backend::xnvme_file}) {
+             {serialize_backend::lmdb, serialize_backend::flat_file}) {
             char const *const label = backend_name(backend);
             serialize_numbers numbers =
                 run_serialize_pass(kSerializeVertices, "100k", 20240608u, backend);
@@ -1986,7 +1984,7 @@ int main(int argc, char *argv[]) {
 
     "bench_serialize_large"_test = [] {
         for (serialize_backend backend :
-             {serialize_backend::lmdb, serialize_backend::xnvme_file}) {
+             {serialize_backend::lmdb, serialize_backend::flat_file}) {
             char const *const label = backend_name(backend);
             serialize_numbers numbers =
                 run_serialize_pass(kSerializeLargeVertices, "large", 20240609u, backend);

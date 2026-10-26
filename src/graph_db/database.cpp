@@ -105,13 +105,12 @@ GdiStatus Database::open(kimix::filesystem::path const &dir,
     // existed. A failed open of either backend leaves the database closed, and
     // every later persist()/load_store() reports error_no_such_file — the same
     // observable state a bad store path has always produced.
-    if (_options.store_backend == ColdStoreBackend::xnvme_file) {
-        // cold_map_size is an LMDB knob: FileColdStore accepts and ignores it, and
-        // its own limit is the 2 GiB file wall (file_cold_store.h, amendment A8).
+    if (_options.store_backend == ColdStoreBackend::flat_file) {
+        // cold_map_size is an LMDB knob: FileColdStore accepts and ignores it.
         if (!_cold_file.open(dir, _options.cold_map_size)) {
             return GdiStatus::error_io;
         }
-        _backend = ColdStoreBackend::xnvme_file;
+        _backend = ColdStoreBackend::flat_file;
         _store = ColdStore{_cold_file};
     } else {
         size_t const map_size = _options.cold_map_size != 0
@@ -163,7 +162,7 @@ GdiStatus Database::persist(bool full, GraphSerializeStats *out) {
     // such flag, so the store is told about it here. The store consumes the arm on
     // its next save_batch() and it is cleared again below, so a save that writes
     // nothing can never affect a later incremental one.
-    bool const rebuild = full && _backend == ColdStoreBackend::xnvme_file;
+    bool const rebuild = full && _backend == ColdStoreBackend::flat_file;
     _cold_file.set_rebuild_next_batch(rebuild);
     GraphSerializeStats const stats = full ? _serializer->save(_graph)
                                            : _serializer->save_incremental(_graph);

@@ -12,10 +12,11 @@
  *   LMDB on Windows opens its data file FILE_FLAG_WRITE_THROUGH, so a commit is a
  *   chain of synchronous write-through page flushes (README §6/§8: ~20-24 MB/s
  *   save at 100k/1M vertices). A log-structured file only has to pay ONE
- *   fsync/FlushFileBuffers per save batch, and reads through kimix's xNVMe
- *   classes need no page mapping at all. The reader is not faster than fread on a
- *   page-cached regular file (cpp skill §11) — the win is the write side and the
- *   API shape (64-bit offsets, positioned I/O, one open per pass).
+ *   fsync/FlushFileBuffers per save batch, and it needs no page mapping at all:
+ *   the transport is plain positioned CRT I/O (fopen + _fseeki64/fseeko) with one
+ *   open per pass. The reader is not faster than fread on a page-cached regular
+ *   file — it IS fread — the win is the write side and the ordinary, 64-bit-offset
+ *   I/O shape.
  *
  * THE FILE — <dir>\graph.xdb  (kColdFileName)
  *   [0..8)    magic "KXDB0001"  (ASCII; a FILE LAYOUT tag, see A5 below)
@@ -68,53 +69,40 @@
  *
  *   WRITES
  *     incremental save -> save_batch(): one frame appended at the end of the last
- *                         complete frame, through ONE DeferredBinaryWriter commit
- *                         (open once, one positioned write, ONE sync, close).
- *     full save        -> rebuild(): header + one frame, through ONE truncating
- *                         BinaryFileWriter (two writes, one sync, close). This is
- *                         the only path that bounds the file, so it is also the
- *                         compaction remedy for an append-bloated store; it drops
- *                         records of earlier save rounds that LMDB would keep
- *                         (plan §5.4 item 1 — parity is asserted on the loaded
- *                         graph, not on the log).
+ *                         complete frame: one open (r+b), one positioned write,
+ *                         ONE sync, close.
+ *     full save        -> rebuild(): header + one frame, one open (wb), two
+ *                         positioned writes, one sync, close. This is the only
+ *                         path that bounds the file, so it is also the compaction
+ *                         remedy for an append-bloated store; it drops records of
+ *                         earlier save rounds that LMDB would keep (plan §5.4 item
+ *                         1 — parity is asserted on the loaded graph, not on the
+ *                         log).
  *   A seam batch carries no "full" flag (serialize.cpp writes both kinds through
  *   the same save_batch()), so Database::persist(full=true) asks for the rebuild
  *   explicitly: set_rebuild_next_batch(true) makes the NEXT save_batch() a full
  *   save. rebuild() itself is public, so a caller can ask for it directly.
  *
- *   2 GiB WALL (amendment A8)
- *   On Windows the vendored xnvme open path stats through a 32-bit stat: a file of
- *   2 GiB or more cannot be opened AT ALL, so it is unloadable, not merely
- *   unwritable. Both sides say so explicitly:
- *     write: if the PROJECTED size (_frames_end + frame) would reach 2 GiB, the
- *            save fails and NOTHING is appended — the store reports "full". The
- *            remedy is rebuild() (or a copy_to() checkpoint), not a bigger file.
- *            Note this is a real constraint: at ~700 B per vertex the segment
- *            holds ~3.05 M compact vertices, and every incremental save appends
- *            (report §3.4).
- *     read:  open() refuses a file that is already >= 2 GiB, so valid() is false
- *            and every operation is a no-op — the same observable state as a bad
- *            path today. Linux has no such limit; the guard is Windows-only.
- *
- *   RUNTIME DEGRADATION
- *   On a platform xnvme has no backend for in this build (macOS, FreeBSD, …) every
- *   xnvme open fails, so open() fails cleanly: valid() == false and every
- *   operation returns false without touching the disk. That is EXACTLY the
- *   contract of a closed ColdStorage, so serialize.cpp reports error_io and
- *   Database reports error_io / error_no_such_file with no extra code path.
+ *   FILE SIZE / HANDLES
+ *   Offsets are 64-bit (_fseeki64 / fseeko), so a store has no file-size wall: the
+ *   segment simply grows until the volume is full, and a failure there is an
+ *   ordinary write error. Every writer is synced and CLOSED before its call
+ *   returns, because Windows cannot delete a file (or its directory) while a handle
+ *   still holds it open.
  *
  *   PATHS (amendment A7)
  *   open()/path()/copy_to() speak DIRECTORIES, like ColdStorage: the store file is
  *   always <dir>\graph.xdb, so `path() == dir` and a copy_to() checkpoint is a
  *   directory that reopens as a store of its own. copy_to() closes its writer
- *   before returning — Windows cannot delete a file that xnvme still holds open.
+ *   before returning — Windows cannot delete a file an open handle still refers to.
  *
  * CONTRACT (identical to ColdStorage's, and to the seam's)
  *   Every operation reports what the backend reports: false is "not open / absent /
  *   failed", never an exception (the project is built without them). An empty scan
  *   result is NOT an error. accepted-but-ignored: open()'s map_size
- *   (GraphOptions::cold_map_size is an LMDB knob, A8) and any ColdStorage-only
- *   operation, which FileColdStore deliberately does not grow (see cold_store.h).
+ *   (GraphOptions::cold_map_size is an LMDB knob — this backend has no map) and any
+ *   ColdStorage-only operation, which FileColdStore deliberately does not grow (see
+ *   cold_store.h).
  *
  * Example:
  *   kimix::graph_db::FileColdStore store;
@@ -128,9 +116,6 @@
 
 #include "utils.h"
 
-#include <core/binary_file_stream_xnvme.h>
-#include <core/binary_file_writer.h>
-#include <core/deferred_binary_file_stream.h>
 #include <core/memory.h>
 #include <core/stl/filesystem.h>
 #include <core/stl/string.h>
@@ -184,13 +169,11 @@ public:
      * Returns false — leaving the store closed, with every operation a no-op that
      * reports false — for: an empty path, a directory that cannot be created, a
      * file whose magic/header_size/flags are not this layout, a file that is
-     * truncated inside its header, an xnvme open failure (no backend for this
-     * platform), and (Windows) a file that already reached the 2 GiB wall.
+     * truncated inside its header, and an I/O error while reading that header.
      *
      * `map_size` is accepted and IGNORED: it is ColdStorage's LMDB map size
-     * (GraphOptions::cold_map_size), and this backend's limit is the 2 GiB file
-     * wall instead (amendment A8). The parameter stays so the two backends have
-     * one open() signature.
+     * (GraphOptions::cold_map_size) and this backend has no map. The parameter stays
+     * so the two backends have one open() signature.
      */
     bool open(kimix::filesystem::path const &dir, size_t map_size = 0) noexcept;
     // Close the store and drop the resolved caches. Idempotent; nothing is written.
@@ -214,13 +197,12 @@ public:
     [[nodiscard]] bool
     load_all_records(kimix::vector<ColdRecord> &out) const noexcept;
 
-    // Append ONE frame holding the whole batch: one DeferredBinaryWriter commit,
-    // i.e. one open, one positioned write of the frame, ONE sync, one close. The
-    // command order is preserved (it is already key-sorted by the serializer, so a
-    // frame is deterministic — A6), and the keys must already be store spellings.
-    // Returns false — with nothing appended — when the store is closed, when a key
-    // is empty or absurdly long, when the write/sync fails, and (Windows) when the
-    // PROJECTED size would reach 2 GiB ("store full", A8).
+    // Append ONE frame holding the whole batch: one open, one positioned write of
+    // the frame, ONE sync, one close. The command order is preserved (it is already
+    // key-sorted by the serializer, so a frame is deterministic — A6), and the keys
+    // must already be store spellings. Returns false — with nothing appended — when
+    // the store is closed, when a key is empty or absurdly long, or when the
+    // write/sync fails.
     [[nodiscard]] bool
     save_batch(kimix::vector<kimix::LMDBWriteCommand> &&commands) const noexcept;
 
@@ -228,8 +210,8 @@ public:
     // the batch as ONE frame, one sync, close. Only valid when `commands` is a
     // COMPLETE snapshot of what the store must hold: an incremental (dirty-only)
     // batch written this way would drop everything else. Returns false without
-    // destroying the old file when the store is closed, when a key is invalid or
-    // (Windows) when the rebuilt file would reach 2 GiB.
+    // destroying the old file when the store is closed, when a key is invalid, or
+    // when the write/sync fails.
     [[nodiscard]] bool
     rebuild(kimix::vector<kimix::LMDBWriteCommand> &&commands) const noexcept;
 
@@ -264,8 +246,8 @@ private:
     // Drop every resolved cache (close(), and after a failed write).
     void _forget() const noexcept;
 
-    // The store directory, the file inside it and its narrow spelling (the xnvme
-    // classes take kimix::string, not a filesystem::path).
+    // The store directory, the file inside it and its narrow spelling (the private
+    // CRT helpers below take kimix::string, not a filesystem::path).
     kimix::filesystem::path _path;
     kimix::filesystem::path _file;
     kimix::string _file_name;

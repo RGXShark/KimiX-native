@@ -42,7 +42,7 @@ target("kimix-core")
     -- kimix-marl backs the header-only core/fiber.h (fiber scheduler, events,
     -- wait groups, parallel for): its objects are archived into this dll, so a
     -- consumer never pulls them directly -- it calls the exported core API.
-          add_deps("mimalloc", "kimix-xxhash", "kimix-yyjson", "kimix-pybind11", "kimix-marl", "kimix-pdqsort", "kimix-xnvme", "kimix-xnvme-shim")
+          add_deps("mimalloc", "kimix-xxhash", "kimix-yyjson", "kimix-pybind11", "kimix-marl", "kimix-pdqsort")
     kimix_set_pcxxheader("core/pch.h")
     _config_project({batch_size = 8, project_kind = "shared"})
     on_load(function(target)
@@ -105,52 +105,6 @@ target("kimix-core")
         target:add("syslinks", "Advapi32", {public = true})
         -- core/guid.cpp: Guid::remake() calls CoCreateGuid on Windows.
         target:add("syslinks", "Ole32", {public = true})
-        -- xnvme (and its shim) are MinGW-compiled archives linked into this
-        -- MSVC-built library, so the MSVC linker also has to satisfy the MinGW
-        -- C runtime those objects expect: winpthreads (pthread_*, used by
-        -- xnvme's cbi-async-thrpool backend and by xnvme's global lock),
-        -- libmingwex (the __mingw_* printf family), libgcc (__chkstk_ms),
-        -- libmsvcrt (fstat64i32 and winpthreads' __imp__setjmp) and UCRT's
-        -- legacy printf symbol. Both toolchains are UCRT-based, so this is a
-        -- static merge of small runtime objects into kimix-core.dll — not a
-        -- second CRT and not a second heap: mingw's malloc/free resolve to the
-        -- same UCRT heap MSVC's do.
-        --   * libmingw32.a is deliberately NOT linked: its tlssup.o defines
-        --     __dyn_tls_init / __dyn_tls_init_callback, which MSVC's MSVCRT.lib
-        --     also provides (LNK2005), and MSVC's own CRT startup already does
-        --     that job here.
-        --   * The archives are named explicitly (.a) instead of via add_links():
-        --     xmake's MSVC linker driver turns a link NAME into "<name>.lib",
-        --     and these exist in the MinGW tree only as .a.
-        --   * shflags, not ldflags: kimix-core is a shared target, and this is
-        --     the sh-family link step.
-        local mingw_root = get_config("mingw")
-        if mingw_root then
-            local mingw_lib = path.join(mingw_root, "x86_64-w64-mingw32/lib")
-            local libgcc = os.files(path.join(mingw_root, "lib/gcc/x86_64-w64-mingw32/*/libgcc.a"))
-            -- Fail loudly when the MinGW runtime archives are not where the link
-            -- step is about to look: otherwise the MSVC linker answers with a
-            -- wall of unresolved __mingw_*/pthread_* symbols that says nothing
-            -- about the missing toolchain.
-            for _, archive in ipairs({
-                path.join(mingw_lib, "libmingwex.a"),
-                path.join(mingw_lib, "libwinpthread.a")
-            }) do
-                if not os.isfile(archive) then
-                    raise("MinGW runtime archives not found under " .. mingw_root ..
-                        " (missing " .. archive .. ")" ..
-                        "; kimix-xnvme needs WinLibs/MSYS2 UCRT MinGW on PATH at configure time")
-                end
-            end
-            target:add("shflags",
-                       path.join(mingw_lib, "libmingwex.a"),
-                       path.join(mingw_lib, "libwinpthread.a"))
-            if libgcc and #libgcc > 0 then
-                target:add("shflags", libgcc[1])
-            end
-            target:add("shflags", path.join(mingw_lib, "libmsvcrt.a"),
-                       "legacy_stdio_definitions.lib")
-        end
             if is_mode("debug") then
                 target:add("syslinks", "Dbghelp")  -- for backtrace
             end
@@ -163,64 +117,6 @@ target("kimix-core")
         elseif target:is_plat("macosx") then
             target:add("defines", "KIMIX_PLATFORM_UNIX", "KIMIX_PLATFORM_APPLE", {public = true})
         end
-    end)
-target_end()
-
--- ============================================================================
--- xNVMe C-ABI shim (core/binary_file_stream_xnvme_shim.c)
---
--- xnvme's public headers are GCC-only and MSVC cannot parse them: libxnvme.h
--- pulls in libxnvme_spec.h (__attribute__((packed)), __packed__) and
--- libxnvme_util.h (clock_gettime(), CLOCK_MONOTONIC), which MSVC rejects with
--- C2065 / C2079 / C3861. That is why xnvme itself is built by MinGW here.
--- kimix::XnvmeBinaryFileStream, on the other hand, MUST be compiled by
--- kimix-core's own toolchain (MSVC on Windows), because MSVC-built modules
--- (kimix-llm, kimix-cli, runtime_py, kimix_api, the unit tests) consume its C++
--- member symbols; a MinGW-compiled definition would not be found by them.
---
--- So the two halves are split along the ABI that works across mingw-gcc and
--- MSVC on x86_64 — plain C: this target is compiled with the SAME toolchain as
--- xnvme and exposes the three xnvme entry points the stream needs
--- (open-readonly / byte-granular pread / close) as C functions taking only
--- pointers and 64-bit integers. No xnvme struct crosses the boundary, so
--- nothing about xnvme's layout — nor the 32-bit off_t of the Windows CRT, which
--- caps a single pread at 2 GiB — is re-declared by hand on the MSVC side: the
--- compiler checks all of it here, where the real headers are visible.
---
--- The shim links nothing itself; kimix-core links this archive together with
--- kimix-xnvme (see the add_deps on both targets), just like it already links
--- every other vendored third-party static library.
--- ============================================================================
-target("kimix-xnvme-shim")
-    set_kind("static")
-    add_rules("kimix_basic_settings")
-    add_rules("c++.build", "c.build")
-    add_files("core/binary_file_stream_xnvme_shim.c")
-    add_headerfiles("core/binary_file_stream_xnvme_shim.h")
-    -- The real xnvme headers arrive as the public includedir of kimix-xnvme,
-    -- together with the generated xnvme_config.h / xnvme_vcs.h directory.
-    add_deps("kimix-xnvme")
-    if is_plat("windows") then
-        -- Same toolchain as the vendored xnvme library (see above).
-        set_toolchains("mingw")
-        -- <libxnvme.h> includes <sys/uio.h>, which neither the MSVC CRT nor
-        -- MinGW-w64 ships; xnvme vendors the minimal iovec shim for exactly
-        -- this and adds the directory to its own MinGW build.
-        add_includedirs(path.join(os.scriptdir(), "ext/xnvme/toolbox/third-party/windows"))
-    end
-    on_load(function(target)
-        -- This translation unit includes <libxnvme.h>, whose headers read the
-        -- generated XNVME_*_ENABLED defines, so it is force-included exactly
-        -- like kimix-xnvme does it (the directory itself is inherited from
-        -- kimix-xnvme, where the autogen dir is PUBLIC). Gated by TOOLSET, not
-        -- platform: on Windows this target is MinGW-compiled and takes the
-        -- gcc/clang form.
-        target:add("cflags", "-include", "xnvme_config.h", {
-            tools = {"gcc", "clang"}
-        })
-        target:add("cflags", "/FIxnvme_config.h", {
-            tools = {"cl", "clang-cl"}
-        })
     end)
 target_end()
 

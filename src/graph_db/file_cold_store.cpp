@@ -3,21 +3,21 @@
  * file_cold_store.h for the layout, the contract and the limits).
  *
  * STRUCTURE
- *   open()        header validation (or creation) + the 2 GiB read wall; the frame
- *                 geometry and the meta record stay LAZY, because a store that is
- *                 only ever written never needs them.
+ *   open()        header validation (or creation); the frame geometry and the
+ *                 meta record stay LAZY, because a store that is only ever
+ *                 written never needs them.
  *   _ensure_geometry()  walks the 8-byte frame headers only — the cheapest way to
  *                 tell a complete segment from one with a torn tail, and the
  *                 append offset the next save needs.
- *   _scan()       the ONE record pass: windowed 1 MiB positioned preads (or a
- *                 single read_all() for a small store), framing validation,
- *                 last-wins dedupe and the "meta/root" capture.
- *   _write()      the ONE write path: append (DeferredBinaryWriter, one sync) or
- *                 rebuild (truncating BinaryFileWriter, one sync).
+ *   _scan()       the ONE record pass: windowed 1 MiB positioned reads, framing
+ *                 validation, last-wins dedupe and the "meta/root" capture.
+ *   _write()      the ONE write path: append (one positioned write, one sync) or
+ *                 rebuild (header + frame, one sync).
  *   copy_to()     a sequential chunked copy of the complete frames.
  *
- * Everything here is non-throwing and reports through bool; the caches are
- * `mutable` because the seam's operations are `const`, exactly like
+ * All I/O is plain positioned stdio (see FileReader / FileWriter below), one
+ * open per pass. Every call is non-throwing and reports through bool; the caches
+ * are `mutable` because the seam's operations are `const`, exactly like
  * ColdStorage::save_batch(), which mutates its LMDB environment through a const
  * method.
  */
@@ -29,28 +29,25 @@
 #include <core/stl/unordered_map.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <system_error>
+
+#if defined(KIMIX_PLATFORM_WINDOWS)
+#include <io.h> // _commit, _fileno
+#else
+#include <unistd.h> // fsync, fileno
+#endif
 
 namespace kimix::graph_db {
 
 namespace {
 
-// One positioned pread = 1 MiB. It is a multiple of kimix::pagesize() on every
-// supported host (4 KiB on Windows, <= 64 KiB elsewhere), so every chunk offset
-// this file computes is page-aligned and every chunk length is too.
+// One positioned read chunk = 1 MiB.
 constexpr uint64_t kChunkSize = 1024ull * 1024ull;
-// Chunks staged per deferred-batch commit. The staging buffers are CALLER-owned
-// and must stay valid and unmodified until commit() returns, so this window — not
-// the file size — bounds the staging memory of a scan or a copy (8 MiB).
+// Chunks staged per pass. This window — not the file size — bounds the staging
+// memory of a scan or a copy (8 MiB).
 constexpr size_t kWindowChunks = 8;
-// Up to this size the whole file is read with ONE xnvme read_all(); the windowed
-// 1 MiB machinery only pays off for the big stores it was built for.
-constexpr uint64_t kReadAllLimit = 4ull * 1024ull * 1024ull;
-// Windows: a file of 2 GiB or more cannot be opened through the vendored xnvme
-// open path (32-bit stat), so it is unloadable rather than merely unwritable
-// (cpp skill §11, amendment A8).
-constexpr uint64_t kMaxFileSize = 2147483648ull;
 // Framing sanity bounds. No writer produces a key longer than "meta/root" (9) or
 // an 18-byte guid key, so the bound only has to catch nonsense; a key_len of 0 or
 // one above this ends the frame as corrupt.
@@ -60,6 +57,109 @@ constexpr size_t kFrameHeaderSize = 8;
 // u32 LE key length + u64 LE value length around a record's bytes.
 constexpr size_t kKeyLengthSize = 4;
 constexpr size_t kValueLengthSize = 8;
+
+// ---------------------------------------------------------------------------
+// Private positioned file I/O (64-bit offsets, plain stdio)
+//
+// The cold store speaks the CRT directly. Offsets are 64-bit on purpose —
+// _fseeki64 / fseeko — so there is no 2 GiB file-size wall and the chunk offsets
+// stay exact. Neither helper throws and neither is exported: this is the store's
+// own transport, not a core abstraction.
+// ---------------------------------------------------------------------------
+
+int seek_to(FILE *f, uint64_t offset) noexcept {
+#if defined(KIMIX_PLATFORM_WINDOWS)
+    return _fseeki64(f, static_cast<__int64>(offset), SEEK_SET);
+#else
+    return ::fseeko(f, static_cast<off_t>(offset), SEEK_SET);
+#endif
+}
+
+class FileReader {
+public:
+    FileReader() noexcept = default;
+    ~FileReader() { close(); }
+    FileReader(FileReader const &) = delete;
+    FileReader &operator=(FileReader const &) = delete;
+
+    // fopen "rb"; a path that cannot be opened leaves the reader closed.
+    bool open(kimix::string const &path) noexcept {
+        close();
+        _f = std::fopen(path.c_str(), "rb");
+        return _f != nullptr;
+    }
+
+    // `size` bytes at `offset`; a short count only happens at EOF.
+    size_t read_at(uint64_t offset, void *dst, size_t size) const noexcept {
+        if (_f == nullptr || size == 0 || seek_to(_f, offset) != 0) {
+            return 0;
+        }
+        return std::fread(dst, 1, size, _f);
+    }
+
+    void close() noexcept {
+        if (_f != nullptr) {
+            std::fclose(_f);
+            _f = nullptr;
+        }
+    }
+
+private:
+    FILE *_f{nullptr};
+};
+
+class FileWriter {
+public:
+    FileWriter() noexcept = default;
+    ~FileWriter() { close(); }
+    FileWriter(FileWriter const &) = delete;
+    FileWriter &operator=(FileWriter const &) = delete;
+
+    // truncate=true creates/empties the file; truncate=false keeps its content so
+    // positioned writes overwrite or extend it.
+    bool open(kimix::string const &path, bool truncate) noexcept {
+        close();
+        _f = std::fopen(path.c_str(), truncate ? "wb" : "r+b");
+        if (_f == nullptr && !truncate) {
+            // "r+b" needs an existing file; a missing store file is created.
+            _f = std::fopen(path.c_str(), "wb");
+        }
+        return _f != nullptr;
+    }
+
+    // `size` bytes at `offset`; returns the count that landed (all-or-nothing in
+    // every caller below, which compares it against `size`).
+    size_t write_at(uint64_t offset, void const *src, size_t size) noexcept {
+        if (_f == nullptr || size == 0 || seek_to(_f, offset) != 0) {
+            return 0;
+        }
+        return std::fwrite(src, 1, size, _f);
+    }
+
+    // fflush then _commit/fsync: the bytes are on stable storage when this returns.
+    bool sync() noexcept {
+        if (_f == nullptr || std::fflush(_f) != 0) {
+            return false;
+        }
+#if defined(KIMIX_PLATFORM_WINDOWS)
+        return ::_commit(::_fileno(_f)) == 0;
+#else
+        return ::fsync(::fileno(_f)) == 0;
+#endif
+    }
+
+    // Deliberately does NOT sync: callers sync explicitly when they need durability
+    // (and Windows cannot delete the file while a writer still holds it open).
+    void close() noexcept {
+        if (_f != nullptr) {
+            std::fclose(_f);
+            _f = nullptr;
+        }
+    }
+
+private:
+    FILE *_f{nullptr};
+};
 
 [[nodiscard]] bool key_is(kimix::string_view expected, std::byte const *key,
                           size_t key_len) noexcept {
@@ -112,13 +212,13 @@ bool FileColdStore::_check_or_create_file() noexcept {
     if (!exists) {
         // Create the empty store: header + sync + close, so a reader that opens it
         // later finds a complete (empty) store instead of a zero-length file.
-        kimix::BinaryFileWriter writer{_file_name};
-        if (!writer) {
+        FileWriter writer;
+        if (!writer.open(_file_name, /*truncate=*/true)) {
             return false;
         }
         std::byte header[kHeaderSize];
         _encode_header(header);
-        bool const written = writer.write(header, kHeaderSize) == kHeaderSize;
+        bool const written = writer.write_at(0, header, kHeaderSize) == kHeaderSize;
         bool const synced = written && writer.sync();
         writer.close();
         return synced;
@@ -132,23 +232,16 @@ bool FileColdStore::_check_or_create_file() noexcept {
         }
         size = static_cast<uint64_t>(raw);
     }
-#if defined(KIMIX_PLATFORM_WINDOWS)
-    if (size >= kMaxFileSize) {
-        // Unloadable, not just unwritable: say so here rather than letting every
-        // read fail inside xnvme (A8).
-        return false;
-    }
-#endif
     if (size == 0) {
         // A zero-length file (an interrupted creation): stamp the header instead of
         // refusing the store.
-        kimix::BinaryFileWriter writer{_file_name, /*truncate=*/false};
-        if (!writer) {
+        FileWriter writer;
+        if (!writer.open(_file_name, /*truncate=*/false)) {
             return false;
         }
         std::byte header[kHeaderSize];
         _encode_header(header);
-        bool const written = writer.write(header, kHeaderSize) == kHeaderSize;
+        bool const written = writer.write_at(0, header, kHeaderSize) == kHeaderSize;
         bool const synced = written && writer.sync();
         writer.close();
         return synced;
@@ -156,12 +249,14 @@ bool FileColdStore::_check_or_create_file() noexcept {
     if (size < kHeaderSize) {
         return false; // truncated header: not a store this build can repair
     }
-    kimix::XnvmeBinaryFileStream stream{_file_name};
-    if (!stream) {
+    FileReader reader;
+    if (!reader.open(_file_name)) {
         return false;
     }
     std::byte header[kHeaderSize];
-    if (stream.read(header, kHeaderSize) != kHeaderSize) {
+    size_t const got = reader.read_at(0, header, kHeaderSize);
+    reader.close();
+    if (got != kHeaderSize) {
         return false;
     }
     if (!key_is(kFileMagic, header, kFileMagic.size())) {
@@ -180,8 +275,8 @@ bool FileColdStore::_check_or_create_file() noexcept {
 }
 
 bool FileColdStore::open(kimix::filesystem::path const &dir, size_t map_size) noexcept {
-    // Accepted and ignored: ColdStorage's LMDB map size (A8). This backend's limit
-    // is the 2 GiB file wall.
+    // Accepted and ignored: ColdStorage's LMDB map size — this backend has no map
+    // size of its own, the file simply grows with the graph.
     (void)map_size;
     close();
     if (dir.empty()) {
@@ -253,14 +348,13 @@ bool FileColdStore::_ensure_geometry() const noexcept {
     // file is a torn tail (amendment A2) — it and everything after it are ignored.
     uint64_t pos = _segment_start;
     if (pos < _file_size) {
-        kimix::XnvmeBinaryFileStream stream{_file_name};
-        if (!stream) {
+        FileReader reader;
+        if (!reader.open(_file_name)) {
             return false;
         }
         std::byte raw_len[kFrameHeaderSize];
         while (pos + kFrameHeaderSize <= _file_size) {
-            stream.set_pos(pos);
-            if (stream.read(raw_len, kFrameHeaderSize) != kFrameHeaderSize) {
+            if (reader.read_at(pos, raw_len, kFrameHeaderSize) != kFrameHeaderSize) {
                 break;
             }
             uint64_t const frame_len = detail::read_u64(raw_len);
@@ -269,6 +363,7 @@ bool FileColdStore::_ensure_geometry() const noexcept {
             }
             pos += kFrameHeaderSize + frame_len;
         }
+        reader.close();
     }
     _frames_end = pos;
     _geometry_known = true;
@@ -398,57 +493,50 @@ bool FileColdStore::_scan(kimix::vector<ColdRecord> *out) const noexcept {
     uint64_t const begin = _segment_start;
     uint64_t const end = _frames_end;
     if (end > begin) {
-        if (end - begin <= kReadAllLimit) {
-            // Small store: one pread of the whole file (read_all() always starts at
-            // offset 0, so the header is skipped after the fact).
-            kimix::XnvmeBinaryFileStream stream{_file_name};
-            if (!stream) {
-                return false;
-            }
-            kimix::vector<kimix::byte> whole = stream.read_all();
-            if (whole.size() < end) {
-                return false;
-            }
-            consume(reinterpret_cast<std::byte const *>(whole.data()) + begin,
-                    static_cast<size_t>(end - begin));
-        } else {
-            // Big store: 1 MiB positioned preads staged in 8 MiB windows, each
-            // window one DeferredBinaryFileStream commit. The staging buffers are
-            // caller-owned and outlive the commit (the deferred-read contract).
-            kimix::vector<kimix::vector<kimix::byte>> staging(kWindowChunks);
-            for (auto &buffer : staging) {
-                buffer.resize(kChunkSize);
-            }
-            // Chunks are 1 MiB-aligned, so the first one may start before the
-            // segment and carry a few header bytes that are skipped below.
-            uint64_t pos = begin - (begin % kChunkSize);
-            while (pos < end && !stopped) {
-                uint64_t const span = end - pos;
-                size_t const chunks = static_cast<size_t>(
-                    std::min<uint64_t>(static_cast<uint64_t>(kWindowChunks),
-                                       (span + kChunkSize - 1) / kChunkSize));
-                kimix::DeferredBinaryFileStream batch;
-                for (size_t i = 0; i < chunks; ++i) {
-                    uint64_t const offset = pos + static_cast<uint64_t>(i) * kChunkSize;
-                    uint64_t const bytes = std::min<uint64_t>(kChunkSize, end - offset);
-                    batch.add_read(_file_name, offset, static_cast<size_t>(bytes),
-                                   staging[i].data());
+        // 1 MiB positioned reads staged in 8 MiB windows, one reader open for the
+        // whole pass. Chunks are 1 MiB-aligned, so the first one may start before
+        // the segment and carry a few header bytes that are skipped below.
+        FileReader reader;
+        if (!reader.open(_file_name)) {
+            return false;
+        }
+        kimix::vector<kimix::vector<std::byte>> staging(kWindowChunks);
+        for (auto &buffer : staging) {
+            buffer.resize(kChunkSize);
+        }
+        bool read_ok = true;
+        uint64_t pos = begin - (begin % kChunkSize);
+        while (pos < end && !stopped) {
+            uint64_t const span = end - pos;
+            size_t const chunks = static_cast<size_t>(
+                std::min<uint64_t>(static_cast<uint64_t>(kWindowChunks),
+                                   (span + kChunkSize - 1) / kChunkSize));
+            for (size_t i = 0; i < chunks; ++i) {
+                uint64_t const offset = pos + static_cast<uint64_t>(i) * kChunkSize;
+                uint64_t const bytes = std::min<uint64_t>(kChunkSize, end - offset);
+                if (reader.read_at(offset, staging[i].data(), static_cast<size_t>(bytes)) !=
+                    bytes) {
+                    read_ok = false; // the store became unreadable mid-pass
+                    break;
                 }
-                if (batch.commit() != chunks) {
-                    return false; // the store became unreadable mid-pass
-                }
-                for (size_t i = 0; i < chunks && !stopped; ++i) {
-                    uint64_t const offset = pos + static_cast<uint64_t>(i) * kChunkSize;
-                    uint64_t const bytes = std::min<uint64_t>(kChunkSize, end - offset);
-                    size_t skip = 0;
-                    if (offset < begin) {
-                        skip = static_cast<size_t>(std::min<uint64_t>(begin - offset, bytes));
-                    }
-                    consume(reinterpret_cast<std::byte const *>(staging[i].data()) + skip,
-                            static_cast<size_t>(bytes) - skip);
-                }
-                pos += static_cast<uint64_t>(chunks) * kChunkSize;
             }
+            if (!read_ok) {
+                break;
+            }
+            for (size_t i = 0; i < chunks && !stopped; ++i) {
+                uint64_t const offset = pos + static_cast<uint64_t>(i) * kChunkSize;
+                uint64_t const bytes = std::min<uint64_t>(kChunkSize, end - offset);
+                size_t skip = 0;
+                if (offset < begin) {
+                    skip = static_cast<size_t>(std::min<uint64_t>(begin - offset, bytes));
+                }
+                consume(staging[i].data() + skip, static_cast<size_t>(bytes) - skip);
+            }
+            pos += static_cast<uint64_t>(chunks) * kChunkSize;
+        }
+        reader.close();
+        if (!read_ok) {
+            return false;
         }
     }
 
@@ -526,17 +614,6 @@ bool FileColdStore::_write(kimix::vector<kimix::LMDBWriteCommand> &&commands,
     kimix::vector<std::byte> batch_meta;
     bool const batch_has_meta = batch_meta_value(commands, batch_meta);
 
-#if defined(KIMIX_PLATFORM_WINDOWS)
-    // PROJECTED size, not the graph's size (A8): a rebuild replaces the segment, an
-    // append extends it. Nothing is written when the wall would be crossed — the
-    // store reports "full", and the remedy is a rebuild()/copy_to() compaction.
-    uint64_t const projected = (rebuild_requested ? _segment_start : _frames_end) +
-                               static_cast<uint64_t>(frame_bytes);
-    if (projected >= kMaxFileSize) {
-        return false;
-    }
-#endif
-
     kimix::vector<std::byte> frame(frame_bytes);
     detail::write_u64(frame.data(), static_cast<uint64_t>(payload));
     std::byte *cursor = frame.data() + kFrameHeaderSize;
@@ -556,14 +633,14 @@ bool FileColdStore::_write(kimix::vector<kimix::LMDBWriteCommand> &&commands,
     if (rebuild_requested) {
         // FULL save: header + one frame, truncating. Two writes, ONE sync, then the
         // handle is closed before returning (Windows cannot delete an open file).
-        kimix::BinaryFileWriter writer{_file_name};
-        if (!writer) {
+        FileWriter writer;
+        if (!writer.open(_file_name, /*truncate=*/true)) {
             return false;
         }
         std::byte header[kHeaderSize];
         _encode_header(header);
-        bool ok = writer.write(header, kHeaderSize) == kHeaderSize &&
-                  writer.write(frame.data(), frame.size()) == frame.size();
+        bool ok = writer.write_at(0, header, kHeaderSize) == kHeaderSize &&
+                  writer.write_at(kHeaderSize, frame.data(), frame.size()) == frame.size();
         if (ok) {
             ok = writer.sync();
         }
@@ -588,11 +665,19 @@ bool FileColdStore::_write(kimix::vector<kimix::LMDBWriteCommand> &&commands,
             }
             _file_size = _frames_end;
         }
-        kimix::DeferredBinaryWriter writer;
-        writer.add_write(_file_name, _frames_end, std::move(frame));
-        // ONE commit = one open, one positioned write, ONE sync(), one close. A
-        // partial commit counts as a failed save (never as success).
-        if (writer.commit() != 1) {
+        // ONE open, one positioned write at the end of the segment, ONE sync, close.
+        // A short write or a failed sync is a failed save (never a success).
+        FileWriter writer;
+        if (!writer.open(_file_name, /*truncate=*/false)) {
+            _forget();
+            return false;
+        }
+        bool ok = writer.write_at(_frames_end, frame.data(), frame.size()) == frame.size();
+        if (ok) {
+            ok = writer.sync();
+        }
+        writer.close();
+        if (!ok) {
             _forget();
             return false;
         }
@@ -659,15 +744,20 @@ bool FileColdStore::copy_to(kimix::filesystem::path const &target) const noexcep
         return false;
     }
     // Truncating writer: a checkpoint REPLACES a previous one in that directory.
-    kimix::BinaryFileWriter writer{destination_name};
-    if (!writer) {
+    FileWriter writer;
+    if (!writer.open(destination_name, /*truncate=*/true)) {
         return false;
     }
     bool ok = true;
     if (_frames_end > 0) {
-        // Sequential 1 MiB-chunk copy of the complete frames: one open/close of the
-        // source per 8 MiB window, one open of the target for the whole copy.
-        kimix::vector<kimix::vector<kimix::byte>> staging(kWindowChunks);
+        // Sequential 1 MiB-chunk copy of the complete frames: ONE reader open on the
+        // source, one writer open on the target, 8 MiB of staging.
+        FileReader reader;
+        if (!reader.open(_file_name)) {
+            writer.close();
+            return false;
+        }
+        kimix::vector<kimix::vector<std::byte>> staging(kWindowChunks);
         for (auto &buffer : staging) {
             buffer.resize(kChunkSize);
         }
@@ -677,30 +767,27 @@ bool FileColdStore::copy_to(kimix::filesystem::path const &target) const noexcep
             size_t const chunks = static_cast<size_t>(
                 std::min<uint64_t>(static_cast<uint64_t>(kWindowChunks),
                                    (span + kChunkSize - 1) / kChunkSize));
-            kimix::DeferredBinaryFileStream batch;
-            for (size_t i = 0; i < chunks; ++i) {
+            for (size_t i = 0; i < chunks && ok; ++i) {
                 uint64_t const offset = pos + static_cast<uint64_t>(i) * kChunkSize;
-                uint64_t const bytes = std::min<uint64_t>(kChunkSize, end - offset);
-                batch.add_read(_file_name, offset, static_cast<size_t>(bytes), staging[i].data());
-            }
-            if (batch.commit() != chunks) {
-                ok = false;
-                break;
+                size_t const bytes =
+                    static_cast<size_t>(std::min<uint64_t>(kChunkSize, end - offset));
+                ok = reader.read_at(offset, staging[i].data(), bytes) == bytes;
             }
             for (size_t i = 0; i < chunks && ok; ++i) {
                 uint64_t const offset = pos + static_cast<uint64_t>(i) * kChunkSize;
                 size_t const bytes =
                     static_cast<size_t>(std::min<uint64_t>(kChunkSize, end - offset));
-                ok = writer.write(staging[i].data(), bytes) == bytes;
+                ok = writer.write_at(offset, staging[i].data(), bytes) == bytes;
             }
             pos += static_cast<uint64_t>(chunks) * kChunkSize;
         }
+        reader.close();
     }
     if (ok) {
         ok = writer.sync();
     }
-    // CLOSE before returning: on Windows an xnvme writer without FILE_SHARE_DELETE
-    // keeps the target directory undeletable (A7).
+    // CLOSE before returning: on Windows an open handle keeps the target file — and
+    // its directory — undeletable.
     writer.close();
     return ok;
 }

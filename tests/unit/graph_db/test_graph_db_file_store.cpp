@@ -25,15 +25,11 @@
 //     * an immediate incremental save after a load writing nothing at all (the empty
 //       append batch leaves the store file byte-identical)
 // - THE FILE BACKEND'S OWN CONTRACT (file_cold_store.h):
-//     * the 2 GiB wall: an append whose PROJECTED size reaches the wall fails and
-//       appends nothing, rebuild() compacts instead, and a file already at the wall
-//       cannot be opened at all (valid() false, every operation false)
 //     * open-failure degradation: a directory where the store file belongs, an empty
 //       path, a foreign magic and a header truncated mid-way all leave the store
 //       closed with every operation reporting false
-//     * the deferred-read staging contract: a store read through the WINDOWED
-//       (1 MiB, caller-owned staging) path keeps every record intact across a later
-//       commit, and the staged bytes outlive commit()
+// * the windowed scan: a store past 4 MiB is read through the 1 MiB positioned
+// (8 MiB staging) path, and every record stays intact across a later save
 //     * determinism: two full saves of the same graph produce identical record
 //       segment bytes, and the on-disk layout is the documented
 //       magic/header/frames/records one (parsed from the bytes, not through the
@@ -68,8 +64,6 @@
 #include <graph_db/vertex.h>
 
 #include <core/binary_file_stream.h>
-#include <core/binary_file_writer.h>
-#include <core/deferred_binary_file_stream.h>
 #include <core/guid.h>
 #include <core/lmdb.h>
 #include <core/string_scratch.h>
@@ -184,11 +178,11 @@ kimix::vector<Vertex *> fixed_layered_dag(Graph &graph, size_t count) {
 // Backend fixture: one store per backend, side by side
 // ---------------------------------------------------------------------------
 
-enum class backend_kind : uint8_t { lmdb, xnvme_file };
+enum class backend_kind : uint8_t { lmdb, flat_file };
 
 [[nodiscard]] kimix::string_view backend_name(backend_kind kind) {
     return kind == backend_kind::lmdb ? kimix::string_view{"lmdb"}
-                                      : kimix::string_view{"xnvme_file"};
+                                      : kimix::string_view{"flat_file"};
 }
 
 // Both backends over their own directory, so a scenario can be written ONCE and run
@@ -222,7 +216,7 @@ public:
     [[nodiscard]] bool is_open() const noexcept { return _is_open; }
 
     [[nodiscard]] static backend_kind side(size_t index) noexcept {
-        return index == 0 ? backend_kind::lmdb : backend_kind::xnvme_file;
+        return index == 0 ? backend_kind::lmdb : backend_kind::flat_file;
     }
 
 private:
@@ -520,7 +514,7 @@ void fill_graph_snapshot(Graph const &graph, scenario_outcome &out) {
     kimix::StringScratch diff;
     auto note = [&diff](kimix::string_view field, size_t lhs, size_t rhs) {
         if (lhs != rhs) {
-            diff << field << ": lmdb=" << lhs << " xnvme_file=" << rhs << "; ";
+            diff << field << ": lmdb=" << lhs << " flat_file=" << rhs << "; ";
         }
     };
     note("saved_count", lmdb.saved_count, file.saved_count);
@@ -969,7 +963,7 @@ int main(int argc, char *argv[]) {
                 vertices[5]->mark_dirty();
             }
             expect(eq(serializer.save_incremental(graph).saved_count, size_t{1}));
-            if (kind == backend_kind::xnvme_file) {
+            if (kind == backend_kind::flat_file) {
                 file_layout const appended = read_store_file(store_file(stores.dir(kind)));
                 expect(appended.ok);
                 expect(eq(appended.frame_count, size_t{2}))
@@ -979,7 +973,7 @@ int main(int argc, char *argv[]) {
 
             // FULL SAVE. On the file backend the Phase-2 handoff arms the rebuild; a plain
             // save_batch() would append a second copy of every record instead.
-            if (kind == backend_kind::xnvme_file) {
+            if (kind == backend_kind::flat_file) {
                 stores.file().set_rebuild_next_batch(true);
             }
             GraphSerializeStats const full = serializer.save(graph);
@@ -988,7 +982,7 @@ int main(int argc, char *argv[]) {
             fill_store_snapshot(cold, outcomes[side]);
             expect(eq(outcomes[side].live_records, size_t{24}))
                 << "the rebuild drops the superseded records instead of keeping both";
-            if (kind == backend_kind::xnvme_file) {
+            if (kind == backend_kind::flat_file) {
                 file_layout const rebuilt = read_store_file(store_file(stores.dir(kind)));
                 expect(rebuilt.ok);
                 expect(eq(rebuilt.frame_count, size_t{1}))
@@ -1448,7 +1442,7 @@ int main(int argc, char *argv[]) {
             expect(eq(outcomes[side].skipped_edge_count, size_t{0}));
             expect(outcomes[side].adjacency == source_outcome.adjacency)
                 << "the checkpoint reproduces the whole graph, edges included";
-            if (kind == backend_kind::xnvme_file) {
+            if (kind == backend_kind::flat_file) {
                 // A byte-for-byte copy of the complete frames, closed before returning —
                 // so the checkpoint directory is immediately deletable on Windows.
                 auto const live = read_file_bytes(store_file(stores.dir(kind)));
@@ -1515,7 +1509,7 @@ int main(int argc, char *argv[]) {
             expect(eq(noop.skipped_count, size_t{0}));
             expect(same_records(record_bytes(cold), records_before))
                 << "an empty append batch leaves every stored byte alone";
-            if (kind == backend_kind::xnvme_file) {
+            if (kind == backend_kind::flat_file) {
                 expect(eq(file_bytes(file), size_before))
                     << "an empty append batch does not grow the store file";
                 expect(same_bytes(read_file_bytes(file), bytes_before))
@@ -1525,111 +1519,6 @@ int main(int argc, char *argv[]) {
         }
         kimix::string const diff = outcome_diff(outcomes[0], outcomes[1]);
         expect(diff.empty()) << "the two backends must agree byte for byte: " << diff;
-    };
-
-    "file_store_two_gib_wall"_test = [] {
-#if defined(KIMIX_PLATFORM_WINDOWS)
-        // Windows cannot open a 2 GiB file through the vendored xnvme path at all
-        // (cpp skill §11), so the backend guards both sides: an append whose PROJECTED
-        // size would reach the wall fails with nothing written, and a file already at the
-        // wall cannot be opened.
-        //
-        // The file is PRE-SIZED, not written: it gets the real header, one frame header
-        // declaring the rest of the file, and then its end of file is moved to just below
-        // the wall. The guard therefore sees a REAL file size and a REAL frame geometry
-        // (one complete frame), and the test stays fast — no payload byte is produced.
-        constexpr uint64_t wall = 2147483648ull; // 2 GiB
-        gtest::temp_dir_guard dir;
-        expect(dir.ok()) << "a temp directory must be creatable";
-        if (!dir.ok()) {
-            return;
-        }
-        kimix::filesystem::path const file = store_file(dir.path());
-        std::error_code ec;
-
-        // A real, header-only store first: open() then finds the exact bytes it validates.
-        {
-            FileColdStore store;
-            expect(store.open(dir.path()));
-            expect(store.valid());
-        }
-        expect(eq(file_bytes(file), static_cast<uintmax_t>(FileColdStore::kHeaderSize)))
-            << "a fresh store is the bare header";
-
-        // A length open() still accepts, with less headroom than the batch's frame needs:
-        // the guard must therefore trip on the PROJECTED size, not on the frame size.
-        uint64_t const target = wall - 60;
-        uint64_t const frame_len = target - FileColdStore::kHeaderSize - 8;
-        {
-            kimix::BinaryFileWriter writer{kimix::to_string(file), /*truncate=*/false};
-            expect(static_cast<bool>(writer)) << "the store file must be writable";
-            std::byte raw_len[8];
-            graph_db::detail::write_u64(raw_len, frame_len);
-            writer.set_pos(FileColdStore::kHeaderSize);
-            expect(eq(writer.write(raw_len, 8), size_t{8})) << "the frame header is written";
-            writer.close();
-            kimix::filesystem::resize_file(file, target, ec);
-            expect(!ec) << "the store file could not be extended";
-        }
-        expect(eq(file_bytes(file), target));
-
-        // Below the wall the store still opens ...
-        FileColdStore store;
-        expect(store.open(dir.path())) << "a store just below the wall still opens";
-        expect(store.valid());
-        if (!store.valid()) {
-            return;
-        }
-
-        // ... but an append that would cross it fails and appends NOTHING. The frame this
-        // batch needs is a handful of bytes, so the guard really is on the PROJECTED size.
-        kimix::Guid const guid = fixed_guid(41);
-        kimix::LMDBWriteCommand command;
-        graph_db::guid_key(guid, command.key);
-        graph_db::encode_vertex_record(gtest::make_record(guid, gtest::to_bytes("full"), {}, {}),
-                                       command.value);
-        kimix::vector<kimix::LMDBWriteCommand> batch;
-        batch.push_back(command);
-        expect(!store.save_batch(std::move(batch)))
-            << "an append whose projected size reaches 2 GiB reports 'store full'";
-        expect(eq(file_bytes(file), target)) << "a refused save appends nothing";
-
-        // The documented remedy is rebuild(): it REPLACES the segment, so the same
-        // (complete-snapshot) batch fits again and the store becomes usable.
-        kimix::vector<kimix::LMDBWriteCommand> snapshot;
-        snapshot.push_back(command);
-        expect(store.rebuild(std::move(snapshot)))
-            << "rebuild() compacts instead of growing into the wall";
-        expect(lt(file_bytes(file), static_cast<uintmax_t>(4096)))
-            << "the rebuilt file holds the header and one small frame";
-        kimix::vector<ColdRecord> records;
-        expect(store.load_all_records(records));
-        expect(eq(records.size(), size_t{1})) << "the rebuilt store holds the batch";
-        if (records.size() == 1) {
-            expect(!records.front().value.empty()) << "…and its record is not a tombstone";
-        }
-
-        // The READ wall: a file that already reached 2 GiB cannot be opened at all, so it
-        // is unloadable rather than merely unwritable.
-        store.close();
-        kimix::filesystem::resize_file(file, wall, ec);
-        expect(!ec);
-        FileColdStore refused;
-        expect(!refused.open(dir.path())) << "a store AT the wall cannot be opened at all";
-        expect(!refused.valid());
-        expect(refused.path().empty()) << "a failed open leaves no store behind";
-        MetaRecord meta;
-        expect(!refused.read_meta(meta));
-        kimix::vector<ColdRecord> none;
-        expect(!refused.load_all_records(none)) << "every operation reports false";
-        expect(!refused.save_batch(one_command(fixed_guid(42), gtest::to_bytes("x"))));
-        expect(!refused.rebuild(one_command(fixed_guid(43), gtest::to_bytes("x"))));
-        expect(!refused.copy_to(dir.path()));
-#else
-        // Linux has no such limit (cpp skill §11): the wall is a Windows-only guard, and
-        // this build does not exercise it.
-        expect(true) << "the 2 GiB wall is a Windows-only limit";
-#endif
     };
 
     "file_store_open_failure_degrades"_test = [] {
@@ -1670,15 +1559,20 @@ int main(int argc, char *argv[]) {
 
         // (3) a file whose magic is not this layout, and one truncated inside its header:
         // a store this build cannot read is never opened half-way.
+        // A main()-scope CRT writer: the store file is written by the test itself, so a
+        // failure is visible here instead of inside the code under test.
         auto const write_bytes = [](kimix::filesystem::path const &file,
                                     kimix::span<const std::byte> bytes) {
-            kimix::BinaryFileWriter writer{kimix::to_string(file)};
-            if (!writer) {
+            kimix::string const name = kimix::to_string(file);
+            std::FILE *stream = std::fopen(name.c_str(), "wb");
+            if (stream == nullptr) {
                 return false;
             }
-            bool const ok = writer.write(bytes.data(), bytes.size()) == bytes.size();
-            writer.close();
-            return ok;
+            size_t const written = bytes.empty()
+                                        ? size_t{0}
+                                        : std::fwrite(bytes.data(), 1, bytes.size(), stream);
+            std::fclose(stream);
+            return written == bytes.size();
         };
         std::byte foreign[FileColdStore::kHeaderSize]{};
         std::memcpy(foreign, "NOTKXDB1", 8);
@@ -1705,12 +1599,11 @@ int main(int argc, char *argv[]) {
             << "the blocking directory is still there, untouched";
     };
 
-    "file_store_deferred_read_staging_lifetime"_test = [] {
-        // Beyond kReadAllLimit (4 MiB) the scan reads the store through the WINDOWED path:
-        // 1 MiB positioned reads staged into CALLER-owned buffers that must stay valid
-        // until commit() returns (cpp skill §11). Six ~700 KiB records push the segment
-        // past that threshold, so this test really exercises it — and proves the records
-        // stay intact across a LATER commit (a second save).
+    "file_store_large_scan_window"_test = [] {
+        // A segment past 4 MiB is read through the WINDOWED path: 1 MiB positioned reads
+        // staged in 8 MiB of local buffers, one reader open for the whole pass. Six
+        // ~700 KiB records push the segment past that threshold, so this test really
+        // exercises it — and proves the records stay intact across a LATER save.
         gtest::temp_dir_guard dir;
         expect(dir.ok()) << "a temp directory must be creatable";
         if (!dir.ok()) {
@@ -1737,22 +1630,22 @@ int main(int argc, char *argv[]) {
         }
         expect(cold.save_batch(std::move(batch))) << "one frame holds the whole batch";
         expect(gt(file_bytes(file), static_cast<uintmax_t>(4ull * 1024ull * 1024ull)))
-            << "the store must be past the 4 MiB read_all() threshold";
+            << "the store must be past the 4 MiB chunking threshold";
 
         // The batch landed as ONE frame — the framing is the atomicity boundary (A2) —
-        // and the frame covers the whole segment. Read through the deferred API with a
-        // CALLER-owned staging buffer, the same call shape the windowed scan uses.
-        kimix::string const file_name = kimix::to_string(file);
-        kimix::vector<kimix::byte> header(28);
-        kimix::DeferredBinaryFileStream head_reads;
-        head_reads.add_read(file_name, 0, header.size(), header.data());
-        expect(eq(head_reads.pending_count(), size_t{1}));
-        expect(eq(head_reads.commit(), size_t{1})) << "the staged read completes";
-        expect(eq(head_reads.pending_count(), size_t{0})) << "commit clears the command list";
+        // and the frame covers the whole segment. The header is read with the plain
+        // read-only stream, independently of the scan under test.
+        kimix::BinaryFileStream reader{kimix::to_string(file)};
+        expect(static_cast<bool>(reader)) << "the store file must be readable";
+        if (!reader) {
+            return;
+        }
+        kimix::byte header[28];
+        expect(eq(reader.read(header, sizeof header), sizeof header));
         expect(header[0] == 'K' && header[1] == 'X' && header[2] == 'D' && header[3] == 'B')
-            << "the staged bytes are the store's magic";
+            << "the store file starts with the format magic";
         uint64_t const frame_len =
-            graph_db::detail::read_u64(reinterpret_cast<std::byte const *>(header.data() + 20));
+            graph_db::detail::read_u64(reinterpret_cast<std::byte const *>(header + 20));
         expect(eq(frame_len, static_cast<uint64_t>(file_bytes(file)) - 28))
             << "one frame spans the whole batch";
         file_layout const layout = read_store_file(file);
@@ -1762,11 +1655,11 @@ int main(int argc, char *argv[]) {
         expect(eq(layout.torn_tail_bytes, uint64_t{0})) << "no torn tail";
 
         kimix::vector<ColdRecord> first;
-        expect(cold.load_all_records(first)) << "the windowed (deferred) scan succeeds";
+        expect(cold.load_all_records(first)) << "the windowed scan succeeds";
         expect(eq(first.size(), size_t{6}));
 
-        // A save in between: the append path commits its own positioned write, so the
-        // staging buffers of the load above are long gone by the next scan.
+        // A save in between: the append path writes its own frame at the end of the
+        // segment, so the staging of the scan above is long gone by the next scan.
         expect(cold.save_batch(one_command(fixed_guid(200), gtest::to_bytes("late"))));
 
         kimix::vector<ColdRecord> second;
@@ -1776,7 +1669,7 @@ int main(int argc, char *argv[]) {
         file_layout const appended = read_store_file(file);
         expect(eq(appended.frame_count, size_t{2})) << "an append adds a frame";
         expect(eq(appended.torn_tail_bytes, uint64_t{0}));
-        // Every record loaded BEFORE the commit is intact and byte-identical.
+        // Every record loaded BEFORE the append is intact and byte-identical.
         size_t matched = 0;
         for (auto const &before : first) {
             auto const found =
@@ -1788,7 +1681,7 @@ int main(int argc, char *argv[]) {
                 continue;
             }
             expect(same_bytes(found->value, before.value))
-                << "a record survives a later commit intact";
+                << "a record survives a later save intact";
             ++matched;
         }
         expect(eq(matched, size_t{6}));
@@ -1926,7 +1819,7 @@ int main(int argc, char *argv[]) {
             graph_db::GraphOptions options;
             options.store_backend = kind == backend_kind::lmdb
                                         ? graph_db::ColdStoreBackend::lmdb
-                                        : graph_db::ColdStoreBackend::xnvme_file;
+                                        : graph_db::ColdStoreBackend::flat_file;
             graph_db::LabelId node{};
             kimix::vector<kimix::string> const keys{"one", "two", "three"};
             {
@@ -2003,10 +1896,10 @@ int main(int argc, char *argv[]) {
             return;
         }
         db_outcome const lmdb = run(backend_kind::lmdb, lmdb_dir.path());
-        db_outcome const file = run(backend_kind::xnvme_file, file_dir.path());
+        db_outcome const file = run(backend_kind::flat_file, file_dir.path());
 
         expect(eq(lmdb.vertices, size_t{3})) << "the lmdb backend holds three vertices";
-        expect(eq(file.vertices, size_t{3})) << "the xnvme_file backend holds three vertices";
+        expect(eq(file.vertices, size_t{3})) << "the flat_file backend holds three vertices";
         expect(eq(lmdb.persist_saved, size_t{3})) << "a full save writes every vertex";
         expect(eq(file.persist_saved, size_t{3}));
         expect(eq(lmdb.format_version, graph_db::kFormatVersion));
@@ -2020,6 +1913,6 @@ int main(int argc, char *argv[]) {
         expect(eq(lmdb.clean_saved, size_t{0})) << "a clean reopen writes nothing";
         expect(eq(file.clean_saved, size_t{0}));
         expect(!lmdb.graph_file) << "the lmdb backend knows no graph.xdb";
-        expect(file.graph_file) << "the xnvme_file backend writes graph.xdb";
+        expect(file.graph_file) << "the flat_file backend writes graph.xdb";
     };
 }

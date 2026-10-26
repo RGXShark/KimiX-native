@@ -27,9 +27,9 @@
  *                             it yields error_size_limit with the transaction
  *                             still abortable.
  *   cold_map_size             LMDB map size handed to ColdStorage::open
- *                             (accepted and ignored by the xnvme_file backend).
+ *                             (accepted and ignored by the flat_file backend).
  *   store_backend             which cold-storage backend open() builds: lmdb
- *                             (the default, unchanged behavior) or xnvme_file
+ *                             (the default, unchanged behavior) or flat_file
  *                             (the append-only flat file of
  *                             file_cold_store.h). C++-only: the C ABI has no
  *                             field for it, so its default keeps ABI behavior
@@ -82,9 +82,9 @@ namespace kimix::graph_db {
       // the historical default, 64 GiB map, per-transaction write-through pages.
       lmdb = 0,
       // The append-only <dir>\graph.xdb of file_cold_store.h: one sync() per save
-      // batch, one positioned sequential read pass, and a 2 GiB file wall on
-      // Windows. Opt-in; see that header for the format and the limits.
-      xnvme_file = 1,
+      // batch, one positioned sequential read pass. Opt-in; see that header for the
+      // format and the limits.
+      flat_file = 1,
   };
   struct KIMIX_GRAPH_DB_API GraphOptions {
       bool auto_create_schema{true};
@@ -95,11 +95,10 @@ namespace kimix::graph_db {
         // 64 MiB of undo journal per transaction (see max_journal_bytes).
     size_t max_journal_bytes{64ull * 1024ull * 1024ull};
     // ColdStorage::default_map_size (64 GiB); 0 means "keep the storage default".
-    // LMDB only: the xnvme_file backend accepts and ignores it (its limit is the
-    // 2 GiB file wall, see file_cold_store.h).
+    // LMDB only: the flat_file backend accepts and ignores it (it has no map).
     size_t cold_map_size{0};
     // Which cold-store backend Database::open builds. lmdb keeps every existing
-    // behavior byte for byte; xnvme_file swaps in the flat-file backend.
+    // behavior byte for byte; flat_file swaps in the flat-file backend.
     ColdStoreBackend store_backend{ColdStoreBackend::lmdb};
     bool persist_on_commit{false};
     kimix::string graph_name;

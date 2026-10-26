@@ -19,6 +19,3 @@
 [submodule "src/ext/lua"]
 	path = src/ext/lua
 	url = https://github.com/Sikao-Engine/lua.git
-[submodule "src/ext/xnvme"]
-	path = src/ext/xnvme
-	url = https://github.com/xnvme/xnvme
