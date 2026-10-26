@@ -176,7 +176,7 @@ public:
     [[nodiscard]] Graph const &graph() const noexcept { return _graph; }
     [[nodiscard]] Schema &schema() noexcept { return _schema; }
     [[nodiscard]] Schema const &schema() const noexcept { return _schema; }
-    // The LMDB backend instance — CLOSED (and unused) while the xnvme_file
+    // The LMDB backend instance — CLOSED (and unused) while the flat_file
     // backend is the live one. Kept as the typed escape hatch for the LMDB
     // store; a caller that needs the file store asks for its backend through
     // GraphOptions instead.

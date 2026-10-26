@@ -13,7 +13,7 @@
  *     ColdStorage   the LMDB environment of utils.h — the default, selected by
  *                   GraphOptions::store_backend == ColdStoreBackend::lmdb.
  *     FileColdStore the append-only <dir>\graph.xdb of file_cold_store.h —
- *                   selected by ColdStoreBackend::xnvme_file.
+ *                   selected by ColdStoreBackend::flat_file.
  *
  *   The two backends are the alternatives of ONE kimix::variant of POINTERS, so
  *   the handle is
@@ -50,8 +50,7 @@
  *   store therefore still reports false from valid() and from every operation,
  *   which is what keeps "the store is not open" one single code path
  *   (serialize.cpp reports error_io / empty stats) instead of two — including the
- *   FileColdStore whose open() failed because xnvme is unavailable on this
- *   platform or because its file reached the 2 GiB wall.
+ *   FileColdStore whose open() failed because its file could not be read.
  *
  *   save_batch() is the seam's only write: it means "append this batch to the
  *   store", i.e. the incremental-save semantics. The FileColdStore's truncating

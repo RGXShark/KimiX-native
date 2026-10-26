@@ -46,12 +46,6 @@
  *                        KIMIX_FFI names); the session is the only allocated
  *                        object, released by kimix_graphdb_close
  *                                                      -> ffi_graphdb.cpp
- *   <api/ffi_read_write.h> binary file read/write: kimix::BinaryFileStream and
- *                        kimix::BinaryFileWriter behind opaque handles, plus the
- *                        deferred context that records reads/writes/copies, owns
- *                        every temporary buffer they need and releases it when
- *                        the commit has written to disk
- *                                                   -> ffi_read_write.cpp
  *
  * Rules that apply to the whole surface (see the file headers for the details):
  *   - One heap.  Anything the library allocates is mimalloc memory owned by
@@ -88,6 +82,5 @@
 #include <api/ffi_sqlite.h>
 #include <api/ffi_yyjson.h>
 #include <api/ffi_graphdb.h>
-#include <api/ffi_read_write.h>
 
 #endif /* KIMIX_API_KIMIX_API_H */
