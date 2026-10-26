@@ -257,6 +257,7 @@ scripts/            # dev tools (check_*_syntax, debugger, pull_latest, ... see 
 src/ # C++ sources
   core/ # kimix-core static lib (namespace kimix)
   api/ # kimix_api shared lib: the plain-C FFI surface -> bin/<mode>/kimix_api.dll
+  script/ # kimix-script static lib: the Lua script sandbox (vetted env, budgets, DENIED)
   runtime/ # runtime kernels + pybind11 bindings -> runtime_py.pyd
   ext/ # vendored deps (mimalloc, xxhash, yyjson, pybind11, reproc, marl, mbedtls, sqlite_amalgamation)
   test/ # kimix-test binary (add_tests "basic")
@@ -270,7 +271,7 @@ python/             # Python layer
 
 # Testing
 
-- **C++ tests** — Boost.UT executables under `tests/unit/<area>/` (13 areas: core, api, ext, llm, openai, openai_responses, anthropic, kimi, native, tools, builtin_tools, cli, agent), each registered via `test_proj(name, source, callable)` (or `builtin_tools_test(name, source)`) in `tests/xmake.lua`. Keep test logic in `main()` scope, never file-scope static lambdas (see test skill). The Boost.UT name filter accepts an **exact name / `?` wildcard only** — `"add*"` skips everything and still exits 0.
+- **C++ tests** — Boost.UT executables under `tests/unit/<area>/` (14 areas: core, api, ext, llm, openai, openai_responses, anthropic, kimi, native, tools, builtin_tools, cli, agent, script), each registered via `test_proj(name, source, callable)` (or `builtin_tools_test(name, source)`) in `tests/xmake.lua`. Keep test logic in `main()` scope, never file-scope static lambdas (see test skill). The Boost.UT name filter accepts an **exact name / `?` wildcard only** — `"add*"` skips everything and still exits 0.
   ```bash
   python bootstrap.py --test # build + run the kimix-test smoke binary (NOT the suites)
   xmake f -m debug -c -y && xmake build
@@ -335,6 +336,7 @@ Use this index to find the files for a feature change. Layout: **feature → pri
 | Core utilities (strings, memory, STL, json) | `src/core/` (umbrella `kimix_core.h`, STL aliases in `core/stl/`) |
 | Runtime kernels exposed to Python | `src/runtime/<area>/` + pybind layer `src/runtime/py/` |
 | The C FFI surface (foreign-language callers) | `src/api/` (one `ffi_<area>.h/.cpp` pair per area) + `docs/ffi.md` |
+| What a script may do (sandbox capabilities, tripwires, budgets) | `src/script/script_env.cpp` (allow/replace/deny), `script_alloc.cpp` + `script_hook.cpp` (budgets), `script_sticky.cpp` (abort semantics) + `src/script/README.md` |
 | Python-side shim / parity fallback | `python/kimix_native/` |
 | Build wiring of any of the above | `src/xmake.lua` (targets), `tests/xmake.lua` (test targets) |
 
@@ -360,6 +362,15 @@ Base library everything links; deps on `mimalloc`, `xxhash`, `yyjson`, `pybind11
 - One heap: everything the FFI allocates is mimalloc memory *inside this DLL* and must be released by the matching `kimix_mem_free` / `kimix_vec_destroy` / `kimix_vec_free` / `kimix_yyjson_str_free` / `*_doc_free`.
 - Tests: `tests/unit/api/test_kimix_api.cpp` (includes only the C headers). Gated by `kimix_enable_api`, see *File-level skip* under Version, Build & Publish.
 
+
+## `src/script/` — the Lua script sandbox (target `kimix-script`, namespace `kimix::script`)
+One throw-away, budgeted `lua_State` per run; the environment holds only base (minus file/process/bytecode), `string`, `table`, `math`, `utf8`. **Read `src/script/README.md` first** — five layers, capability matrix, message format, the longjmp rule for writing natives. Depends on `kimix-core` and the vendored `lua` target (the one third-party dep a module declares directly, like `src/api`'s `kimix-sqlite3`).
+- `script_sandbox.h` — public surface: `Sandbox` (`run`/`add_native`/`allow_coroutines`/`cancel`/`busy`), `Limits`, `Result`, `Value`. `script_status.h` — `Status`, the message prefixes, `Violation`. `script_value.h` — the only value that crosses the boundary (no pointers; tables become canonical JSON).
+- `script_state.*` — `SandboxState` + state lifetime (fixed seed, `lua_atpanic`, `lua_setwarnf`, extraspace) and the panic/warning handlers. `script_alloc.*` — the budgeted `lua_Alloc` (memory cap, single-allocation cap, sticky OOM). `script_hook.cpp` — the count hook (deadline, instruction budget, cancel).
+- `script_env.*` — `_ENV`: allow list, replacements (`load`, `pcall`/`xpcall`, `print`/`warn`, `tostring`, `collectgarbage`, `string.format`, `coroutine.resume`/`close`), the loud tripwires (`io`, `os`, `package`, `debug`, `require`, `dofile`, `loadfile`, `loadlib`, `string.dump`), the redaction converter and the env integrity post-check. `script_error.*` — the one message format + the raise helpers. `script_sticky.cpp` — first-violation-wins and the re-raise every catcher performs. `script_run.cpp` — THE single `lua_pcallk` boundary, the message handler, the run flow. `script_lua.h` — the module's only Lua include (`extern "C"`).
+- Rules: every `lua_CFunction` is POD-only and raises at the end; scratch buffers live in `SandboxState`; no `lua_State*` escapes the module; `scripts/check_lua_sandbox.py` fails the tree on an `luaL_openlibs`, an `luaL_newstate`, a raw `lua_newstate` or a `luaopen_io|os|debug|package|loadlib` outside `src/script/`, `src/ext/` and `tests/unit/ext/test_lua.cpp`.
+- C ABI: `<api/ffi_lua.h>` (`kimix_lua_*`) in `kimix_api`, documented in `docs/ffi.md`.
+- Tests: `tests/unit/script/test_script_sandbox.cpp`, `test_script_hostile.cpp` (17 forbidden APIs x 7 wrappers), `test_script_surface.cpp` (golden capability allowlist), `test_script_bench.cpp` (`KIMIX_SCRIPT_BENCH=1`).
 
 ## `src/llm/` — LLM providers (namespace `kimix::llm`)
 - `llm.*` — unified facade; `config.type` picks provider (`openai`|`openai_legacy` → `openai/`, `openai_responses` → `openai_responses/`, `anthropic` → `anthropic/`). Unified `ToolCall`/`Tool`/`Message` types live here.
@@ -415,7 +426,7 @@ Pure kernels + pybind11 bindings. **Ownership split (see `src/xmake.lua`):** `sh
 Loads `runtime_py.pyd` lazily; env toggles `KIMIX_NATIVE` / `KIMIX_NATIVE_<KERNEL>` (`__init__.py::use_native`). One module per kernel area mirroring the C++ kernels: `text.py`, `codec.py`, `diff.py`, `glob.py`, `index.py`, `parse.py`, `search.py`, `stream.py`, `tools.py`. Compat shims: `_parse_compat.py`, `_shell_compat.py` (the pure-Python reference behind the runtime BASH_FIX scanner in `src/runtime/parse/shell_scanner.cpp`). Changing a kernel = change C++ kernel **and** this fallback, keeping bit-identical behavior (parity tests: `python/tests/test_parity_*.py`, `python/tests/_parity_ref.py`).
 
 ## Tests map
-- C++ (Boost.UT, vendored `tests/ut/ut.hpp`): `tests/unit/{core,api,ext,llm,openai,openai_responses,anthropic,native,tools,builtin_tools,cli,agent}/test_*.cpp`; registered via `test_proj(...)` in `tests/xmake.lua` (`test_kimix_api` additionally behind `has_config("kimix_enable_api")`). `tests/unit/native/{bench_util,soul_test_util}.h` shared helpers.
+- C++ (Boost.UT, vendored `tests/ut/ut.hpp`): `tests/unit/{core,api,ext,llm,openai,openai_responses,anthropic,native,tools,builtin_tools,cli,agent,script}/test_*.cpp`; registered via `test_proj(...)` in `tests/xmake.lua` (`test_kimix_api` additionally behind `has_config("kimix_enable_api")`). `tests/unit/native/{bench_util,soul_test_util}.h` shared helpers.
 - Python (pytest): `python/tests/` — kernels (`test_<kernel>.py`), parity (`test_parity_*.py`), tools (`test_tools.py`, `test_builtin_tools.py`); `conftest.py` puts `bin/<mode>` + `python/` on sys.path.
 - Workspace parity: `tests/verify_workspace_parity.py`.
 

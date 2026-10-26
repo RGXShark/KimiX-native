@@ -115,6 +115,25 @@ test_proj("test_xxhash", "unit/ext/test_xxhash.cpp")
 test_proj("test_lua", "unit/ext/test_lua.cpp", function()
     add_deps("lua")
 end)
+
+-- unit/script (kimix-script): the Lua script sandbox (src/script).
+--   test_script_sandbox -- lifecycle, isolation, budgets, marshalling
+--   test_script_hostile -- the abort contract: 17 forbidden APIs x 7 wrappers
+--   test_script_surface -- golden capability allowlist (fails on any new global)
+test_proj("test_script_sandbox", "unit/script/test_script_sandbox.cpp", function()
+    add_deps("kimix-script")
+end)
+test_proj("test_script_hostile", "unit/script/test_script_hostile.cpp", function()
+    add_deps("kimix-script")
+end)
+test_proj("test_script_surface", "unit/script/test_script_surface.cpp", function()
+    add_deps("kimix-script")
+end)
+-- Env-gated sandbox benchmark (runs nothing unless KIMIX_SCRIPT_BENCH=1): fresh vs
+-- reused state, count-hook granularity, marshalling cost, the denial path.
+test_proj("test_script_bench", "unit/script/test_script_bench.cpp", function()
+    add_deps("kimix-script")
+end)
 test_proj("test_pybind11", "unit/ext/test_pybind11.cpp")
 test_proj("test_mbedtls", "unit/ext/test_mbedtls.cpp", function()
     add_deps("kimix-llm", "kimix-mbedtls")

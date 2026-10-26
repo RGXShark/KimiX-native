@@ -3,7 +3,7 @@
 `kimix_api` is a shared library (`src/api`) that puts a **plain C ABI** on top of
 `kimix-core`, so a caller in C, C#, Zig, Rust, Python (ctypes/cffi), Julia,
 Node `ffi-napi` or any other FFI host can use the kimix base facilities without
-C++ or pybind11 in the picture. It exports nine feature areas plus a small common
+C++ or pybind11 in the picture. It exports ten feature areas plus a small common
 header: the version/ABI/status/layout queries of
 `kimix_api_*` / `kimix_status_name`, the mimalloc allocator vocabulary
 (`kimix_mem_*`), the byte-buffer container `kimix::vector<std::byte>` as an inline
@@ -14,8 +14,10 @@ worker pool (`kimix_fiber_*`), the yyjson JSON read/build/write surface with
 the mimalloc allocator baked in (`kimix_yyjson_*`), `kimix::repair()` for
 malformed LLM tool-call JSON (`kimix_repair*` / `kimix_json_*`), deterministic
 canonical JSON (`kimix_canonical_json*`), the SQLite3 database C API re-exported
-over the vendored amalgamation (`kimix_sqlite_*`), and the kimix-graph-db graph
-database C ABI re-exported from `src/graph_db/graph_c_api.h` (`kimix_graphdb_*`).
+over the vendored amalgamation (`kimix_sqlite_*`), the kimix-graph-db graph
+database C ABI re-exported from `src/graph_db/graph_c_api.h` (`kimix_graphdb_*`),
+and the Lua script sandbox (`kimix_lua_*`) -- a bounded, capability-restricted
+Lua interpreter that aborts a run on any denied side effect.
 Every entry point
 is declared in a pure-C header under `src/api`; this document is the searchable
 index of all of them.
@@ -28,8 +30,8 @@ index of all of them.
 | Build command | `xmake build kimix_api` (or `python bootstrap.py`) |
 | Output | `bin/<mode>/kimix_api.dll` + `kimix_api.lib` on Windows, `bin/<mode>/libkimix_api.so` on Linux (`<mode>` = `debug` / `release`) |
 | Umbrella header | `#include <api/kimix_api.h>` — include dir is `src/` |
-| Area headers | `<api/ffi_common.h>`, `<api/ffi_mem.h>`, `<api/ffi_vec.h>`, `<api/ffi_map.h>`, `<api/ffi_parallel.h>`, `<api/ffi_yyjson.h>`, `<api/ffi_repair.h>`, `<api/ffi_canonical.h>`, `<api/ffi_sqlite.h>`, `<api/ffi_graphdb.h>` |
-| Dependencies | `kimix-core` carries mimalloc / yyjson / marl (compiled **into** this image); `kimix-sqlite3` and `kimix-graph-db` are declared on this target directly, the same way `kimix-llm` declares its extra third-party deps |
+| Area headers | `<api/ffi_common.h>`, `<api/ffi_mem.h>`, `<api/ffi_vec.h>`, `<api/ffi_map.h>`, `<api/ffi_parallel.h>`, `<api/ffi_yyjson.h>`, `<api/ffi_repair.h>`, `<api/ffi_canonical.h>`, `<api/ffi_sqlite.h>`, `<api/ffi_graphdb.h>`, `<api/ffi_lua.h>` |
+| Dependencies | `kimix-core` carries mimalloc / yyjson / marl (compiled **into** this image); `kimix-sqlite3`, `kimix-graph-db` and `kimix-script` (which in turn links the vendored `lua` shared library) are declared on this target directly, the same way `kimix-llm` declares its extra third-party deps |
 
 The headers are valid for a **C99/C11 compiler and for C++17 or newer**: opaque
 pointer typedefs, fixed-size POD structs, `size_t`, `<stdint.h>` scalars, `bool`
@@ -2678,6 +2680,164 @@ N edge creates, the same shape without a per-row warning (a duplicate edge is no
 
 ---
 
+## Lua script sandbox — `<api/ffi_lua.h>` (`kimix_lua_*`)
+
+The sandbox runs ONE Lua chunk per call in a throw-away, budgeted `lua_State`
+whose environment contains only a vetted subset of the standard library (base
+minus the file/process/bytecode entry points, plus `string`, `table`, `math`,
+`utf8`). A script cannot read or write a file, spawn a process, load a module,
+reach debug introspection, obtain an address, exit the process, read the
+environment, or allocate/run without a bound. An attempt is a **loud denial that
+aborts the run**: `status == KIMIX_LUA_DENIED` and a message of the fixed shape
+
+```
+script.lua:7: DENIED: io.open — file I/O is not available in the sandbox
+```
+
+even when the script wrapped the call in its own `pcall` / `xpcall` /
+`coroutine.resume`. The model behind that guarantee (five defence layers, the
+capability matrix, the message prefixes, the residual risks and the rules for
+extending the environment) is `src/script/README.md`; the C++ twin of everything
+below is `<script/script_sandbox.h>`.
+
+Two properties a caller should rely on:
+
+- **Nothing reaches the process streams.** `print()`/`warn()` are captured into
+  the run's output (`kimix_lua_last_output`), and Lua warnings (including an error
+  inside a `__gc` finalizer) are captured too.
+- **A run is reproducible.** The state is created with a fixed seed and
+  `math.randomseed` is pinned, so `pairs` order and `math.random` are stable, and
+  with `fresh_state_per_run = 1` (the default) no global written by one run is
+  visible to the next.
+
+**Status vocabulary.** `kimix_lua_run` returns the house `kimix_status` for the
+*call* and reports the *chunk's* outcome in `result->status`:
+
+| `kimix_lua_status_code` | Meaning |
+|---|---|
+| `KIMIX_LUA_OK` (0) | the chunk ran; `value_count` return values are available |
+| `KIMIX_LUA_SYNTAX` | the chunk did not compile (Lua's own line-numbered message) |
+| `KIMIX_LUA_RUNTIME` | an ordinary Lua error (`nil` index, bad argument, `error()`) |
+| `KIMIX_LUA_DENIED` | a tripwire: a forbidden capability was called |
+| `KIMIX_LUA_MEMORY` | the memory budget was exhausted |
+| `KIMIX_LUA_TIMEOUT` | the wall-clock deadline or the instruction budget was exhausted |
+| `KIMIX_LUA_BEHAVIOUR` | the script replaced a sandbox primitive (`pcall`, `string.format`, a tripwire…) |
+| `KIMIX_LUA_CANCELLED` | `kimix_lua_cancel` was called during the run |
+| `KIMIX_LUA_LIMIT` | a source / output / result cap was exceeded |
+| `KIMIX_LUA_INTERNAL` | host misuse (a concurrent run) or a Lua panic — never a script error |
+
+`KIMIX_LUA_OK` is 0, so `if (res.status) { /* the run failed */ }`. Every non-OK
+code carries a non-empty message.
+
+**Ownership and threading.** The only object this area allocates is the handle
+from `kimix_lua_sandbox_create`, released by exactly one
+`kimix_lua_sandbox_destroy`; every other answer is copied into caller storage, so
+no pointer is ever handed back. A handle is **not** thread-safe (one Lua state per
+run): a concurrent `kimix_lua_run` answers `KIMIX_LUA_INTERNAL`, and
+`kimix_lua_cancel` is the only call another thread may make. One handle per worker
+thread is the intended deployment.
+
+**Two-phase buffers.** Every variable-length answer (message, output, traceback,
+the violation strings, a string/JSON value) follows the same protocol: pass
+`NULL` to learn the required length, then pass caller storage. A buffer that is
+too small answers `KIMIX_ERR_OUT_OF_RANGE` and still reports the required length.
+
+#### `uint32_t kimix_lua_abi_version(void)`
+
+`KIMIX_API_ABI_VERSION` as compiled into the image; a binding asserts on it at
+load time. Never fails.
+
+#### `const char *kimix_lua_version_string(void)`
+
+The kimix-core version string of this build ("kimix 1.2.3"). Static storage —
+never free it.
+
+#### `const char *kimix_lua_status_name(KIMIX_IN int32_t status)`
+
+The textual name of a `KIMIX_LUA_*` code (`"ok"`, `"denied"`, …), or `"unknown"`
+for a value outside the enum. Static storage; never `NULL`.
+
+#### `kimix_lua_limits kimix_lua_default_limits(void)`
+
+The library defaults as a value the caller can edit and pass back:
+16 MiB state budget, 1 MiB source, 8 MiB single-allocation cap, 64 KiB captured
+output, 256 KiB / 64 values / depth 32 for results, a 2.000 s deadline, no
+instruction budget, hook granularity 10 000, fixed `seed`/`random_seed`,
+`fresh_state_per_run = 1`, `allow_coroutines = 0`, `allow_collectgarbage_count = 0`.
+
+#### `kimix_status kimix_lua_sandbox_create(KIMIX_IN const kimix_lua_limits *limits, KIMIX_OUT kimix_lua_sandbox **out)`
+
+Creates the one handle of this area; `NULL` limits mean the defaults. `*out` is
+written only on `KIMIX_OK`; `KIMIX_ERR_INVALID_ARG` for a `NULL` `out`,
+`KIMIX_ERR_OUT_OF_MEMORY` when the handle cannot be allocated. `allow_coroutines`
+adds the `coroutine` library (with re-raising `resume`/`close`), and
+`allow_collectgarbage_count` permits `collectgarbage("count")` — both are decided
+at creation because the library mask is fixed when the state is built.
+
+#### `kimix_status kimix_lua_sandbox_destroy(KIMIX_TRANSFER kimix_lua_sandbox *sb)`
+
+Destroys the handle and drops the last run's result. A `NULL` handle is ignored
+(the call still answers `KIMIX_OK`); a run in flight must have finished — cancel
+it and join your own thread first. After this call every buffer previously
+written into caller storage is still the caller's, but no accessor may be used.
+
+#### `kimix_status kimix_lua_cancel(KIMIX_IN kimix_lua_sandbox *sb)`
+
+Asks the in-flight run to abort: the count hook raises `KIMIX_LUA_CANCELLED` in
+bounded time (one hook granularity). This is the ONLY cross-thread call of the
+family; the flag is cleared automatically at the start of the next run.
+`KIMIX_ERR_INVALID_ARG` for a `NULL` handle.
+
+#### `kimix_status kimix_lua_run(KIMIX_IN kimix_lua_sandbox *sb, KIMIX_IN const char *src, KIMIX_IN size_t src_len, KIMIX_OUT kimix_lua_result *res, KIMIX_OUT char *msg_buf, KIMIX_IN size_t msg_cap)`
+
+Compiles and runs `src` (length-based: an embedded NUL is just a byte) with the
+chunk name `"script.lua"`. The source is copied before use, so the caller's buffer
+may be reused or freed immediately. `res` is REQUIRED and is filled on `KIMIX_OK`
+and on `KIMIX_ERR_OUT_OF_RANGE` (so a two-phase caller always learns the required
+message length); `msg_buf` receives the message, NUL-terminated, truncated into
+`msg_cap`. The call answers `KIMIX_OK` when the chunk ran *or* failed — inspect
+`res->status` — plus `KIMIX_ERR_INVALID_ARG` (NULL `sb`/`res`) and
+`KIMIX_ERR_OUT_OF_RANGE` (message buffer too small). `res->memory_peak`,
+`res->instructions` and `res->seconds` describe what the run cost.
+
+#### `kimix_status kimix_lua_run_named(KIMIX_IN kimix_lua_sandbox *sb, KIMIX_IN const char *src, KIMIX_IN size_t src_len, KIMIX_IN const char *chunk_name, KIMIX_IN size_t chunk_name_len, KIMIX_OUT kimix_lua_result *res, KIMIX_OUT char *msg_buf, KIMIX_IN size_t msg_cap)`
+
+The same run with an explicit chunk name, which then appears in every message
+(`my_tool.lua:12: DENIED: …`). Keep it short: `LUA_IDSIZE` is 60, so a longer name
+is truncated *inside the message* (the full name is available through
+`kimix_lua_last_violation`). A `NULL`/empty name means `"script.lua"`.
+
+#### `kimix_status kimix_lua_last_output(KIMIX_IN kimix_lua_sandbox *sb, KIMIX_OUT char *buf, KIMIX_IN size_t cap, KIMIX_OUT size_t *out_len)`
+
+The text the last run captured from `print()`/`warn()` — the sandbox never writes
+to stdout/stderr. Two-phase; `KIMIX_ERR_OUT_OF_RANGE` when `buf` is too small.
+
+#### `kimix_status kimix_lua_last_traceback(KIMIX_IN kimix_lua_sandbox *sb, KIMIX_OUT char *buf, KIMIX_IN size_t cap, KIMIX_OUT size_t *out_len)`
+
+The bounded traceback (≤ 4 KiB) of the last failure; empty after a clean run.
+
+#### `kimix_status kimix_lua_last_violation(kimix_lua_sandbox *sb, char *api, size_t api_cap, size_t *api_len, char *category, size_t category_cap, size_t *category_len, char *detail, size_t detail_cap, size_t *detail_len, char *chunk, size_t chunk_cap, size_t *chunk_len)`
+
+The violation record of the last denied run: the exact api (`"io.open"`), its
+category (`"file-io"`, `"process"`, `"env"`, `"time"`, `"module"`,
+`"introspection"`, `"bytecode"`, `"pointer"`, `"gc"`, `"limit"`, `"memory"`), the
+human detail, and the FULL chunk name. Any buffer may be `NULL` to skip that
+field; every `*_len` is written regardless, and `KIMIX_ERR_OUT_OF_RANGE` reports a
+buffer that was too small.
+
+#### `kimix_status kimix_lua_last_value(kimix_lua_sandbox *sb, size_t index, int32_t *kind, uint8_t *b, int64_t *i, double *d, char *str_buf, size_t str_cap, size_t *str_len)`
+
+One marshalled return value of the last run. `kind` receives a
+`KIMIX_LUA_VALUE_*`; booleans land in `b`, integers in `i` (and `d`), numbers in
+`d`, and a `KIMIX_LUA_VALUE_STRING` / `KIMIX_LUA_VALUE_JSON` payload in `str_buf`
+(two-phase, like every other buffer). `KIMIX_ERR_OUT_OF_RANGE` for an
+`index >= value_count` or a too-small buffer. A table is delivered as **canonical
+JSON** (minified, object keys byte-sorted) because a `Value` never carries a
+pointer: functions, threads and userdata cannot cross the boundary at all — the
+run answers `KIMIX_LUA_LIMIT` instead.
+
+---
+
 ## Quick start
 
 ## Quick start
@@ -3000,6 +3160,19 @@ sub-section) the declaration lives in.
 | `kimix_map_reserve`                      | map      | Reserves room for `count` entries; only ever grows, so a smaller request is a successful no-op. |
 | `kimix_map_set`                          | map      | Insert-or-overwrite: a new key is appended (insertion order), an existing one is overwritten in place and keeps its index. |
 | `kimix_map_size`                         | map      | The number of entries (0 for a NULL or empty map). |
+| `kimix_lua_abi_version` | lua §0 | `KIMIX_API_ABI_VERSION` of the running image; assert on it at load time. |
+| `kimix_lua_cancel` | lua §3 | Asks the in-flight run to abort (the only cross-thread call); the hook raises `KIMIX_LUA_CANCELLED`. |
+| `kimix_lua_default_limits` | lua §2 | The library's default resource contract as an editable value. |
+| `kimix_lua_last_output` | lua §5 | The `print()`/`warn()` text the last run captured (two-phase). |
+| `kimix_lua_last_traceback` | lua §5 | The bounded traceback of the last failure (two-phase). |
+| `kimix_lua_last_value` | lua §5 | One marshalled return value of the last run (string/JSON payload two-phase). |
+| `kimix_lua_last_violation` | lua §5 | The api / category / detail / chunk of the last denied run (each field two-phase). |
+| `kimix_lua_run` | lua §4 | Compiles and runs a chunk in the sandbox; the outcome is reported in `result->status`. |
+| `kimix_lua_run_named` | lua §4 | The same run with an explicit chunk name for the messages. |
+| `kimix_lua_sandbox_create` | lua §3 | Creates the one handle of this area from a `kimix_lua_limits`. |
+| `kimix_lua_sandbox_destroy` | lua §3 | Releases the handle (and the last run's result). |
+| `kimix_lua_status_name` | lua §0 | The textual name of a `KIMIX_LUA_*` code. |
+| `kimix_lua_version_string` | lua §0 | The kimix-core version string of this build. |
 | `kimix_mem_calloc`                       | mem      | Allocates a zero-filled array of `count` elements of `size` bytes. |
 | `kimix_mem_calloc_aligned`               | mem      | Allocates an aligned, zero-filled array of `count` elements of `size` bytes. |
 | `kimix_mem_collect`                      | mem      | Asks mimalloc to return cached/abandoned memory to the OS now. |
@@ -3219,4 +3392,4 @@ sub-section) the declaration lives in.
 | `kimix_yyjson_write`                     | json §6  | Serialises a whole document into a freshly allocated, NUL-terminated UTF-8 string. |
 | `kimix_yyjson_write_buf`                 | json §6  | Serialises a document into the caller's own buffer: no allocation at all, nothing to free. |
 
-Total: **372 functions** — ABI 5, `kimix_mem_*` 35, `kimix_vec_*` 36, `kimix_map_*` 11, `kimix_fiber_*` 2, `kimix_yyjson_*` 140, repair 8, canonical 2, sqlite 33, graphdb 64, read/write 36. Any of these is a valid Ctrl-F target for the section above.
+Total: **385 functions** — ABI 5, `kimix_mem_*` 35, `kimix_vec_*` 36, `kimix_map_*` 11, `kimix_fiber_*` 2, `kimix_yyjson_*` 140, repair 8, canonical 2, sqlite 33, graphdb 64, lua 13, read/write 36. Any of these is a valid Ctrl-F target for the section above.

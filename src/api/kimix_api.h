@@ -82,5 +82,6 @@
 #include <api/ffi_sqlite.h>
 #include <api/ffi_yyjson.h>
 #include <api/ffi_graphdb.h>
+#include <api/ffi_lua.h>
 
 #endif /* KIMIX_API_KIMIX_API_H */

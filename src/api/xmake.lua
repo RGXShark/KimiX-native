@@ -48,6 +48,13 @@
 --                   caller-owned buffers) from this image; the session is the
 --                   only allocated object, released by kimix_graphdb_close
 --                                                        -> ffi_graphdb.cpp
+--   ffi_lua.h        the Lua script sandbox (kimix-script): one opaque handle
+--                   per worker thread, create -> run -> read the result ->
+--                   destroy.  A chunk cannot touch the file system, spawn a
+--                   process, load a module, reach debug introspection, obtain
+--                   an address or run unbounded; a denial aborts the run and
+--                   comes back as KIMIX_LUA_DENIED plus the documented message
+--                                                        -> ffi_lua.cpp
 --
 -- Dependency rule: kimix_api depends on kimix-core for everything core-ish —
 -- never on a src/ext target directly for those (mimalloc/yyjson, and the marl
@@ -104,6 +111,10 @@ target("kimix_api")
     -- kimix_graphdb_* re-exports callable).  kimix-graph-db is likewise
     -- always built.
     add_deps("kimix-graph-db")
+    -- ffi_lua.h owns the sandbox handle over kimix::script::Sandbox, so the
+    -- archive (and, transitively, the vendored `lua` target it links) becomes
+    -- part of this image.  kimix-script is always built.
+    add_deps("kimix-script")
     on_load(function(target)
         -- Our own symbols are dllexport'd from this image; a consumer without
         -- either macro sees dllimport (src/core/dll_export.h, KIMIX_API_API).

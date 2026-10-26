@@ -270,6 +270,15 @@ target_end()
 -- The two guarded source edits live as uncommitted changes inside the
 -- src/ext/lua submodule (pinned at upstream 8cb93bad); their exported diff
 -- is kept at src/ext/lua.kimix.patch — re-apply it after a submodule update.
+-- NOTE for the consumers of this library: src/script (kimix-script, the Lua
+-- script sandbox) NEVER calls luaL_openlibs — it builds its states with
+-- lua_newstate + luaL_openselectedlibs and installs loud tripwires for the
+-- libraries it does not open (see src/script/README.md). Nothing here changes
+-- for the sandbox: KIMIX_LUA_SANDBOX (the optional source-side address
+-- redaction of the plan) is intentionally NOT defined, because
+-- src/script/script_env.cpp closes the same hole from the host side by wrapping
+-- string.format. A new consumer must not open io/os/package/debug either;
+-- scripts/check_lua_sandbox.py enforces that tree-wide.
 -- The mimalloc include dir + the MI_SHARED_LIB import declarations arrive
 -- transitively through kimix-core (this target's only dependency), matching
 -- the project rule that third-party deps are declared on kimix-core, never

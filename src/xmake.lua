@@ -240,6 +240,11 @@ end
 -- in-memory graph container + LMDB cold-storage glue (kimix-core only).
 includes("graph_db")
 
+-- Include the Lua script sandbox (src/script): kimix-script (static) — one
+-- throw-away, budgeted lua_State per run, a vetted environment, loud tripwires
+-- and an aborted run on any denied capability.  See src/script/README.md.
+includes("script")
+
 
 
 
