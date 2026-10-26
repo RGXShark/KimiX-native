@@ -411,9 +411,14 @@ private:
     // when undeclared, error_wrong_type when the kind/container/dtype disagree,
     // error_count when an array's length does not match the declaration.
     [[nodiscard]] GdiStatus _validate_property(PropNameId name, PropertyValue const &value) const;
-    // Resolve the registered constraint (or an empty one for a zero handle).
+    // Resolve the registered constraint (or an empty one for a zero handle) and
+    // hand it back BY REFERENCE: `out` is set to `&constraint` on success, so a
+    // read pays no copy of the condition vector (plan O9), and the C ABI path —
+    // whose handle is already resolved — pays nothing at all. The validation rules
+    // are unchanged (a label condition with an ordering op is error_op) and `out`
+    // is written only on success.
     [[nodiscard]] GdiStatus _resolve_constraint(Constraint const &constraint,
-                                                Constraint &out) const;
+                                                Constraint const *&out) const;
     // True when any live entity carries a value of this property type.
     [[nodiscard]] bool _property_values_exist(PropNameId name) const;
     // Strip a label / property type from every vertex and every edge. When a

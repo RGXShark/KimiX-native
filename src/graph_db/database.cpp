@@ -220,14 +220,18 @@ GdiStatus Database::_validate_property(PropNameId name, PropertyValue const &val
 }
 
 GdiStatus Database::_resolve_constraint(Constraint const &constraint,
-                                        Constraint &out) const {
-    if (constraint.conditions.empty()) {
-        out = Constraint{};
-        return GdiStatus::ok;
-    }
-    // A caller may either hand in a definition or (through the C ABI) a handle,
-    // which is already resolved before this point. Here the definition itself is
+                                        Constraint const *&out) const {
+    // Plan O9: this used to COPY the whole Constraint (`out = constraint`, a
+    // kimix::vector<ConstraintCondition> whose every element carries a
+    // PropertyValue) on every call — one avoidable allocation per facade read, and
+    // a second one on the C ABI path on top of the walk it feeds. Nothing needs
+    // the copy: the caller's object is const for the whole call and every consumer
+    // takes it by const reference, so handing back the caller's own constraint is
+    // equivalent. The RULES are untouched — a caller may hand in a definition or
+    // (through the C ABI) a handle, which is already resolved before this point; an
+    // empty constraint matches everything; and here the definition itself is
     // validated: a label condition with an ordering op cannot be evaluated.
+    // `out` is set only on success (the error paths return before it is written).
     for (auto const &condition : constraint.conditions) {
         if (condition.is_label()) {
             if (condition.op != GdiOp::equal && condition.op != GdiOp::not_equal) {
@@ -235,7 +239,7 @@ GdiStatus Database::_resolve_constraint(Constraint const &constraint,
             }
         }
     }
-    out = constraint;
+    out = &constraint;
     return GdiStatus::ok;
 }
 
@@ -1248,11 +1252,12 @@ GdiStatus Database::get_edges_of_vertex(kimix::Guid const &uid,
     if (!_graph.contains(uid)) {
         return GdiStatus::error_vertex;
     }
-    Constraint resolved;
-    GdiStatus status = _resolve_constraint(constraint, resolved);
+    Constraint const *resolved_ref = nullptr;
+    GdiStatus status = _resolve_constraint(constraint, resolved_ref);
     if (is_error(status)) {
         return status;
     }
+    Constraint const &resolved = *resolved_ref;
     kimix::vector<EdgeId> ids;
     _graph.incident_edges(uid, orientation, ids);
     kimix::vector<EdgeRecord> matches;
@@ -1283,11 +1288,12 @@ GdiStatus Database::get_neighbor_vertices(kimix::Guid const &uid,
     if (!_graph.contains(uid)) {
         return GdiStatus::error_vertex;
     }
-    Constraint resolved;
-    GdiStatus status = _resolve_constraint(constraint, resolved);
+    Constraint const *resolved_ref = nullptr;
+    GdiStatus status = _resolve_constraint(constraint, resolved_ref);
     if (is_error(status)) {
         return status;
     }
+    Constraint const &resolved = *resolved_ref;
     if (resolved.conditions.empty()) {
         // Plan v3 §4.1 (the degree-counter epoch): the UNFILTERED neighbourhood
         // read no longer resolves every neighbour's own record — the labels /
@@ -1402,12 +1408,12 @@ GdiStatus Database::traverse_bfs(kimix::Guid const &start, Constraint const &con
                                  uint32_t max_depth,
                                  kimix::vector<Graph::TraversalVertex> &out) const {
     out.clear();
-    Constraint resolved;
-    GdiStatus const status = _resolve_constraint(constraint, resolved);
+    Constraint const *resolved_ref = nullptr;
+    GdiStatus const status = _resolve_constraint(constraint, resolved_ref);
     if (is_error(status)) {
         return status;
     }
-    return _graph.traverse_bfs(start, resolved, orientation, cap_per_level, max_depth, out);
+    return _graph.traverse_bfs(start, *resolved_ref, orientation, cap_per_level, max_depth, out);
 }
 
   GdiStatus Database::shortest_path(kimix::Guid const &from, kimix::Guid const &to,
@@ -1421,24 +1427,24 @@ GdiStatus Database::traverse_bfs(kimix::Guid const &start, Constraint const &con
                                     EdgeOrientation orientation, uint32_t max_depth,
                                     kimix::vector<Graph::PathStep> &out) const {
       out.clear();
-      Constraint resolved;
-      GdiStatus const status = _resolve_constraint(edge_constraint, resolved);
+      Constraint const *resolved_ref = nullptr;
+      GdiStatus const status = _resolve_constraint(edge_constraint, resolved_ref);
       if (is_error(status)) {
           return status;
       }
-      return _graph.shortest_path(from, to, resolved, orientation, max_depth, out);
+      return _graph.shortest_path(from, to, *resolved_ref, orientation, max_depth, out);
   }
 
   GdiStatus Database::has_path(kimix::Guid const &from, kimix::Guid const &to,
                                Constraint const &edge_constraint, EdgeOrientation orientation,
                                bool &out) const {
       out = false;
-      Constraint resolved;
-      GdiStatus const status = _resolve_constraint(edge_constraint, resolved);
+      Constraint const *resolved_ref = nullptr;
+      GdiStatus const status = _resolve_constraint(edge_constraint, resolved_ref);
       if (is_error(status)) {
           return status;
       }
-      out = _graph.has_path(from, to, resolved, orientation);
+      out = _graph.has_path(from, to, *resolved_ref, orientation);
       return GdiStatus::ok;
   }
 
@@ -1450,11 +1456,12 @@ GdiStatus Database::traverse_bfs(kimix::Guid const &start, Constraint const &con
       if (cap < 0) {
           return GdiStatus::error_argument;
       }
-      Constraint resolved;
-      GdiStatus const status = _resolve_constraint(constraint, resolved);
+      Constraint const *resolved_ref = nullptr;
+      GdiStatus const status = _resolve_constraint(constraint, resolved_ref);
       if (is_error(status)) {
           return status;
       }
+      Constraint const &resolved = *resolved_ref;
       bool const filtered = !resolved.conditions.empty();
       kimix::vector<kimix::Guid> found;
       kimix::vector<LabelId> labels; // filtered path only, reused across vertices
@@ -1550,11 +1557,12 @@ return true; // keep scanning
       default:
           return GdiStatus::error_argument;
       }
-      Constraint resolved;
-      GdiStatus const status = _resolve_constraint(spec.constraint, resolved);
+      Constraint const *resolved_ref = nullptr;
+      GdiStatus const status = _resolve_constraint(spec.constraint, resolved_ref);
       if (is_error(status)) {
           return status;
       }
+      Constraint const &resolved = *resolved_ref;
       // The legality matrix, decided from the REGISTERED declaration before any
       // scan: count reduces rows (no property needed); min/max order values
       // (numeric cross-kind via compare_values, strings ordinal via char_); sum/

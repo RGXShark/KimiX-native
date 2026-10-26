@@ -999,25 +999,161 @@ Semantics, all inherited from the read commands rather than invented:
 - unknown endpoints / bounds / label ordering ops keep the vertex-only
   contract (`error_vertex` / `error_argument` / `error_op`); unreachable within
   the bound over matching edges is an EMPTY path with status ok;
-- read atomicity is per visit, exactly as before: one vertex shard SHARED lock
-  copies the link list, then one edge-shard SHARED lock per candidate hop, with
-  no lock held between visits, so a concurrent writer may be observed on one
-  visit and not the next.
+- read atomicity is per visit for a vertex's adjacency and PER VISIT BATCH for
+  that visit's edge tests: one vertex shard SHARED lock copies the oriented link
+  list and is released before the next visit, then -- for a visit wide enough to
+  pay for it -- the visit's candidate edges are tested together under ONE
+  edge-shard SHARED lock per TOUCHED shard, in ascending index. No lock is held
+  between visits, and no vertex-shard lock is ever held while an edge-shard lock
+  is taken (the vertex shard is level 1 and the edge shard level 3 in the lock
+  order of `graph.h`; only the ABSENCE of a level 3 -> level 1 acquisition keeps
+  the wait-for graph acyclic -- a level 1 -> level 3 one is the direction the
+  hierarchy permits, and the structural write paths take it too). A concurrent
+  writer may therefore be observed on one visit and not the next. The batch
+  changes WHEN an edge of that visit is tested and which state the test sees: **in
+  a structurally quiescent graph** it never changes which vertices the walk
+  discovers, because the candidates are filtered out of order but consumed in
+  ORIGINAL link order; in a graph a writer is mutating concurrently it can, because
+  a wide visit's tests span the per-link head plus up to seven drains (a hub visit
+  drains 64 + 256 + 1 024 x 4 + 520), so a writer change landing between two drains
+  may flip a verdict and with it a discovery. That is the SAME anomaly class as the
+  inter-visit skew above and it trades nothing in memory safety or quiescent
+  determinism.
 
-Cost: the filtered walk pays one edge-shard shared lock per CANDIDATE link (the
-unfiltered `has_path`/`shortest_path` forms keep their guid-projection fast path
-and are untouched), and the BFS keeps its discovered nodes in one vector with
-parent INDICES instead of a guid-to-predecessor map, so a walk allocates on
-growth only. The C ABI addition is purely additive: no existing struct changed,
-so `KIMIX_GDB_ABI_VERSION` stays 6 and a binder may treat a missing symbol as a
+Cost, measured (`tests/unit/graph_db/test_graph_db_bench_edges.cpp` -- its `[bench]`,
+`[mem]` and `[ctr]` rows -- release MSVC x64 build, one pinned core, median of three
+RECORD-OK runs; "E0" is the same file's pre-optimization row, so every ratio below is
+a before/after of the SAME measurement, not a claim against another machine):
+
+| row | E0 ns/op | now ns/op | ratio | `[mem]` allocs/op E0 -> now |
+|---|---|---|---|---|
+| **S6 unfiltered 3-hop / F1 (CONTROL)** | 856.8 | 841.4 | 1.02x | 18 (untouched) |
+| S1 1-hop, label 100 %, F1 | 150.4 | 96.1 | **1.57x** | 8 -> **0** |
+| S1 1-hop, hub F4 (early hit) | 2 742.7 | 2 606.3 | 1.05x | 9 -> 1 |
+| S2 3-hop, label 100 %, F1 | 1 919.2 | 1 330.2 | **1.44x** | 27 -> **0** |
+| S2 3-hop, label 50 %, F2 | 385.1 | 281.8 | 1.37x | 12 -> **0** |
+| S2 3-hop, label 100 %, F3 | 14 373.2 | 9 126.9 | 1.57x | 48 -> 9 |
+| S2 hub F4 | 697 342.2 | 447 296.7 | 1.56x | 100 -> 47 |
+| S3 8-hop, label 100 %, F1 | 115 391.6 | 37 247.0 | **3.10x** | 61 -> 14 |
+| S4 unreachable, F5 | 2 039.4 | 1 561.0 | 1.31x | 9 -> **0** |
+| S4 unreachable wide, F1 | 1 167 468.0 | 541 521.9 | **2.16x** | 70 -> 19 |
+| S5 `has_path` false, F5 | 2 047.6 | 1 400.9 | 1.46x | 9 -> **0** |
+| S5 `has_path` false, F1 | 1 297 831.2 | 476 595.7 | **2.72x** | 70 -> 19 (peak 196 608 -> **65 536 B**) |
+| S7 `both` 2-hop, F4 | 736 766.8 | 450 872.3 | 1.63x | 100 -> 47 |
+| S10 C ABI fill 3-hop, F2c | 313.0 | 199.7 | 1.57x | 13 -> **0** |
+
+26 of the 39 `[mem]` rows are exactly 0 allocs / 0 B / peak 0, and no row's peak
+regressed. The control row is what keeps the "unfiltered fast paths untouched"
+promise honest: -1.8 %, i.e. inside its own spread.
+
+What each lever is, and what it is not:
+
+- the batch is a **LOCK-COUNT** lever, not a time lever. `edge_matches` measures
+  20.4 ns and only ~5-7 ns of that is the edge-shard lock (S11 micro-row), so
+  halving the hub visit's lock count (`[ctr] edge_locks` 9 000 -> about 4 4xx; the
+  exact point value scatters 4 384-4 489 per process because touched shards depend
+  on guid hashing -- never quote an absolute) left that row inside its own spread.
+  What the batch costs when it misfires is real, so it is applied only to a visit
+  whose link list is at least `kEdgeFilterMinLinks` (128) wide: every narrow visit
+  of every fixture stays per-link (S1/F1 1 probe, S2/F1 37, S2/F3 232, S3 515,
+  S4-wide 3 006).
+- a wide visit batches its TAIL only: the first `kEdgeFilterHeadLinks` (64) links
+  take the per-link path, the rest is drained in ESCALATING chunks (64 -> 256 ->
+  1 024, then 1 024 steady). The head is what preserves the early exit -- a drain
+  stages before it consumes, so without the head a 1-hop hub lookup probed all
+  5 000 links and took 320 edge locks where 8 probes and 8 locks answer it:
+  `edges/S1_1hop_label100/F4` measured 96 888 ns (33x) before the split and
+  2 709 ns after. The escalation bounds the same effect just past the head: a hit
+  inside a drain is only noticed when that drain is consumed, so an early hit costs
+  the current drain -- ~1.3 us right after the head, ~5 us in the 256 drain, ~21 us
+  on the steady-state 1 024 chunk. A bound, not a per-link guarantee.
+- the chunk (`kEdgeFilterChunk` = 1 024 candidates per drain) is a DELIBERATE
+  peak-for-time trade: the staging arrays stay at "order 4 B + match 1 B per
+  candidate" (~5 KB) however wide the visit is instead of growing with it.
+- a LEVEL-wide batch is worse and is not what ships: with the visited check ahead
+  of the filter, 79-83 % of a level's links point at vertices the SAME level
+  discovers, so deferring discovery re-probes them (`[ctr] edge_tests` 515 -> 2 460
+  on S3, exactly `links_snapshotted`). In the intermediate build that implemented
+  it, draining a whole level measured ~2.4-2.5x slower on S3 (139-149 us against
+  51-58 us); that build was not retained, so the number is quoted as a band and the
+  mechanism above is what makes the deviation sound.
+- neither constant is a fitted knee: 128 sits above the width where a level drain
+  measured the regression above and below the hub rows that lose ~50 % of their
+  edge locks; 64 covers the measured early-hit row by 8x. Both are conservative
+  choices, recorded as such in `graph.cpp`.
+- the visited check runs BEFORE the edge filter, which is what removed most of the
+  filter work on the deep rows: `[ctr] edge_tests` fell from 17 460 to 3 006 on
+  S4-wide (-83 %) and from 2 460 to 515 on S3 (-79 %) while `visits` and
+  `links_snapshotted` stayed identical, i.e. discovery order, level widths and
+  snapshot volume are untouched. A NEWLY discovered neighbour still takes the
+  filter in link order, so the first matching parallel edge still wins for
+  `PathStep::edge`.
+- the walk's per-call state is stack-resident: the node array, both level frontiers
+  and the link snapshot keep 64 / 64 / 16 entries inline and grow to the heap only
+  past that, so a short filtered walk allocates NOTHING. The state is a plain local
+  of 4.6 KB of buffer in one stack frame (0.44 % of a 1 MiB marl fiber), with no
+  recursion and nothing that grows with the graph; its buffers are raw storage
+  written by placement new, so they cost stack space and no stores. The only
+  `{}`-initialised part is the level-3 scratch, and only once a wide visit ENGAGES
+  it (its shard tables must start zeroed): +1 280 B, so 0.56 % (~5.9 KB) then.
+  Where a row still allocates, it is that inline-budget growth and nothing else:
+  S2/F3 9, S3/F1 14, S4-wide 19, S5_haspfalse/F1 19 (peak 65 536 B), the hub and
+  S7`both`/F4 47 (peak 655 360 B = E0's figure, 160 000 B of it the hub's one
+  5 000-link snapshot). Nothing allocates per candidate or per visit.
+- the visited set of THIS walk is its own exact table (open addressing over node
+  INDICES, keyed by a Fibonacci mix of the guid's two words, collisions resolved by
+  a full 16-byte guid compare, 512 slots inline): the ankerl set keyed on the
+  exported XXH3 `Guid` hash was 2 460 / 17 460 / 9 000 membership probes on the
+  deep rows, i.e. the dominant remaining term, and replacing it is what moved the
+  wide rows on top of the levers above (S3 1.51x, S4-wide 1.20x, S5/F1 1.32x, hub
+  1.54x on top of their earlier state). It is exact: a collision always forces the
+  guid compare, so it can never report a member that is not one.
+- `has_path` is a mode of the SAME walk, not a second BFS: its node record is the
+  16-byte guid alone, and the parent/depth/edge payload plus the whole `PathStep`
+  assembly (including the caller's buffer) do not exist in that instantiation.
+  That is the memory lever: peak 196 608 -> 65 536 B on the wide `has_path(false)`
+  row (-67 %) and 1 -> 0 allocations on the `has_path(true)` rows.
+- the discovered nodes keep their parent INDICES instead of a
+  guid-to-predecessor map, `nodes` IS the visited container (there is no second
+  discovery mirror), and a reused `out` keeps its capacity (the path is filled in
+  place, no `std::reverse` pass).
+- the facade no longer copies the `Constraint` per call, and the C ABI reuses one
+  per-session staging buffer instead of building a fresh `vector<PathStep>` per
+  call, so the two-phase (count-only, then fill) protocol costs no allocation at
+  all: S10 3 -> 0 allocs/op. `KIMIX_GDB_ABI_VERSION` stays 6 and `graph_c_api.h`
+  is unchanged; the session struct gained one private member and is opaque to C
+  consumers, so its single allocation is per session, not per call.
+- the UNFILTERED fast paths (has_path, the vertex-only shortest_path and
+  traverse_bfs, i.e. the S6 control rows) keep their guid-projection algorithms and
+  never touch the batch, the reachability mode or the walk-local visited table; the
+  only change they see is the allocation-free visited set (one fewer allocation per
+  call: S6 `has_path`-false `[mem]` 51 -> 49 allocs/op).
+
+Known limitation, recorded rather than hidden: the duplicate-neighbour *re-enqueue*
+inside one drain is only observable in a `KIMIX_GRAPH_DB_WALK_COUNTERS` build --
+removing the consume-time visited check does not change any answer (the duplicate is
+an extra node record, not a different `PathStep` sequence), so the default gate does
+not catch it. The mechanical counters-off gate for a future change is a fixture whose
+discovery count sits exactly at the 64-node inline budget with one duplicate link:
+its `[mem]` row then reads 0.0 allocs/op when correct and 1.0 when mutated.
+
+The C ABI addition is purely additive: no existing struct changed, so
+`KIMIX_GDB_ABI_VERSION` stays 6 and a binder may treat a missing symbol as a
 pre-edge-epoch image.
 
-Coverage: `test_graph_db_traverse.cpp` (equivalence against a brute force over
-the constraint x orientation x depth x endpoint matrix, the parallel-edge choice,
-`oriented_links` / `edge_matches`, the facade and its handle path),
-`test_graph_db_c_api.cpp` (`cabi_shortest_path_edges`: two-phase, the reroute a
-label filter causes, the orientation knob, the error surface) and
-`tests/unit/api/test_kimix_api.cpp` (the re-export exists).
+Coverage: `test_graph_db_traverse.cpp` (18 058 asserts; equivalence against a brute
+force over the constraint x orientation x depth x endpoint matrix, the parallel-edge
+choice, `oriented_links` / `edge_matches`, the facade and its handle path, plus the
+three cases this cost work added: a 200-link visit with a parallel pair at index 130
+-- inside a drained chunk, so the batch's first-match-wins is pinned rather than
+assumed -- a duplicate neighbour inside one chunk with a rival, and a randomized
+`has_path == !shortest_path.empty()` equivalence over 120 draws x 4 constraints x 3
+orientations), `test_graph_db_c_api.cpp` (`cabi_shortest_path_edges`: two-phase, the
+reroute a label filter causes, the orientation knob, the error surface),
+`tests/unit/api/test_kimix_api.cpp` (the re-export exists) and the gated benchmark
+`test_graph_db_bench_edges.cpp` (the `[bench]` / `[mem]` / `[ctr]` rows quoted above,
+with a brute-force `PathStep` parity gate before any timing and no timing assertion
+at all).
 
 ## 5e. Epoch 4 — first-class edges + the GDI layer
 

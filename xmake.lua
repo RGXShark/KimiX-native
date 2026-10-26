@@ -128,6 +128,22 @@ option("kimix_enable_api")
     set_description("build the kimix_api C FFI shared library (src/api)")
 option_end()
 
+-- Optional walk instrumentation for kimix-graph-db (optimize_plan.md §3.2).
+-- Adds the public define KIMIX_GRAPH_DB_WALK_COUNTERS to kimix-graph-db (and, by
+-- propagation, to everything that depends on it), which compiles a thread_local
+-- WalkCounters record into the EDGE-filtered walk: vertex_locks, edge_locks,
+-- edge_tests, links_snapshotted, visited_checks, edge_shards. The benchmark
+-- tests/unit/graph_db/test_graph_db_bench_edges.cpp prints them as [ctr] rows.
+-- OFF by default, and off means COMPILED OUT: no counter, no thread_local
+-- access, no hot-path cost — a timing row of a default build is the record, and
+-- an instrumented build is for attribution only. Diagnostic, never a behaviour
+-- switch: nothing in the walk changes its result, its locks or its order.
+option("graph_db_walk_counters")
+    set_default(false)
+    set_showmenu(true)
+    set_description("compile the edge-filtered walk's [ctr] counters into kimix-graph-db")
+option_end()
+
 -- disable Windows message box (redirect asserts/errors to stderr instead)
 option("kimix_disable_win_message_box", {
     default = true

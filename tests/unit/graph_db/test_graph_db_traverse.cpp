@@ -265,6 +265,19 @@ bool walk_is_consistent(kimix::vector<TraversalVertex> const &walk, kimix::Guid 
 inline constexpr LabelId kOpenEdgeLabel = 21u;
 inline constexpr LabelId kBlockedEdgeLabel = 22u;
 inline constexpr PropNameId kCostName = 11u;
+// A label no filter below selects: the wide-visit fixtures fill the HEAD and the
+// first drained CHUNK with these, so nothing but the deliberately placed links can
+// become the hop.
+inline constexpr LabelId kDecoyEdgeLabel = 23u;
+// The visit width that puts the walk on the BATCHED edge filter
+// (graph.cpp's kEdgeFilterMinLinks), and the link index the wide-visit fixtures
+// place their interesting links at: the head is the first 64 links taken per link,
+// the first drained chunk is links[64,128), and the second chunk starts at 128. 130
+// is therefore INSIDE a drained chunk and not on its boundary, so the batch's
+// staging and its consume loop both decide what the hop reports, and an off-by-one
+// in either moves the hop onto an edge that does not join the two steps.
+inline constexpr size_t kWideVisitLinks = 200;
+inline constexpr size_t kWideVisitPairAt = 130;
 
 // The (neighbour, edge) pairs a brute force steps over from `current`, computed
 // through the PUBLIC edge reads only — incident_edges + edge_record + matches —
@@ -408,6 +421,15 @@ void expect_path_is_sound(Graph const &graph, kimix::vector<Graph::PathStep> con
 }
 
 
+
+// One directed edge carrying `labels`; true when the graph accepted it. A fixture
+// failure is folded into a single call-site count instead of an assert per edge, so
+// a 200-link fixture does not swamp the suite's assert count.
+bool wide_link(Graph &graph, kimix::Guid const &from, kimix::Guid const &to,
+               kimix::span<const LabelId> labels, EdgeId &out) {
+    return graph.edge_create(from, to, graph_db::EdgeDirectionType::directed, labels, nullptr,
+                             out) == GdiStatus::ok;
+}
 
 } // namespace
 
@@ -1017,6 +1039,360 @@ int main(int argc, char *argv[]) {
         expect(graph.has_path(dag.b->guid(), dag.b->guid(), blocked, EdgeOrientation::outgoing))
             << "from == to on an existing vertex is a zero-length path";
         expect(!graph.has_path(unknown, unknown, Constraint{}, EdgeOrientation::outgoing));
+    };
+
+    // -----------------------------------------------------------------------
+    // The BATCHED edge filter (a visit of kWideVisitLinks >= kEdgeFilterMinLinks
+    // links): the walk filters a visit's tail out of order — one lock per touched
+    // edge shard — but must still CONSUME the candidates in original link order, so
+    // the first matching parallel edge carries the hop exactly as the per-link path
+    // would. These are the suite's only wide visits, and they place the interesting
+    // links inside a drained chunk on purpose (the bench's F4 hub, the only other
+    // wide visit in the tree, has no parallel edges at all).
+    // -----------------------------------------------------------------------
+    "edge_filtered_wide_visit_first_match_wins"_test = [] {
+        Graph graph;
+        Vertex *start = graph.create_vertex();
+        Vertex *target = graph.create_vertex();
+        EdgeId first_link{};  // link index 130: open AND blocked
+        EdgeId second_link{}; // link index 131: open only
+        size_t made = 0;
+        for (size_t i = 0; i < kWideVisitLinks; ++i) {
+            if (i == kWideVisitPairAt) {
+                // The two parallel links to the SAME target are ADJACENT candidates
+                // of one drained chunk, so the batch's verdict array and its consume
+                // loop — not the snapshot — decide which edge the hop reports.
+                LabelId const labels[] = {kOpenEdgeLabel, kBlockedEdgeLabel};
+                if (wide_link(graph, start->guid(), target->guid(),
+                              kimix::span<const LabelId>{labels, 2}, first_link)) {
+                    ++made;
+                }
+                continue;
+            }
+            if (i == kWideVisitPairAt + 1) {
+                LabelId const labels[] = {kOpenEdgeLabel};
+                if (wide_link(graph, start->guid(), target->guid(),
+                              kimix::span<const LabelId>{labels, 1}, second_link)) {
+                    ++made;
+                }
+                continue;
+            }
+            Vertex *decoy = graph.create_vertex();
+            LabelId const labels[] = {kDecoyEdgeLabel};
+            EdgeId unused{};
+            if (wide_link(graph, start->guid(), decoy->guid(),
+                          kimix::span<const LabelId>{labels, 1}, unused)) {
+                ++made;
+            }
+        }
+        expect(eq(made, kWideVisitLinks)) << "the wide visit fixture built every link";
+        expect(first_link != second_link) << "a parallel edge is its own id";
+        Constraint const open_only =
+            Constraint{}.with(ConstraintCondition::on_label(kOpenEdgeLabel, GdiOp::equal));
+        // Both parallel links match: the FIRST in link order wins.
+        kimix::vector<PathStep> path;
+        expect(eq(graph.shortest_path(start->guid(), target->guid(), open_only,
+                                      EdgeOrientation::outgoing, 1, path),
+                  GdiStatus::ok));
+        expect(eq(path.size(), size_t{2})) << "the fixture is flat: one hop reaches the target";
+        if (path.size() == 2) {
+            expect(path[1].vertex == target->guid());
+            expect(path[1].edge == first_link)
+                << "the batched drain reports the FIRST matching parallel edge";
+        }
+        expect_path_is_sound(graph, path, open_only, EdgeOrientation::outgoing, start->guid(),
+                             target->guid(), "the wide visit's hop is a real, matching edge");
+        // Refusing the FIRST of the pair reroutes the same hop onto the second: a
+        // refused candidate does not consume the neighbour.
+        Constraint const open_and_not_blocked =
+            Constraint{}
+                .with(ConstraintCondition::on_label(kOpenEdgeLabel, GdiOp::equal))
+                .with(ConstraintCondition::on_label(kBlockedEdgeLabel, GdiOp::not_equal));
+        kimix::vector<PathStep> rerouted;
+        expect(eq(graph.shortest_path(start->guid(), target->guid(), open_and_not_blocked,
+                                      EdgeOrientation::outgoing, 1, rerouted),
+                  GdiStatus::ok));
+        expect(eq(rerouted.size(), size_t{2}));
+        if (rerouted.size() == 2) {
+            expect(rerouted[1].edge == second_link)
+                << "the second parallel edge carries the hop once the first is refused";
+        }
+        // The same two parallel links in a visit NARROWER than kEdgeFilterMinLinks
+        // take the per-link path; it must report the same edge, so the batch is a
+        // cost change and never a rule change. (The unfiltered form cannot be the
+        // reference here: it reports vertices, not the edge each hop took.)
+        {
+            Graph narrow;
+            Vertex *narrow_start = narrow.create_vertex();
+            Vertex *narrow_target = narrow.create_vertex();
+            EdgeId narrow_first{};
+            EdgeId narrow_second{};
+            LabelId const both_labels[] = {kOpenEdgeLabel, kBlockedEdgeLabel};
+            LabelId const open_label[] = {kOpenEdgeLabel};
+            expect(wide_link(narrow, narrow_start->guid(), narrow_target->guid(),
+                             kimix::span<const LabelId>{both_labels, 2}, narrow_first));
+            expect(wide_link(narrow, narrow_start->guid(), narrow_target->guid(),
+                             kimix::span<const LabelId>{open_label, 1}, narrow_second));
+            kimix::vector<PathStep> narrow_path;
+            expect(eq(narrow.shortest_path(narrow_start->guid(), narrow_target->guid(),
+                                           open_only, EdgeOrientation::outgoing, 1, narrow_path),
+                      GdiStatus::ok));
+            expect(eq(narrow_path.size(), size_t{2}));
+            if (narrow_path.size() == 2) {
+                expect(narrow_path[1].edge == narrow_first)
+                    << "the per-link path picks the first parallel edge, like the batch";
+            }
+        }
+    };
+
+    // A DUPLICATE neighbour inside ONE drained chunk (two links of the same chunk
+    // pointing at the same vertex), next to a rival vertex that reaches the target
+    // too: the consume-time visited check must drop the duplicate, so the path's
+    // second step is the FIRST of the two links and the third step comes from the
+    // duplicated vertex, not from the rival discovered a candidate later.
+    "edge_filtered_wide_visit_duplicate_neighbour_skipped"_test = [] {
+        Graph graph;
+        Vertex *start = graph.create_vertex();
+        Vertex *shared = graph.create_vertex(); // the duplicated neighbour
+        Vertex *rival = graph.create_vertex();  // discovered AFTER `shared`, same chunk
+        Vertex *target = graph.create_vertex();
+        EdgeId shared_to_target{};
+        EdgeId rival_to_target{};
+        LabelId const open_labels[] = {kOpenEdgeLabel};
+        expect(wide_link(graph, shared->guid(), target->guid(),
+                         kimix::span<const LabelId>{open_labels, 1}, shared_to_target))
+            << "the duplicated neighbour reaches the target";
+        expect(wide_link(graph, rival->guid(), target->guid(),
+                         kimix::span<const LabelId>{open_labels, 1}, rival_to_target))
+            << "the rival reaches the target as well, so discovery order decides";
+        EdgeId first_of_pair{};
+        EdgeId second_of_pair{};
+        EdgeId start_to_rival{};
+        size_t made = 0;
+        for (size_t i = 0; i < kWideVisitLinks; ++i) {
+            if (i == kWideVisitPairAt) {
+                if (wide_link(graph, start->guid(), shared->guid(),
+                              kimix::span<const LabelId>{open_labels, 1}, first_of_pair)) {
+                    ++made;
+                }
+                continue;
+            }
+            if (i == kWideVisitPairAt + 1) {
+                // The duplicate: the same neighbour, later in the SAME chunk.
+                if (wide_link(graph, start->guid(), shared->guid(),
+                              kimix::span<const LabelId>{open_labels, 1}, second_of_pair)) {
+                    ++made;
+                }
+                continue;
+            }
+            if (i == kWideVisitPairAt + 2) {
+                if (wide_link(graph, start->guid(), rival->guid(),
+                              kimix::span<const LabelId>{open_labels, 1}, start_to_rival)) {
+                    ++made;
+                }
+                continue;
+            }
+            Vertex *decoy = graph.create_vertex();
+            LabelId const decoy_labels[] = {kDecoyEdgeLabel};
+            EdgeId unused{};
+            if (wide_link(graph, start->guid(), decoy->guid(),
+                          kimix::span<const LabelId>{decoy_labels, 1}, unused)) {
+                ++made;
+            }
+        }
+        expect(eq(made, kWideVisitLinks)) << "the duplicate-neighbour fixture built every link";
+        expect(first_of_pair != second_of_pair)
+            << "the duplicate neighbour is reached by two distinct edges";
+        Constraint const open_only =
+            Constraint{}.with(ConstraintCondition::on_label(kOpenEdgeLabel, GdiOp::equal));
+        kimix::vector<PathStep> path;
+        expect(eq(graph.shortest_path(start->guid(), target->guid(), open_only,
+                                      EdgeOrientation::outgoing, 4, path),
+                  GdiStatus::ok));
+        expect(eq(path.size(), size_t{3}))
+            << "start -> the duplicated neighbour -> target: three steps, not four";
+        if (path.size() == 3) {
+            expect(path[1].vertex == shared->guid())
+                << "the first of the two duplicate links discovered the neighbour";
+            expect(path[1].edge == first_of_pair)
+                << "and that first link is the hop the path reports";
+            expect(path[2].vertex == target->guid());
+            expect(path[2].edge == shared_to_target)
+                << "the target is reached from the duplicated neighbour, not from the rival";
+        }
+        expect_path_is_sound(graph, path, open_only, EdgeOrientation::outgoing, start->guid(),
+                             target->guid(), "every hop of the duplicate-neighbour path is real");
+        // The same answer as the brute force, which dedups by construction and keeps
+        // the first matching link of a neighbour.
+        expect_same_path(path,
+                         ref_filtered_path(graph, start->guid(), target->guid(), open_only,
+                                           EdgeOrientation::outgoing, 4),
+                         "the duplicate neighbour collapses exactly like the reference");
+        expect(graph.has_path(start->guid(), target->guid(), open_only,
+                              EdgeOrientation::outgoing))
+            << "reachability agrees with the path form on the same fixture";
+        // A second shape of the same duplicate, this time with the duplicated
+        // neighbour leading NOWHERE: the answer must then come from the rival, so a
+        // duplicate the drain re-enqueued can no longer be hidden behind an early hit
+        // — which is what makes the visit count below a proof rather than a guess.
+        Graph nowhere;
+        Vertex *n_start = nowhere.create_vertex();
+        Vertex *n_shared = nowhere.create_vertex();
+        Vertex *n_rival = nowhere.create_vertex();
+        Vertex *n_target = nowhere.create_vertex();
+        EdgeId n_rival_to_target{};
+        expect(wide_link(nowhere, n_rival->guid(), n_target->guid(),
+                         kimix::span<const LabelId>{open_labels, 1}, n_rival_to_target))
+            << "the rival reaches the target in the second fixture too";
+        EdgeId n_first_of_pair{};
+        EdgeId n_second_of_pair{};
+        EdgeId n_start_to_rival{};
+        size_t n_made = 0;
+        for (size_t i = 0; i < kWideVisitLinks; ++i) {
+            if (i == kWideVisitPairAt) {
+                if (wide_link(nowhere, n_start->guid(), n_shared->guid(),
+                              kimix::span<const LabelId>{open_labels, 1}, n_first_of_pair)) {
+                    ++n_made;
+                }
+                continue;
+            }
+            if (i == kWideVisitPairAt + 1) {
+                if (wide_link(nowhere, n_start->guid(), n_shared->guid(),
+                              kimix::span<const LabelId>{open_labels, 1}, n_second_of_pair)) {
+                    ++n_made;
+                }
+                continue;
+            }
+            if (i == kWideVisitPairAt + 2) {
+                if (wide_link(nowhere, n_start->guid(), n_rival->guid(),
+                              kimix::span<const LabelId>{open_labels, 1}, n_start_to_rival)) {
+                    ++n_made;
+                }
+                continue;
+            }
+            Vertex *decoy = nowhere.create_vertex();
+            LabelId const decoy_labels[] = {kDecoyEdgeLabel};
+            EdgeId unused{};
+            if (wide_link(nowhere, n_start->guid(), decoy->guid(),
+                          kimix::span<const LabelId>{decoy_labels, 1}, unused)) {
+                ++n_made;
+            }
+        }
+        expect(eq(n_made, kWideVisitLinks)) << "the nowhere fixture built every link";
+        kimix::vector<PathStep> nowhere_path;
+        expect(eq(nowhere.shortest_path(n_start->guid(), n_target->guid(), open_only,
+                                        EdgeOrientation::outgoing, 4, nowhere_path),
+                  GdiStatus::ok));
+        expect(eq(nowhere_path.size(), size_t{3}))
+            << "start -> the rival -> target: the duplicated neighbour leads nowhere";
+        if (nowhere_path.size() == 3) {
+            expect(nowhere_path[1].vertex == n_rival->guid())
+                << "the rival carries the hop because the duplicated neighbour cannot";
+            expect(nowhere_path[1].edge == n_start_to_rival);
+            expect(nowhere_path[2].edge == n_rival_to_target);
+        }
+#if defined(KIMIX_GRAPH_DB_WALK_COUNTERS)
+        // The consume-time visited check, made OBSERVABLE (only ever compiled in the
+        // instrumented build; the answers above are configuration-independent).
+        // In the FIRST fixture both candidates reach the target, so a duplicate the
+        // drain re-enqueued would add a node the early hit then skips — invisible. In
+        // the `nowhere` shape the duplicated neighbour leads nowhere, so every
+        // duplicate enqueued costs one extra VERTEX SNAPSHOT at the next level:
+        // exactly three visits (the start, the duplicated neighbour, the rival) prove
+        // the duplicate was dropped where it is consumed, and a missing check reads 4.
+        graph_db::reset_walk_counters();
+        kimix::vector<PathStep> counted;
+        expect(eq(nowhere.shortest_path(n_start->guid(), n_target->guid(), open_only,
+                                        EdgeOrientation::outgoing, 4, counted),
+                  GdiStatus::ok));
+        expect(eq(graph_db::walk_counters().vertex_locks, uint64_t{3}))
+            << "the duplicated neighbour was visited once: start, it, and the rival";
+#endif
+    };
+
+    // -----------------------------------------------------------------------
+    // The O6 split (E3): has_path is the REACHABILITY mode of the same walk, so its
+    // bool must equal "the path walk found something" at the same bound. E3 left
+    // that equivalence guarded only by hand-written cases; these seeded draws cover
+    // endpoint x constraint x orientation, and compare both forms against the brute
+    // force as well.
+    // -----------------------------------------------------------------------
+    "edge_filtered_has_path_agrees_with_the_path_walk"_test = [] {
+        Graph graph;
+        auto vertices = gtest::build_layered_dag(graph, 120, 9091u);
+        // Label by POSITION (not by edge_ids() order, which is a hash order): the
+        // same scheme the layered path test uses, so the filters select a stable
+        // subset and the fixture is reproducible.
+        kimix::unordered_map<kimix::Guid, size_t> rank;
+        rank.reserve(vertices.size());
+        for (size_t i = 0; i < vertices.size(); ++i) {
+            rank.emplace(vertices[i]->guid(), i);
+        }
+        for (auto const &id : graph.edge_ids()) {
+            EdgeRecord record;
+            expect(graph.edge_record(id, record));
+            bool const blocked =
+                ((rank.find(record.origin)->second + rank.find(record.target)->second) % 3u) ==
+                0u;
+            expect(eq(graph.edge_add_label(id, blocked ? kBlockedEdgeLabel : kOpenEdgeLabel),
+                      GdiStatus::ok));
+            expect(eq(graph.edge_put_property(id, kCostName,
+                                              PropertyValue::make_double(blocked ? 9.0 : 1.0)),
+                      GdiStatus::ok));
+        }
+        kimix::vector<Constraint> constraints;
+        constraints.push_back(Constraint{}); // no filter: every edge
+        constraints.push_back(
+            Constraint{}.with(ConstraintCondition::on_label(kOpenEdgeLabel, GdiOp::equal)));
+        constraints.push_back(
+            Constraint{}.with(ConstraintCondition::on_label(kBlockedEdgeLabel, GdiOp::equal)));
+        constraints.push_back(Constraint{}.with(ConstraintCondition::on_property(
+            kCostName, GdiOp::less, PropertyValue::make_double(5.0))));
+        std::mt19937 rng(4711u);
+        size_t reachable_count = 0;
+        size_t unreachable_count = 0;
+        size_t bounded_count = 0;
+        for (int round = 0; round < 120; ++round) {
+            kimix::Guid const from = vertices[rng() % vertices.size()]->guid();
+            kimix::Guid const to = vertices[rng() % vertices.size()]->guid();
+            Constraint const &constraint = constraints[rng() % constraints.size()];
+            EdgeOrientation const orientation = static_cast<EdgeOrientation>(rng() % 3u);
+            bool const reachable = graph.has_path(from, to, constraint, orientation);
+            RefPath const at_the_bound =
+                ref_filtered_path(graph, from, to, constraint, orientation,
+                                  Graph::kMaxNativeHopDepth);
+            expect(eq(reachable, !at_the_bound.vertices.empty()))
+                << "has_path agrees with the brute force at the reachability bound";
+            kimix::vector<PathStep> full;
+            expect(eq(graph.shortest_path(from, to, constraint, orientation,
+                                          Graph::kMaxNativeHopDepth, full),
+                      GdiStatus::ok));
+            expect(eq(reachable, !full.empty()))
+                << "has_path == !shortest_path(..., path).empty() at the same bound";
+            expect_same_path(full, at_the_bound,
+                             "the full-bound path matches the brute force");
+            // A tighter bound can only REMOVE paths: a non-empty one still implies
+            // reachability, and the tighter answer matches its own reference.
+            uint32_t const depth = 1 + static_cast<uint32_t>(rng() % 6);
+            kimix::vector<PathStep> tight;
+            expect(eq(graph.shortest_path(from, to, constraint, orientation, depth, tight),
+                      GdiStatus::ok));
+            expect_same_path(tight,
+                             ref_filtered_path(graph, from, to, constraint, orientation, depth),
+                             "the tighter bound's path matches the brute force");
+            if (!tight.empty()) {
+                expect(reachable) << "a path inside the tighter bound proves reachability";
+                ++bounded_count;
+            }
+            if (reachable) {
+                ++reachable_count;
+            } else {
+                ++unreachable_count;
+            }
+        }
+        expect(gt(reachable_count, size_t{0})) << "the draws produced reachable pairs";
+        expect(gt(unreachable_count, size_t{0})) << "the draws produced unreachable pairs";
+        expect(gt(bounded_count, size_t{0})) << "the draws produced paths inside the tighter bound";
     };
 
     // Database facade: the edge filter is a registered constraint like every

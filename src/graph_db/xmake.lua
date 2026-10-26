@@ -72,6 +72,15 @@ target("kimix-graph-db")
     -- Static linkage of this library's own symbols: KIMIX_GRAPH_DB_API
     -- expands to nothing (src/graph_db/graph_db_api.h).
     add_defines("KIMIX_GRAPH_DB_STATIC", { public = true })
+      -- Optional walk instrumentation (root xmake.lua option
+      -- graph_db_walk_counters, optimize_plan.md §3.2). PUBLIC, so the
+      -- benchmark that reads the counters — and only it — compiles against the
+      -- same record as the library. OFF by default: the structure, the accessor
+      -- and every increment in graph.cpp are inside #if, so a default build has
+      -- no counter in any timing path.
+      if has_config("graph_db_walk_counters") then
+          add_defines("KIMIX_GRAPH_DB_WALK_COUNTERS", { public = true })
+      end
     on_load(function(target)
         -- KIMIX_GRAPH_DB_VERSION comes from version.txt, the single source of
         -- truth for the project version (same file src/xmake.lua turns into

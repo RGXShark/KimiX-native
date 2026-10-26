@@ -753,6 +753,15 @@ end)
 test_proj("test_graph_db_bench", "unit/graph_db/test_graph_db_bench.cpp", function()
     add_deps("kimix-graph-db")
 end)
+-- Edge-filtered traversal benchmark (README §5h / optimize_plan.md phase E0): the EDGE
+-- half of the §5.10 filter. Split from test_graph_db_bench because that suite's fixture
+-- is shared but its serialization rows take minutes; this one must iterate in seconds.
+-- Gated on KIMIX_GRAPH_DB_BENCH like the other benches (a plain xmake test runs nothing),
+-- and it prints [ctr] rows only when the root option graph_db_walk_counters is on
+-- (KIMIX_GRAPH_DB_WALK_COUNTERS arrives through kimix-graph-db's public define).
+test_proj("test_graph_db_bench_edges", "unit/graph_db/test_graph_db_bench_edges.cpp", function()
+    add_deps("kimix-graph-db")
+end)
 -- GDI alignment (src/graph_db/reports/gdi_alignment.md): one suite per phase.
 -- status pins every GdiStatus numeric value and the capability advertisement;
 -- migrate covers the meta envelope and the v1 -> v2 store migration.

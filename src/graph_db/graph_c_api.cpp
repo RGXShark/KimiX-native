@@ -56,6 +56,19 @@ struct kimix_gdb_session {
     // The catalog name this session registered under ("" = anonymous; plan v3
     // step 3.7).  Copied at open; close() releases the catalog entry.
     kimix::string graph_name;
+    // Plan O12: the edge-filtered shortest path's staging buffer, ONE per session.
+    // kimix_gdb_shortest_path_edges used to build a fresh kimix::vector<PathStep>
+    // per call and then copy it into the caller's array, so the two-phase protocol
+    // (a count-only probe, then a fill) paid that allocation twice per path. The
+    // walk fills `out` in place and keeps its capacity (plan O8), so keeping the
+    // buffer here means the probe leaves it ready and the fill reuses it: from the
+    // second call on, neither phase allocates for the path at all.
+    // Session-local by the same rule as the constraint table above — the ABI's
+    // threading contract is one session per worker, single-threaded per session
+    // (graph_c_api.h, contract point 5), so no other thread can observe it
+    // mid-call. Purely internal: the struct is opaque, so this adds nothing to the
+    // ABI (KIMIX_GDB_ABI_VERSION is unchanged).
+    kimix::vector<kimix::graph_db::Graph::PathStep> path_staging;
 };
 
 namespace {
@@ -293,16 +306,28 @@ ConstraintSlot *find_slot(kimix_gdb_session *session, uint32_t id) {
     return nullptr;
 }
 
-GdiStatus resolve_constraint(kimix_gdb_session *session, uint32_t id, Constraint &out) {
-    out = Constraint{};
+GdiStatus resolve_constraint(kimix_gdb_session *session, uint32_t id, Constraint const *&out) {
+    // Plan O9: hand back the SESSION's definition BY REFERENCE instead of copying
+    // it into a per-call Constraint. A handle was resolved once, at
+    // kimix_gdb_constraint_create, so the ABI path has no constraint work left to
+    // do and no longer allocates for it — which used to be paid on top of the walk
+    // it feeds, twice per two-phase read. The rules are unchanged: id 0 is "no
+    // constraint" (match everything), an unknown id is error_constraint, and `out`
+    // is written only on success. The slot lives in the session's table and is not
+    // mutated between this call and the end of the command (create/free only touch
+    // it inside their own calls), so the pointer stays valid for the call; a C ABI
+    // session is single-threaded by contract (graph_c_api.h, threading), so no
+    // other thread can invalidate it either.
+    static Constraint const kEmptyConstraint{};
     if (id == 0) {
-        return GdiStatus::ok; // an id of 0 means "no constraint": match everything
+        out = &kEmptyConstraint; // an id of 0 means "no constraint": match everything
+        return GdiStatus::ok;
     }
     ConstraintSlot *slot = find_slot(session, id);
     if (slot == nullptr) {
         return GdiStatus::error_constraint;
     }
-    out = slot->definition;
+    out = &slot->definition;
     return GdiStatus::ok;
 }
 
@@ -1153,7 +1178,7 @@ int32_t kimix_gdb_edges_of_vertex(kimix_gdb_session *session, kimix_gdb_guid ver
     if (session == nullptr) {
         return KIMIX_GDB_ERR_ARGUMENT;
     }
-    Constraint resolved;
+    Constraint const *resolved = nullptr;
     GdiStatus status = resolve_constraint(session, constraint, resolved);
     if (is_error(status)) {
         return code_of(status);
@@ -1167,7 +1192,7 @@ int32_t kimix_gdb_edges_of_vertex(kimix_gdb_session *session, kimix_gdb_guid ver
     // Phase 1 (items == NULL) always asks for the count, so the caller learns the
     // size even when it passed no cap.
     int64_t const effective_cap = items == nullptr ? 0 : cap;
-    status = session->database.get_edges_of_vertex(to_guid(vertex), resolved, direction,
+    status = session->database.get_edges_of_vertex(to_guid(vertex), *resolved, direction,
                                                   effective_cap, page);
     if (is_error(status)) {
         return code_of(status);
@@ -1202,7 +1227,7 @@ int32_t kimix_gdb_neighbors_of_vertex(kimix_gdb_session *session, kimix_gdb_guid
     if (session == nullptr) {
         return KIMIX_GDB_ERR_ARGUMENT;
     }
-    Constraint resolved;
+    Constraint const *resolved = nullptr;
     GdiStatus status = resolve_constraint(session, constraint, resolved);
     if (is_error(status)) {
         return code_of(status);
@@ -1214,7 +1239,7 @@ int32_t kimix_gdb_neighbors_of_vertex(kimix_gdb_session *session, kimix_gdb_guid
                                           : EdgeOrientation::both;
     kimix::graph_db::VertexPage page;
     int64_t const effective_cap = items == nullptr ? 0 : cap;
-    status = session->database.get_neighbor_vertices(to_guid(vertex), resolved, direction,
+    status = session->database.get_neighbor_vertices(to_guid(vertex), *resolved, direction,
                                                     effective_cap, page);
     if (is_error(status)) {
         return code_of(status);
@@ -1242,7 +1267,7 @@ int32_t kimix_gdb_count_neighbors(kimix_gdb_session *session, kimix_gdb_guid ver
     if (session == nullptr || out_count == nullptr) {
         return KIMIX_GDB_ERR_ARGUMENT;
     }
-    Constraint resolved;
+    Constraint const *resolved = nullptr;
     GdiStatus status = resolve_constraint(session, constraint, resolved);
     if (is_error(status)) {
         return code_of(status);
@@ -1253,7 +1278,7 @@ int32_t kimix_gdb_count_neighbors(kimix_gdb_session *session, kimix_gdb_guid ver
                                           ? EdgeOrientation::incoming
                                           : EdgeOrientation::both;
     return code_of(
-        session->database.count_neighbors(to_guid(vertex), resolved, direction, *out_count));
+        session->database.count_neighbors(to_guid(vertex), *resolved, direction, *out_count));
 }
 
 int32_t kimix_gdb_exists_neighbor(kimix_gdb_session *session, kimix_gdb_guid vertex,
@@ -1262,7 +1287,7 @@ int32_t kimix_gdb_exists_neighbor(kimix_gdb_session *session, kimix_gdb_guid ver
     if (session == nullptr || out_exists == nullptr) {
         return KIMIX_GDB_ERR_ARGUMENT;
     }
-    Constraint resolved;
+    Constraint const *resolved = nullptr;
     GdiStatus status = resolve_constraint(session, constraint, resolved);
     if (is_error(status)) {
         return code_of(status);
@@ -1273,7 +1298,7 @@ int32_t kimix_gdb_exists_neighbor(kimix_gdb_session *session, kimix_gdb_guid ver
                                           ? EdgeOrientation::incoming
                                           : EdgeOrientation::both;
     bool exists = false;
-    status = session->database.exists_neighbor(to_guid(vertex), resolved, direction, exists);
+    status = session->database.exists_neighbor(to_guid(vertex), *resolved, direction, exists);
     if (is_error(status)) {
         return code_of(status);
     }
@@ -1292,7 +1317,7 @@ int32_t kimix_gdb_traverse_bfs(kimix_gdb_session *session, kimix_gdb_guid start,
         max_depth > kimix::graph_db::Graph::kMaxNativeHopDepth) {
         return KIMIX_GDB_ERR_ARGUMENT;
     }
-    kimix::graph_db::Constraint resolved;
+    kimix::graph_db::Constraint const *resolved = nullptr;
     GdiStatus status = resolve_constraint(session, constraint, resolved);
     if (is_error(status)) {
         return code_of(status);
@@ -1303,7 +1328,7 @@ int32_t kimix_gdb_traverse_bfs(kimix_gdb_session *session, kimix_gdb_guid start,
                                           ? EdgeOrientation::incoming
                                           : EdgeOrientation::both;
     kimix::vector<kimix::graph_db::Graph::TraversalVertex> walk;
-    status = session->database.traverse_bfs(to_guid(start), resolved, direction, cap_per_level,
+    status = session->database.traverse_bfs(to_guid(start), *resolved, direction, cap_per_level,
                                             max_depth, walk);
     if (is_error(status)) {
         return code_of(status);
@@ -1363,7 +1388,7 @@ int32_t kimix_gdb_shortest_path_edges(kimix_gdb_session *session, kimix_gdb_guid
     if (max_depth < 1 || max_depth > kimix::graph_db::Graph::kMaxNativeHopDepth) {
         return KIMIX_GDB_ERR_ARGUMENT;
     }
-    Constraint resolved;
+    Constraint const *resolved = nullptr;
     GdiStatus status = resolve_constraint(session, edge_constraint, resolved);
     if (is_error(status)) {
         return code_of(status);
@@ -1373,8 +1398,13 @@ int32_t kimix_gdb_shortest_path_edges(kimix_gdb_session *session, kimix_gdb_guid
                                       : orientation == KIMIX_GDB_ORIENTATION_INCOMING
                                           ? EdgeOrientation::incoming
                                           : EdgeOrientation::both;
-    kimix::vector<kimix::graph_db::Graph::PathStep> path;
-    status = session->database.shortest_path(to_guid(from), to_guid(to), resolved, direction,
+    // Plan O12: fill the SESSION's staging buffer, not a fresh local vector — the
+    // count-only phase and the fill phase then share one buffer whose capacity
+    // survives between calls (the walk fills it in place, plan O8). `path` is only
+    // read below, and the walk clears it first (Database::shortest_path), so a
+    // stale path from the previous call can never leak into this one.
+    kimix::vector<kimix::graph_db::Graph::PathStep> &path = session->path_staging;
+    status = session->database.shortest_path(to_guid(from), to_guid(to), *resolved, direction,
                                              max_depth, path);
     if (is_error(status)) {
         return code_of(status);
@@ -1401,14 +1431,14 @@ int32_t kimix_gdb_scan_vertices(kimix_gdb_session *session, uint32_t constraint,
     if (session == nullptr) {
         return KIMIX_GDB_ERR_ARGUMENT;
     }
-    Constraint resolved;
+    Constraint const *resolved = nullptr;
     GdiStatus status = resolve_constraint(session, constraint, resolved);
     if (is_error(status)) {
         return code_of(status);
     }
     kimix::graph_db::VertexPage page;
     int64_t const effective_cap = items == nullptr ? 0 : cap;
-    status = session->database.scan_vertices(resolved, effective_cap, page);
+    status = session->database.scan_vertices(*resolved, effective_cap, page);
     if (is_error(status)) {
         return code_of(status);
     }
@@ -1436,13 +1466,13 @@ int32_t kimix_gdb_aggregate(kimix_gdb_session *session, uint32_t constraint, uin
     if (session == nullptr || out == nullptr) {
         return KIMIX_GDB_ERR_ARGUMENT;
     }
-    Constraint resolved;
+    Constraint const *resolved = nullptr;
     GdiStatus status = resolve_constraint(session, constraint, resolved);
     if (is_error(status)) {
         return code_of(status);
     }
     AggregateSpec spec;
-    spec.constraint = resolved;
+    spec.constraint = *resolved; // AggregateSpec holds the constraint by value
     spec.property = PropNameId{property};
     spec.function = static_cast<GdiAggregate>(function);
     AggregateResult result;

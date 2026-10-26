@@ -66,6 +66,19 @@
  *      relaxed atomic. roots() takes _roots_mutex and then one shard shared lock
  *      at a time while recomputing, so it can never be part of a shard-level
  *      cycle — no path takes _roots_mutex while holding a shard lock.
+ *   4. EDGE shards (level 3, EdgeTable) are the one other level a READ takes: the
+ *      EDGE-filtered walk tests ONE VISIT's candidate edges in a BATCH, which takes
+ *      one edge-shard SHARED lock per TOUCHED shard in ASCENDING index — and only
+ *      after that visit's vertex-shard (level 1) lock has been released. The batch
+ *      never runs while a vertex is being visited, so it holds no vertex-shard
+ *      lock: a level 1 -> level 3 acquisition is not a violation, it is the
+ *      direction the hierarchy and the ascending shard numbering already permit
+ *      (the structural write paths take it too — _create_edge_locked and
+ *      _move_edge_endpoint in graph.cpp). What keeps the wait-for graph acyclic is
+ *      the ABSENCE of the inverse, level 3 -> level 1: no edge-shard lock is ever
+ *      held while a vertex-shard lock is acquired. Within level 3 the batch obeys
+ *      the same ascending rule. See the multi-hop API block below for the walk's
+ *      shape.
  *
  * DEADLOCK FREEDOM (the written-down argument)
  *   Every acquisition respects the hierarchy "shard level, then vertex level",
@@ -104,6 +117,24 @@
  *         therefore reads live memory (its guid, its content); a reader that
  *         visits it afterwards simply does not find it. No path dereferences a
  *         freed Vertex.
+ *     (d) the ONE exception to "per visit" is the EDGE-filtered walk's edge
+ *         TESTS: read atomicity is PER VISIT BATCH for edge tests (see the
+ *         multi-hop API block below). That walk still copies one visited vertex's
+ *         link list under one shard lock and releases it before the next visit —
+ *         its vertex reads are per visit — but the candidate edges that ONE visit
+ *         produced may be tested together, one edge-shard SHARED lock per touched
+ *         shard, after that visit's vertex-shard lock is gone. A writer observed
+ *         between the visit and its batch is the same anomaly as one observed
+ *         between two visits: the batch changes WHEN an edge of that visit is
+ *         tested and which state the test sees. In a structurally quiescent graph
+ *         it never changes which vertices the walk discovers; in a graph that is
+ *         NOT quiescent it can, because a wide visit's tests span the per-link head
+ *         plus up to seven drains (64 + 256 + 1 024 x 4 + 520 on the 5 000-link
+ *         hub), so a writer change landing between two drains can flip a verdict
+ *         and with it a discovery. That is the SAME anomaly class as the
+ *         inter-visit skew above — the batch introduces no new one — and neither
+ *         memory safety nor determinism in a structurally quiescent graph is
+ *         affected by it.
  *   Verified by a 8-reader / 1-writer stress harness (create + connect + cascade
  *   remove, 80k removals, readers resolving and reading vertices mid-removal):
  *   zero invariant violations, zero dangling edges, and a post-run sweep found
@@ -548,6 +579,135 @@ private:
     kimix::vector<kimix::Guid> _heap; // only for a vertex exceeding kInlineCapacity
 };
 
+// Candidates one batched edge-filter DRAIN stages at a time. The batch may be handed
+// a whole visit's link list (a hub's is thousands of links) and drains it in chunks
+// of this size, so the scratch it needs stays at "order 4 B + match 1 B per
+// candidate" (~5 KB) however wide the visit is. 1024 is the documented default from
+// the measured batching curve (6.65x at 1024 candidates, 8.39x at 4096): the curve
+// has flattened, so 4x less staging is worth the last 20 % — a deliberate
+// peak-for-time trade, recorded in README §5h.
+inline constexpr size_t kEdgeFilterChunk = 1024;
+
+/*
+ * Reusable scratch for the batched edge filter (Graph::_filter_edges_batched — the
+ * filtered walk's level-3 phase). One per walk, passed in and reused across every
+ * drain of every level, so a walk whose drains fit the inline budget allocates
+ * nothing for it:
+ *
+ *   kimix::graph_db::EdgeFilterScratch scratch;   // a stack local of the walk
+ *
+ * A drain counting-sorts its candidates by EdgeTable::shard_of() in ONE pass that
+ * also records the TOUCHED shards (it never scans all 64, which is what makes the
+ * batch a win even at a handful of candidates), prefixes over that touched list
+ * only, and then takes ONE edge-shard SHARED lock per touched shard in ascending
+ * index. `_order` holds one candidate index (4 B) per candidate of the drain; the
+ * first kInlineCapacity live in the object itself, a wider drain falls back to a
+ * heap vector whose capacity is retained for the rest of the walk.
+ *
+ * Level-3 scratch only: it carries no vertex-shard state and gives the caller no
+ * way to hold an edge-shard lock across a visit.
+ */
+class KIMIX_GRAPH_DB_API EdgeFilterScratch {
+public:
+    // Candidate indices staged inline (256 B). A drain of a normal level fits; the
+    // hub fixtures (degree 5 000) grow the heap array once per walk.
+    static constexpr size_t kInlineCapacity = 64;
+    EdgeFilterScratch() noexcept = default;
+    EdgeFilterScratch(EdgeFilterScratch const &) = delete;
+    EdgeFilterScratch &operator=(EdgeFilterScratch const &) = delete;
+    EdgeFilterScratch(EdgeFilterScratch &&) = delete;
+    EdgeFilterScratch &operator=(EdgeFilterScratch &&) = delete;
+    ~EdgeFilterScratch() noexcept = default;
+
+    // How many candidate indices the order array can hold without reallocating.
+    [[nodiscard]] size_t order_capacity() const noexcept { return _capacity; }
+
+private:
+    friend class Graph;
+    // The order array for a drain of `count` candidates, growing on demand. The
+    // heap array keeps its capacity, so only the first wide drain of a walk pays.
+    [[nodiscard]] uint32_t *_order_for(size_t count) {
+        if (count > _capacity) {
+            _order_heap.resize(count);
+            _order = _order_heap.data();
+            _capacity = _order_heap.size();
+        }
+        return _order;
+    }
+    uint32_t _order_inline[kInlineCapacity]{};
+    uint32_t *_order{_order_inline};
+    size_t _capacity{kInlineCapacity};
+    kimix::vector<uint32_t> _order_heap; // only for a drain wider than kInlineCapacity
+    // Per-drain bookkeeping, all indexed by shard and touched only for the shards
+    // the drain actually touches: the per-shard counts, each bucket's first slot,
+    // each bucket's next free slot, and the touched list itself (kept in ascending
+    // index, which is the contract's lock order).
+    uint32_t _count[kEdgeShardCount]{};
+    uint32_t _begin[kEdgeShardCount]{};
+    uint32_t _cursor[kEdgeShardCount]{};
+    uint32_t _touched[kEdgeShardCount]{};
+    uint32_t _touched_count{0};
+};
+
+// --- optional walk instrumentation (measurement scaffolding, not API) --------
+// The EDGE-filtered walk's cost is dominated by two things a wall clock cannot
+// attribute: how many vertices it locked, and how many candidate links it pushed
+// through the edge filter. This is the counter record that attributes them — the
+// input of tests/unit/graph_db/test_graph_db_bench_edges.cpp's [ctr] rows.
+//
+// OFF BY DEFAULT and compiled out ENTIRELY: the structure, the accessor and every
+// increment live behind KIMIX_GRAPH_DB_WALK_COUNTERS (xmake option
+// `graph_db_walk_counters`), so a default build carries no counter, no
+// thread_local access and no hot-path cost at all — the [bench] numbers of a
+// default build are the record, and the [ctr] numbers exist only in an
+// instrumented build. Nothing here changes a result, a lock order or a return
+// value; a walk that early-returns (error_argument / error_op / error_vertex /
+// zero-length path) leaves the record untouched, which is itself an assertion the
+// benchmark makes.
+//
+// Thread-local, so the CALLING thread reads right after its own call: reset with
+// reset_walk_counters(), call the walk, read walk_counters(). Several threads may
+// each hold their own record; the library never merges them.
+#if defined(KIMIX_GRAPH_DB_WALK_COUNTERS)
+struct KIMIX_GRAPH_DB_API WalkCounters {
+    // One oriented_links snapshot per VISITED vertex (the level-1 shard lock).
+    uint64_t vertex_locks{0};
+    // Edge-shard SHARED lock acquisitions on the level-3 paths: one per
+    // edge_matches() call, and — in the filtered walk's BATCH — one per TOUCHED
+    // shard per drain, i.e. fewer than one per candidate. This is the counter that
+    // proves the batching: edge_locks <= edge_tests, and after the batch
+    // edge_locks <= touched shards per drain <= 64 per drain.
+    uint64_t edge_locks{0};
+    // Candidate EDGES actually pushed through the filter, i.e. one matches_probe
+    // evaluation each — NOT every iterated link. The two paths differ here, by
+    // design: the PER-LINK path gates the filter behind the visited check (O1), so its
+    // edge_tests is a strict subset of the links it iterated (that denominator is
+    // visited_checks below); a drained CHUNK stages and probes EVERY one of its
+    // candidates and only then runs the visited check at consume time, so a candidate
+    // whose neighbour an earlier candidate of the same chunk discovered is still
+    // probed — one probe the per-link path would have skipped. That is why [ctr] must
+    // be read per row, and why kEdgeFilterMinLinks keeps the common path off the batch.
+    uint64_t edge_tests{0};
+    // Links copied out of the vertices' adjacencies (the snapshot volume).
+    uint64_t links_snapshotted{0};
+    // Visited-set probes, ONE PER ITERATED LINK: this is the "candidates" of the
+    // cost model (it equals the pre-O1 `candidates` count on every row). The batch's
+    // re-check of a matching hop at consume time is internal bookkeeping and is not
+    // counted again, so the denominator stays comparable across the epochs.
+    uint64_t visited_checks{0};
+    // Bitmask of the edge shards whose lock was taken at least once — its
+    // popcount is the "shards" of the model, the denominator of any batching
+    // efficiency claim.
+    uint64_t edge_shards{0};
+};
+// The calling thread's record. The library never clears it: the caller resets
+// before the call it wants to attribute.
+[[nodiscard]] KIMIX_GRAPH_DB_API WalkCounters &walk_counters() noexcept;
+inline void reset_walk_counters() noexcept { walk_counters() = WalkCounters{}; }
+static_assert(kEdgeShardCount <= 64,
+              "WalkCounters::edge_shards is a uint64_t bitmask of the edge shards");
+#endif // KIMIX_GRAPH_DB_WALK_COUNTERS
+
 class KIMIX_GRAPH_DB_API Graph : public kimix::IOperatorNewBase {
 public:
     Graph() noexcept = default;
@@ -945,7 +1105,9 @@ public:
     // {from} when from == to and `from` exists. An UNKNOWN endpoint is
     // error_vertex (the unbounded shortest_path above returns {} there; the
     // GDI entry point must not silently invent an empty answer for a bad uid).
-    // Same BFS shape and read-atomicity contract as the unbounded form.
+    // Same BFS shape and read-atomicity contract as the unbounded form, and `out`
+    // is a REUSABLE buffer here too: it is cleared and refilled, so its capacity
+    // survives the call.
     //
     //   error_argument   max_depth < 1 or > kMaxNativeHopDepth
     //   error_vertex     `from` or `to` is unknown
@@ -969,24 +1131,43 @@ public:
     // relations point at me", which the outgoing-only forms cannot), so the
     // orientation is a parameter here and not a fixed outgoing read.
     //
-    // READ ATOMICITY: the same per-visit contract as every traversal above — one
-    // vertex shard SHARED lock copies the oriented LINK list, then the candidate
-    // edges are tested one at a time (one edge-shard SHARED lock each, no lock
-    // held between visits), so a concurrent structural writer may be observed on
-    // one visit and not the next while memory safety holds by the header's
-    // cascade argument. A link whose edge or neighbour vanished between the
-    // snapshot and the test simply is not a hop.
+    // READ ATOMICITY: PER VISIT BATCH for edge tests, per visit for everything else.
+    // One vertex shard SHARED lock still copies one visited vertex's oriented LINK
+    // list and is released before the next visit, so no vertex-shard lock is ever
+    // held between visits; the candidate edges that ONE visit produced may then be
+    // tested together — one edge-shard SHARED lock per TOUCHED shard, ascending
+    // index, taken only after that visit's vertex-shard lock has been released
+    // (Graph::_filter_edges_batched). A concurrent structural writer may therefore
+    // be observed on one visit and not the next, and an edge of a visit may be
+    // tested against a state a later visit would not have seen; memory safety holds
+    // by the header's cascade argument either way, because the edge record stays
+    // under its own shard's lock for the whole test. A link whose edge or neighbour
+    // vanished between the snapshot and the test simply is not a hop; which
+    // vertices the walk discovers, in which order, is unaffected — the batch filters
+    // out of order but consumes in ORIGINAL link order.
+    //
+    // Which of the two paths a visit takes is a COST decision only, and both produce
+    // the same path, the same discovery order and the same PathStep::edge: a visit
+    // whose link list is shorter than kEdgeFilterMinLinks stays per-link, and a wider
+    // one keeps its first kEdgeFilterHeadLinks links per-link and drains only the TAIL
+    // in ESCALATING chunks (64 -> 256 -> kEdgeFilterChunk, then kEdgeFilterChunk), so
+    // the bound on what an early hit past the head can waste is the current drain, not
+    // the whole visit. The head is what preserves the early exit — a wide visit that
+    // finds its target among its first few links never reaches the batch at all.
     //
     // Parallel edges: the link list holds one entry per edge, and the first
     // matching one wins (the target vertex is discovered once — a BFS visits a
     // vertex once by definition); the reported PathStep::edge names WHICH of them
-    // carried the hop.
+    // carried the hop. The batch preserves that: candidates are filtered out of
+    // order but consumed in ORIGINAL link order.
     //
     // Does ONE edge's own payload satisfy `constraint`? ONE edge-shard SHARED lock
     // and a zero-copy probe (no labels/properties copy: a filtered walk tests a
     // candidate edge per link and must not deep-copy its payload). False when the
     // edge is unknown — a vanished edge is skipped, not an error, exactly like the
-    // read commands' post-collection resolution.
+    // read commands' post-collection resolution. This single-edge probe is public
+    // and unchanged; the walk's batched form (below) evaluates the SAME rule
+    // through the same _record_matches() code.
     [[nodiscard]] bool edge_matches(EdgeId const &edge, Constraint const &constraint) const;
 
     // The oriented LINK view of one vertex's adjacency: (edge uid, neighbour uid)
@@ -1005,6 +1186,13 @@ public:
     // existing vertex) is true without testing any edge: it traverses none.
     // Unknown endpoints are simply unreachable (false), the unbounded has_path
     // convention above.
+    // It runs the SAME walk as the bounded filtered shortest_path below, in the
+    // reachability mode of _filtered_walk (plan O6): same bound, same
+    // visited-check-then-filter ordering, same discovery order, same refusal rules —
+    // but the walk keeps only what a bool answer needs, so the per-node predecessor
+    // record (edge/parent/depth, 48 B) and the PathStep assembly do not exist for it
+    // (16 B per discovered node). The answer is therefore identical by construction,
+    // not by keeping two implementations in step.
     [[nodiscard]] bool has_path(kimix::Guid const &from, kimix::Guid const &to,
                                 Constraint const &edge_constraint,
                                 EdgeOrientation orientation) const;
@@ -1013,7 +1201,17 @@ public:
     // vertex of the path, endpoints INCLUDED and in order from `from`; the status
     // and result contract is exactly the vertex-only bounded form's — empty `out`
     // with ok means `to` is unreachable within `max_depth` over MATCHING edges,
-    // {from} when from == to on an existing vertex.
+    // {from} when from == to on an existing vertex. Like every bounded path form
+    // here, `out` is a REUSABLE buffer: it is resized in place and its CAPACITY
+    // survives the call, so a caller that hoists one vector across calls pays no
+    // allocation for a buffer that is already big enough (a warm call allocates
+    // nothing at all for a short walk).
+    //
+    // The walk itself is allocation-free up to a documented inline budget (64
+    // discovered nodes, a 64-wide level frontier, 16 links per visit, and a
+    // linear-scan visited bound of 64) and falls back to the heap on growth — a
+    // 5 000-degree hub or a 32-level walk allocates, a 1-8 hop filtered walk over a
+    // normal-degree graph does not.
     //
     //   error_argument   max_depth < 1 or > kMaxNativeHopDepth
     //   error_op         a label condition carries an ordering op (the
@@ -1199,6 +1397,72 @@ private:
     [[nodiscard]] bool _read_oriented_adjacency(kimix::Guid const &guid,
                                                 EdgeOrientation orientation,
                                                 AdjacencyBuffer &out) const noexcept;
+
+    // --- the EDGE-filtered walk's batch filter (plan O2) ---------------------
+    // Does an ALREADY-RESOLVED edge record's own payload satisfy `constraint`? The
+    // ONE evaluation of the §2.6 edge rule, shared by the public single-edge probe
+    // (edge_matches) and the batched filter, so the two cannot drift. The caller
+    // holds that edge's shard lock (level 3), which is what keeps the borrowed
+    // labels/properties valid for the probe — no payload copy.
+    [[nodiscard]] static bool _record_matches(Edge const &record,
+                                             Constraint const &constraint);
+
+    // The batched edge filter: `match_out[i] = 1` iff edges[i]'s own payload
+    // satisfies `constraint`. ONE edge-shard SHARED lock per TOUCHED shard instead
+    // of one per candidate — the measured shape: one pass counting-sorts the
+    // candidates by EdgeTable::shard_of() and records the touched-shard list (never
+    // a scan of all 64), a prefix over that touched list only, then per touched
+    // shard in ASCENDING index one lock, `_find_locked` per candidate of that shard
+    // and `_record_matches`. `match_out` must be exactly as long as `edges`;
+    // `scratch` is caller-owned and reused across calls.
+    //
+    // LEVEL 3 ONLY. The caller must already have released the vertex-shard lock of
+    // the visit it staged (the filtered walk snapshots one vertex, then batches its
+    // candidates, then consumes them), and nothing here may take a vertex-shard
+    // lock: that is what keeps the hierarchy's "level 1 before level 3, never
+    // together" rule and its deadlock-freedom argument intact.
+    void _filter_edges_batched(kimix::span<const EdgeId> edges, Constraint const &constraint,
+                               kimix::span<uint8_t> match_out, EdgeFilterScratch &scratch) const;
+
+    // The filtered walk's LINK snapshot storage: the AdjacencyBuffer idiom applied
+    // to EdgeLink — kInlineCapacity links inline, a heap vector beyond (capacity
+    // retained for the rest of the walk), so a normal-degree visit allocates
+    // nothing. Defined in graph.cpp next to the walk that owns it; declared here
+    // because that walk's state is a plain stack local.
+    class LinkBuffer;
+    // Fill `out` with `guid`'s oriented LINK list (outgoing half first when
+    // orientation == both — the oriented_links() snapshot) from ONE vertex-shard
+    // SHARED lock, growing `out` only past LinkBuffer::kInlineCapacity. False when
+    // `guid` is unknown (a removed vertex is not a hop).
+    [[nodiscard]] bool _snapshot_links(kimix::Guid const &guid, EdgeOrientation orientation,
+                                       LinkBuffer &out) const;
+
+    // --- the EDGE-filtered walk itself (plan O6) -----------------------------
+    // ONE walk body with two products, selected at COMPILE time by the kind of record
+    // it has to discover (`Node`, a graph.cpp-local struct: the mode IS what the
+    // record needs, so a type parameter — not a runtime flag — is what keeps the two
+    // from drifting and lets the unused half disappear):
+    //   * PathWalkNode (48 B: vertex, discovering edge, parent index, depth) for the
+    //     public shortest_path forms, which must assemble a PathStep sequence;
+    //   * ReachabilityWalkNode (16 B: the vertex alone) for the filtered has_path,
+    //     whose whole product is the bool below — no predecessor chain, no PathStep
+    //     assembly, so the walk's discovery array is a third of the size.
+    // Both modes keep the discovery array (it is also the small-BFS visited set's
+    // projection), the per-visit link snapshot, the level frontiers, the batched edge
+    // filter and every refusal rule, so the reachability answer cannot drift from the
+    // path answer. `out` is the caller's PathStep buffer; it is NULL in the
+    // reachability mode, which writes no path at all.
+    struct FilteredWalkResult {
+        GdiStatus status;
+        // Did the walk reach `to`? The reachability mode's entire product; the path
+        // mode reports through `out` and never reads this.
+        bool reached;
+    };
+    template <typename Node>
+    auto _filtered_walk(kimix::Guid const &from, kimix::Guid const &to,
+                        Constraint const &edge_constraint, EdgeOrientation orientation,
+                        uint32_t max_depth, kimix::vector<PathStep> *out) const
+        -> FilteredWalkResult;
 
     // Bump the structural version. Called by every structural write, AFTER the
     // mutation and while its shard lock is still held, so a reader that sees the
