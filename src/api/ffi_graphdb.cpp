@@ -233,7 +233,11 @@ int32_t kimix_graphdb_traverse_bfs(kimix_gdb_session *session, kimix_gdb_guid st
 }
 
 int32_t kimix_graphdb_shortest_path(kimix_gdb_session *session, kimix_gdb_guid from, kimix_gdb_guid to, uint32_t max_depth, kimix_gdb_guid *items, size_t capacity, size_t *out_count) {
- return kimix_gdb_shortest_path(session, from, to, max_depth, items, capacity, out_count);
+    return kimix_gdb_shortest_path(session, from, to, max_depth, items, capacity, out_count);
+}
+
+int32_t kimix_graphdb_shortest_path_edges(kimix_gdb_session *session, kimix_gdb_guid from, kimix_gdb_guid to, uint32_t edge_constraint, uint8_t orientation, uint32_t max_depth, kimix_gdb_path_step *items, size_t capacity, size_t *out_count) {
+    return kimix_gdb_shortest_path_edges(session, from, to, edge_constraint, orientation, max_depth, items, capacity, out_count);
 }
 
 int32_t kimix_graphdb_scan_vertices(kimix_gdb_session *session, uint32_t constraint, int64_t cap, kimix_gdb_guid *items, size_t capacity, size_t *out_count, size_t *out_total) {

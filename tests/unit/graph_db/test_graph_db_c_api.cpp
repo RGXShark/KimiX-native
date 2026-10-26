@@ -129,6 +129,17 @@ struct session_guard {
                   KIMIX_GDB_OK));
         return id;
     }
+
+    // One edge carrying a single registered label right at creation (what the
+    // edge-filtered path cases assert on).
+    kimix_gdb_guid edge_labeled(kimix_gdb_guid origin, kimix_gdb_guid target,
+                                uint32_t label_id) {
+        kimix_gdb_guid id{};
+        expect(eq(kimix_gdb_edge_create(session, origin, target, KIMIX_GDB_EDGE_DIRECTED,
+                                        &label_id, 1, nullptr, nullptr, 0, &id),
+                  KIMIX_GDB_OK));
+        return id;
+    }
 };
 
 } // namespace
@@ -456,10 +467,129 @@ int main(int argc, char *argv[]) {
       expect(eq(kimix_gdb_traverse_bfs(session, unknown, 0, KIMIX_GDB_ORIENTATION_OUTGOING,
                                        10, 2, nullptr, 0, &count),
                 KIMIX_GDB_ERR_VERTEX));
- expect(eq(kimix_gdb_traverse_bfs(nullptr, a, 0, KIMIX_GDB_ORIENTATION_OUTGOING, 10,
- 2, nullptr, 0, &count),
- KIMIX_GDB_ERR_ARGUMENT));
- };
+      expect(eq(kimix_gdb_traverse_bfs(nullptr, a, 0, KIMIX_GDB_ORIENTATION_OUTGOING, 10,
+                                       2, nullptr, 0, &count),
+                KIMIX_GDB_ERR_ARGUMENT));
+  };
+
+// The EDGE-filtered shortest path (an additive surface after ABI 6): the
+// two-phase walk of kimix_gdb_shortest_path_edges, the reported hop edges, the
+// rerouting a label filter causes, the orientation knob and the error surface.
+"cabi_shortest_path_edges"_test = [] {
+    session_guard guard;
+    kimix_gdb_session *session = guard.session;
+    uint32_t const node = guard.label("node");
+    uint32_t const open = guard.label("open_route");
+    uint32_t const blocked = guard.label("blocked_route");
+    // a -> b -> c is the short chain (b -> c blocked); a -> d -> c is the long
+    // one (both open).  A filter that refuses `blocked` must pick a, d, c.
+    kimix_gdb_guid const a = guard.vertex(node, "a");
+    kimix_gdb_guid const b = guard.vertex(node, "b");
+    kimix_gdb_guid const c = guard.vertex(node, "c");
+    kimix_gdb_guid const d = guard.vertex(node, "d");
+    kimix_gdb_guid const ab = guard.edge(a, b);
+    kimix_gdb_guid const bc = guard.edge_labeled(b, c, blocked);
+    kimix_gdb_guid const ad = guard.edge_labeled(a, d, open);
+    kimix_gdb_guid const dc = guard.edge_labeled(d, c, open);
+
+    // Probe phase: the unfiltered walk is the short chain a, b, c.
+    size_t count = 0;
+    expect(eq(kimix_gdb_shortest_path_edges(session, a, c, 0, KIMIX_GDB_ORIENTATION_OUTGOING,
+                                            KIMIX_GDB_MAX_HOP_DEPTH, nullptr, 0, &count),
+              KIMIX_GDB_OK));
+    expect(eq(count, size_t{3}));
+    kimix_gdb_path_step path[8]{};
+    expect(eq(kimix_gdb_shortest_path_edges(session, a, c, 0, KIMIX_GDB_ORIENTATION_OUTGOING,
+                                            KIMIX_GDB_MAX_HOP_DEPTH, path, 8, &count),
+              KIMIX_GDB_OK));
+    expect(eq(count, size_t{3}));
+    expect(path[0].vertex.lo == a.lo && path[1].vertex.lo == b.lo && path[2].vertex.lo == c.lo)
+        << "unfiltered: a, b, c";
+    expect(path[0].edge.lo == 0ull && path[0].edge.hi == 0ull)
+        << "the start is reached by no edge";
+    expect(path[1].edge.lo == ab.lo && path[2].edge.lo == bc.lo)
+        << "each step reports the edge it traversed";
+    expect(path[1].depth == 1u && path[2].depth == 2u);
+
+    // A blocking label filter reroutes the SAME endpoints onto the long chain.
+    uint32_t blocked_only = 0;
+    expect(eq(kimix_gdb_constraint_create(session, &blocked_only), KIMIX_GDB_OK));
+    expect(eq(kimix_gdb_constraint_add_label(session, blocked_only, open, KIMIX_GDB_OP_EQUAL),
+              KIMIX_GDB_OK));
+    expect(eq(kimix_gdb_shortest_path_edges(session, a, c, blocked_only,
+                                            KIMIX_GDB_ORIENTATION_OUTGOING,
+                                            KIMIX_GDB_MAX_HOP_DEPTH, path, 8, &count),
+              KIMIX_GDB_OK));
+    expect(eq(count, size_t{3})) << "open edges only: a -> d -> c is still 2 hops";
+    expect(path[1].vertex.lo == d.lo && path[2].vertex.lo == c.lo) << "the filter chose the route";
+    expect(path[1].edge.lo == ad.lo && path[2].edge.lo == dc.lo);
+    // Filtering on the OTHER label keeps the short chain and reports its edge.
+    uint32_t blocked_routes = 0;
+    expect(eq(kimix_gdb_constraint_create(session, &blocked_routes), KIMIX_GDB_OK));
+    expect(eq(kimix_gdb_constraint_add_label(session, blocked_routes, blocked, KIMIX_GDB_OP_EQUAL),
+              KIMIX_GDB_OK));
+    expect(eq(kimix_gdb_shortest_path_edges(session, a, c, blocked_routes,
+                                            KIMIX_GDB_ORIENTATION_OUTGOING,
+                                            KIMIX_GDB_MAX_HOP_DEPTH, nullptr, 0, &count),
+              KIMIX_GDB_OK));
+    expect(eq(count, size_t{0}))
+        << "a -> b carries no label, so the blocked-only walk never leaves a";
+
+    // Orientation: walking BACKWARDS from c over `open` edges reaches d and a.
+    expect(eq(kimix_gdb_shortest_path_edges(session, c, a, blocked_only,
+                                            KIMIX_GDB_ORIENTATION_INCOMING,
+                                            KIMIX_GDB_MAX_HOP_DEPTH, path, 8, &count),
+              KIMIX_GDB_OK));
+    expect(eq(count, size_t{3}));
+    expect(path[1].vertex.lo == d.lo && path[2].vertex.lo == a.lo)
+        << "incoming: c <- d <- a";
+    expect(path[1].edge.lo == dc.lo && path[2].edge.lo == ad.lo);
+
+    // Two-phase contract: a too-small buffer reports the count and refuses, and
+    // the count probe (items == NULL) never needs storage.
+    expect(eq(kimix_gdb_shortest_path_edges(session, a, c, 0, KIMIX_GDB_ORIENTATION_OUTGOING,
+                                            KIMIX_GDB_MAX_HOP_DEPTH, path, 2, &count),
+              KIMIX_GDB_ERR_BUFFER));
+    expect(eq(count, size_t{3})) << "the required size is still reported";
+    // Unreachable within the bound, and unreachable over the matched edges, are
+    // both OK with a zero count.
+    expect(eq(kimix_gdb_shortest_path_edges(session, a, c, 0, KIMIX_GDB_ORIENTATION_OUTGOING, 1,
+                                            nullptr, 0, &count),
+              KIMIX_GDB_OK));
+    expect(eq(count, size_t{0}));
+
+    // Error surface: NULL session / NULL out_count, unknown endpoints, bounds,
+    // unknown constraint id, and a label condition with an ordering op.
+    kimix_gdb_guid const unknown{0xdeadbeefull, 0xfeedfaceull};
+    expect(eq(kimix_gdb_shortest_path_edges(nullptr, a, c, 0, KIMIX_GDB_ORIENTATION_OUTGOING,
+                                            KIMIX_GDB_MAX_HOP_DEPTH, nullptr, 0, &count),
+              KIMIX_GDB_ERR_ARGUMENT));
+    expect(eq(kimix_gdb_shortest_path_edges(session, a, c, 0, KIMIX_GDB_ORIENTATION_OUTGOING,
+                                            KIMIX_GDB_MAX_HOP_DEPTH, nullptr, 0, nullptr),
+              KIMIX_GDB_ERR_ARGUMENT));
+    expect(eq(kimix_gdb_shortest_path_edges(session, a, unknown, 0,
+                                            KIMIX_GDB_ORIENTATION_OUTGOING,
+                                            KIMIX_GDB_MAX_HOP_DEPTH, nullptr, 0, &count),
+              KIMIX_GDB_ERR_VERTEX));
+    expect(eq(kimix_gdb_shortest_path_edges(session, a, c, 0, KIMIX_GDB_ORIENTATION_OUTGOING, 0,
+                                            nullptr, 0, &count),
+              KIMIX_GDB_ERR_ARGUMENT));
+    expect(eq(kimix_gdb_shortest_path_edges(session, a, c, 0, KIMIX_GDB_ORIENTATION_OUTGOING,
+                                            KIMIX_GDB_MAX_HOP_DEPTH + 1, nullptr, 0, &count),
+              KIMIX_GDB_ERR_ARGUMENT));
+    expect(eq(kimix_gdb_shortest_path_edges(session, a, c, 424242u,
+                                            KIMIX_GDB_ORIENTATION_OUTGOING,
+                                            KIMIX_GDB_MAX_HOP_DEPTH, nullptr, 0, &count),
+              KIMIX_GDB_ERR_CONSTRAINT));
+    // A label condition can only test membership. This surface refuses an
+    // ordering op when the condition is ADDED (the same rule the walk re-checks),
+    // so the refusal never even reaches the walk through the C ABI.
+    uint32_t ordering = 0;
+    expect(eq(kimix_gdb_constraint_create(session, &ordering), KIMIX_GDB_OK));
+    expect(eq(kimix_gdb_constraint_add_label(session, ordering, open, KIMIX_GDB_OP_GREATER),
+              KIMIX_GDB_ERR_OP))
+        << "a label condition can only test membership";
+};
 
 // The G1/G4 global surface (ABI 3): a full two-phase walk of both calls —
 // scan probe -> fetch -> ERR_BUFFER -> paged caps, the constraint-filtered

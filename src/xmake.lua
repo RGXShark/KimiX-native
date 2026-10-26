@@ -409,6 +409,16 @@ target("runtime_py")
         -- kimix-core.dll and imports both the KIMIX_CORE_API surface and the
         -- single mi_* mimalloc heap from it. publish.py therefore ships
         -- kimix-core.dll / libkimix-core.so next to runtime_py.
+        if is_plat("linux") then
+            -- The module NEEDEDs libkimix-core.so (plus libpython3.x.so), and
+            -- an $ORIGIN RUNPATH lets any loader that opens it resolve the core
+            -- library from the same directory -- `python -c "import runtime_py"`
+            -- and the unit tests that link -lruntime_py both do exactly that.
+            -- DT_RUNPATH is not transitive, so the $ORIGIN of the loading
+            -- executable does not cover this module's own NEEDEDs; kimix_api
+            -- carries the same entry for the same reason.
+            target:add("rpathdirs", "$ORIGIN")
+        end
 
         -- Python interpreter discovery.  Windows keeps the original direct
         -- call (python is on PATH).  On Linux the bare name "python" usually

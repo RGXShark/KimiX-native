@@ -29,6 +29,9 @@ Capability current_capability() noexcept {
       // the C ABI (kimix_gdb_traverse_bfs / _shortest_path) and the
       // kimix_graphdb_* re-exports.  The advertised depth is the real bound
       // the implementation validates against (Graph::kMaxNativeHopDepth).
+      // The same depth bounds the EDGE-filtered shortest_path (the edge half of
+      // the §5.10 filter, kimix_gdb_shortest_path_edges), so the advertisement
+      // stays one honest number for both.
       cap.supports_native_multi_hop = true;
       cap.max_native_hop_depth = static_cast<int32_t>(Graph::kMaxNativeHopDepth);
     // P9/G1+G4 (plan v3 steps 2.1-2.4): global scan (Graph::for_each_vertex

@@ -2386,7 +2386,100 @@ bool Bash::valid() const {
 kimix::string Bash::detect_bash_path() {
     namespace fs = kimix::filesystem;
 #ifdef KIMIX_PLATFORM_WINDOWS
-    // Git Bash first (the same policy as the Python reference), then MSYS2.
+    // Non-throwing string -> path conversion: fs::path's narrow constructor
+    // throws on bytes the ANSI code page cannot represent and kimix builds
+    // without exceptions, so an undecodable candidate becomes an empty path
+    // (which every probe below reports as "not installed").
+    const auto to_path = [](kimix::string_view text) {
+        fs::path out;
+        if (!kimix::path_from_narrow(text, out) &&
+            !kimix::path_from_utf8(text, out)) {
+            out.clear();
+        }
+        return out;
+    };
+    // Existence check of one candidate. `valid()` runs this probe on every
+    // query, so the reference's spawn-based smoke test (bash_tool.py
+    // _bash_runs) is deliberately NOT ported: a candidate that exists on disk
+    // counts as installed. (Documented deviation - a Git for Windows install
+    // whose MSYS2 runtime cannot fork children is accepted here and fails on
+    // the first real command instead.)
+    const auto installed = [](const fs::path &candidate) {
+        if (candidate.empty()) {
+            return false;
+        }
+        std::error_code ec;
+        return fs::is_regular_file(candidate, ec);
+    };
+    // A WindowsApps `bash.exe` is the Microsoft Store app-execution alias: it
+    // only offers to install WSL, never runs a command (reference
+    // _is_windows_apps_stub). Every scan below skips it, otherwise this probe
+    // would claim a shell on a machine that has no git at all.
+    const auto is_store_stub = [](kimix::string_view path) {
+        return path.find("WindowsApps") != kimix::string_view::npos;
+    };
+    // $PATH entries, split on the Windows separator. `path_storage` owns the
+    // bytes the views point into.
+    kimix::string path_storage;
+    if (const char *path_env = std::getenv("PATH"); path_env != nullptr) {
+        path_storage = kimix::string(path_env);
+    }
+    kimix::vector<kimix::string_view> path_dirs;
+    {
+        kimix::string_view rest(path_storage);
+        while (!rest.empty()) {
+            const size_t semi = rest.find(';');
+            path_dirs.push_back((semi == kimix::string_view::npos)
+                                    ? rest
+                                    : rest.substr(0, semi));
+            if (semi == kimix::string_view::npos) {
+                break;
+            }
+            rest.remove_prefix(semi + 1);
+        }
+    }
+    // 1. KIMIX_GIT_BASH_PATH override (reference find_bash step 1).
+    if (const char *override_path = std::getenv("KIMIX_GIT_BASH_PATH");
+        override_path != nullptr && *override_path != '\0') {
+        const fs::path candidate = to_path(override_path);
+        if (installed(candidate)) {
+            return kimix::to_string(candidate);
+        }
+    }
+    // 2. `<git install root>/bin/bash.exe` for every git.exe on $PATH - the
+    // reference's `where.exe git` step (bash_tool.py
+    // _git_bash_candidate_from_git_path), resolved without spawning anything:
+    // the install root is the parent of the directory holding git.exe, so both
+    // the `<root>/cmd/git.exe` and the `<root>/bin/git.exe` layouts resolve to
+    // the same `<root>/bin/bash.exe`.
+    for (const kimix::string_view dir : path_dirs) {
+        if (dir.empty() || is_store_stub(dir)) {
+            continue;
+        }
+        const fs::path git_dir = to_path(dir);
+        std::error_code ec;
+        if (!fs::is_regular_file(git_dir / "git.exe", ec)) {
+            continue;
+        }
+        const fs::path candidate = git_dir.parent_path() / "bin" / "bash.exe";
+        if (installed(candidate)) {
+            return kimix::to_string(candidate);
+        }
+    }
+    // 2b. The kimix installer's own portable Git (%USERPROFILE%\.kimi\git):
+    // the only bash on a machine that never installed Git for Windows, and not
+    // guaranteed to be on $PATH, so it is probed explicitly.
+    if (const char *profile = std::getenv("USERPROFILE");
+        profile != nullptr && *profile != '\0') {
+        const fs::path candidate =
+            to_path(profile) / ".kimi/git/bin/bash.exe";
+        if (installed(candidate)) {
+            return kimix::to_string(candidate);
+        }
+    }
+    // 3. Well-known install locations (reference find_bash step 4): Git Bash
+    // first - the reference's policy - then the other Windows bash
+    // distributions.
     static const char *kWindowsCandidates[] = {
         "C:/Program Files/Git/bin/bash.exe",
         "C:/Program Files (x86)/Git/bin/bash.exe",
@@ -2395,17 +2488,29 @@ kimix::string Bash::detect_bash_path() {
         "C:/cygwin64/bin/bash.exe",
     };
     for (const char *c : kWindowsCandidates) {
-        std::error_code ec;
-        if (fs::exists(fs::path(c), ec)) {
-            return kimix::string(c);
+        const fs::path candidate = to_path(c);
+        if (installed(candidate)) {
+            return kimix::to_string(candidate);
         }
     }
     // LocalAppData Git install (winget/scoop layouts).
     if (const char *la = std::getenv("LOCALAPPDATA")) {
-        std::error_code ec;
-        fs::path p = fs::path(la) / "Programs/Git/bin/bash.exe";
-        if (fs::exists(p, ec)) {
-            return kimix::to_string(p);
+        const fs::path candidate =
+            to_path(la) / "Programs/Git/bin/bash.exe";
+        if (installed(candidate)) {
+            return kimix::to_string(candidate);
+        }
+    }
+    // 4. `bash.exe` on $PATH (reference find_bash step 5) - the Store stub is
+    // not a real bash, so a machine without git reports "no bash" here and the
+    // pwsh fallback takes over.
+    for (const kimix::string_view dir : path_dirs) {
+        if (dir.empty() || is_store_stub(dir)) {
+            continue;
+        }
+        const fs::path candidate = to_path(dir) / "bash.exe";
+        if (installed(candidate)) {
+            return kimix::to_string(candidate);
         }
     }
     return {};

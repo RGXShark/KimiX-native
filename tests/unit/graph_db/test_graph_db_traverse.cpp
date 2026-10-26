@@ -17,6 +17,11 @@
 // - determinism: repeated traversals return the identical sequence;
 // - the bounded shortest_path: same result as the unbounded form when the
 //   bound suffices, empty when it does not, error_vertex on unknown endpoints;
+// - the EDGE-filtered shortest_path (the edge-searching form): equivalence
+//   against a brute-force walk over the PUBLIC edge reads over the
+//   constraint x orientation x depth x endpoint matrix, the reported hop edges
+//   (parallel edges included), the zero-length and unreachable answers, the
+//   error surface, oriented_links / edge_matches, and the filtered has_path;
 // - a 4-reader / 1-writer stress run (no crash, BFS invariants hold, and a
 //   post-run quiescent traversal matches the brute force exactly).
 #include "ut/ut.hpp"
@@ -39,6 +44,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <thread>
+#include <utility>
 
 using namespace boost::ut;
 using namespace boost::ut::literals;
@@ -46,8 +52,12 @@ using namespace kimix;
 using graph_db::AdjacencyBuffer;
 using graph_db::Constraint;
 using graph_db::ConstraintCondition;
+using graph_db::ConstraintHandle;
 using graph_db::Database;
+using graph_db::EdgeId;
+using graph_db::EdgeLink;
 using graph_db::EdgeOrientation;
+using graph_db::EdgeRecord;
 using graph_db::GdiOp;
 using graph_db::GdiStatus;
 using graph_db::Graph;
@@ -57,6 +67,7 @@ using graph_db::PropertyBag;
 using graph_db::PropertyList;
 using graph_db::PropertyValue;
 using graph_db::Vertex;
+using PathStep = graph_db::Graph::PathStep;
 using TraversalVertex = graph_db::Graph::TraversalVertex;
 namespace gtest = kimix::graph_db::test;
 
@@ -244,6 +255,159 @@ bool walk_is_consistent(kimix::vector<TraversalVertex> const &walk, kimix::Guid 
     }
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// The EDGE-filtered path fixtures (the edge-searching form of shortest_path)
+// ---------------------------------------------------------------------------
+
+// Fabricated ids for the edge filters. The Graph level has no schema to register
+// them in (LabelId / PropNameId are plain uint32_t aliases, property.h).
+inline constexpr LabelId kOpenEdgeLabel = 21u;
+inline constexpr LabelId kBlockedEdgeLabel = 22u;
+inline constexpr PropNameId kCostName = 11u;
+
+// The (neighbour, edge) pairs a brute force steps over from `current`, computed
+// through the PUBLIC edge reads only — incident_edges + edge_record + matches —
+// so the reference below shares no code with the engine's link-level walk.
+void ref_hops(Graph const &graph, kimix::Guid const &current, EdgeOrientation orientation,
+              Constraint const &constraint,
+              kimix::vector<std::pair<kimix::Guid, EdgeId>> &out) {
+    out.clear();
+    kimix::vector<EdgeId> ids;
+    graph.incident_edges(current, orientation, ids);
+    for (auto const &id : ids) {
+        EdgeRecord record;
+        if (!graph.edge_record(id, record)) {
+            continue;
+        }
+        if (!graph_db::matches(constraint, record.labels, record.properties)) {
+            continue;
+        }
+        // The other end: an out link points at the target, an in link at the
+        // origin; a self loop is both, and either expression gives `current`.
+        kimix::Guid const neighbour = record.origin == current ? record.target : record.origin;
+        out.push_back({neighbour, id});
+    }
+}
+
+// A brute-force edge-filtered bounded shortest path: `vertices` is the path with
+// its endpoints included, `edges[i]` the edge that reaches `vertices[i]`, both
+// empty when `to` is unreachable within the bound.
+struct RefPath {
+    kimix::vector<kimix::Guid> vertices;
+    kimix::vector<EdgeId> edges;
+};
+
+RefPath ref_filtered_path(Graph const &graph, kimix::Guid const &from, kimix::Guid const &to,
+                          Constraint const &constraint, EdgeOrientation orientation,
+                          uint32_t max_depth) {
+    RefPath path;
+    if (from == to) {
+        path.vertices.push_back(from);
+        path.edges.push_back(EdgeId{});
+        return path;
+    }
+    kimix::unordered_map<kimix::Guid, kimix::Guid> parent;
+    kimix::unordered_map<kimix::Guid, EdgeId> via;
+    parent.emplace(from, from);
+    via.emplace(from, EdgeId{});
+    kimix::vector<kimix::Guid> frontier;
+    kimix::vector<kimix::Guid> next_frontier;
+    kimix::vector<std::pair<kimix::Guid, EdgeId>> hops;
+    frontier.push_back(from);
+    uint32_t depth = 0;
+    bool found = false;
+    while (!frontier.empty() && !found && depth < max_depth) {
+        ++depth;
+        next_frontier.clear();
+        for (auto const &current : frontier) {
+            ref_hops(graph, current, orientation, constraint, hops);
+            for (auto const &hop : hops) {
+                if (parent.find(hop.first) != parent.end()) {
+                    continue;
+                }
+                parent.emplace(hop.first, current);
+                via.emplace(hop.first, hop.second);
+                if (hop.first == to) {
+                    found = true;
+                    break;
+                }
+                next_frontier.push_back(hop.first);
+            }
+            if (found) {
+                break;
+            }
+        }
+        frontier.swap(next_frontier);
+    }
+    if (!found) {
+        return path;
+    }
+    kimix::vector<kimix::Guid> reversed;
+    kimix::vector<EdgeId> reversed_edges;
+    for (kimix::Guid cursor = to;; cursor = parent.find(cursor)->second) {
+        reversed.push_back(cursor);
+        reversed_edges.push_back(via.find(cursor)->second);
+        if (cursor == from) {
+            break;
+        }
+    }
+    std::reverse(reversed.begin(), reversed.end());
+    std::reverse(reversed_edges.begin(), reversed_edges.end());
+    path.vertices = std::move(reversed);
+    path.edges = std::move(reversed_edges);
+    return path;
+}
+
+// The engine's path equals the reference: same vertices, same edges (so a
+// parallel-edge choice is pinned too), and depth == index.
+void expect_same_path(kimix::vector<Graph::PathStep> const &actual, RefPath const &expected,
+                      char const *what) {
+    expect(eq(actual.size(), expected.vertices.size())) << what;
+    if (actual.size() != expected.vertices.size()) {
+        return;
+    }
+    for (size_t i = 0; i < actual.size(); ++i) {
+        expect(actual[i].vertex == expected.vertices[i]) << what;
+        expect(actual[i].edge == expected.edges[i]) << what;
+        expect(eq(actual[i].depth, static_cast<uint32_t>(i))) << what;
+    }
+}
+
+// Every hop of a returned path must be REAL: the reported edge exists, joins the
+// two consecutive vertices in the walked orientation, and satisfies the filter.
+void expect_path_is_sound(Graph const &graph, kimix::vector<Graph::PathStep> const &path,
+                          Constraint const &constraint, EdgeOrientation orientation,
+                          kimix::Guid const &from, kimix::Guid const &to, char const *what) {
+    expect(!path.empty()) << what;
+    if (path.empty()) {
+        return;
+    }
+    expect(path.front().vertex == from) << what;
+    expect(path.back().vertex == to) << what;
+    expect(!static_cast<bool>(path.front().edge)) << what << ": the start is reached by no edge";
+    kimix::unordered_set<kimix::Guid> seen;
+    for (size_t i = 0; i < path.size(); ++i) {
+        expect(seen.insert(path[i].vertex).second) << what << ": the path is simple";
+        if (i == 0) {
+            continue;
+        }
+        EdgeRecord record;
+        expect(graph.edge_record(path[i].edge, record)) << what << ": the hop's edge exists";
+        expect(graph.edge_matches(path[i].edge, constraint)) << what << ": the hop's edge matches";
+        bool const forward =
+            record.origin == path[i - 1].vertex && record.target == path[i].vertex;
+        bool const backward =
+            record.origin == path[i].vertex && record.target == path[i - 1].vertex;
+        bool const connects = orientation == EdgeOrientation::outgoing
+                                  ? forward
+                                  : orientation == EdgeOrientation::incoming ? backward
+                                                                             : (forward || backward);
+        expect(connects) << what << ": the hop's edge joins the two steps";
+    }
+}
+
+
 
 } // namespace
 
@@ -555,6 +719,384 @@ int main(int argc, char *argv[]) {
                 expect(bounded[i] == unbounded[i]) << "cyclic graph: bounded == unbounded";
             }
         }
+    };
+
+    // -----------------------------------------------------------------------
+    // EDGE-filtered shortest path (the edge-searching form): the walk keeps a hop
+    // only when the EDGE it steps over matches, so the filter selects a ROUTE,
+    // not a set of vertices. Equivalence against the brute force over the
+    // constraint x orientation x depth matrix, then the contract details.
+    // -----------------------------------------------------------------------
+    "edge_filtered_shortest_path_matches_brute_force"_test = [] {
+        Graph graph;
+        auto dag = gtest::small_dag(graph);
+        // Label every edge by its ORIGIN: b's and f's edges are `blocked`, the
+        // rest `open`, and each carries a `cost` (blocked 9.0, open 1.0) so a
+        // label filter and a property filter select the same routes from
+        // different conditions.
+        for (auto const &id : graph.edge_ids()) {
+            EdgeRecord record;
+            expect(graph.edge_record(id, record));
+            bool const blocked = record.origin == dag.b->guid() || record.origin == dag.f->guid();
+            expect(eq(graph.edge_add_label(id, blocked ? kBlockedEdgeLabel : kOpenEdgeLabel),
+                      GdiStatus::ok));
+            expect(eq(graph.edge_put_property(id, kCostName,
+                                              PropertyValue::make_double(blocked ? 9.0 : 1.0)),
+                      GdiStatus::ok));
+        }
+        kimix::vector<Constraint> constraints;
+        constraints.push_back(Constraint{}); // no filter: every edge
+        constraints.push_back(
+            Constraint{}.with(ConstraintCondition::on_label(kOpenEdgeLabel, GdiOp::equal)));
+        constraints.push_back(
+            Constraint{}.with(ConstraintCondition::on_label(kBlockedEdgeLabel, GdiOp::equal)));
+        constraints.push_back(Constraint{}.with(ConstraintCondition::on_property(
+            kCostName, GdiOp::less_or_equal, PropertyValue::make_double(5.0))));
+        constraints.push_back(Constraint{}.with(ConstraintCondition::on_property(
+            kCostName, GdiOp::greater, PropertyValue::make_double(5.0))));
+        constraints.push_back(
+            Constraint{}
+                .with(ConstraintCondition::on_label(kOpenEdgeLabel, GdiOp::equal))
+                .with(ConstraintCondition::on_property(
+                    kCostName, GdiOp::greater, PropertyValue::make_double(5.0))));
+        EdgeOrientation const orientations[] = {EdgeOrientation::outgoing,
+                                                EdgeOrientation::incoming,
+                                                EdgeOrientation::both};
+        uint32_t const depths[] = {1u, 2u, 3u, Graph::kMaxNativeHopDepth};
+        size_t compared = 0;
+        for (auto const &constraint : constraints) {
+            for (EdgeOrientation orientation : orientations) {
+                for (uint32_t depth : depths) {
+                    for (size_t s = 0; s < dag.vertices.size(); ++s) {
+                        for (size_t t = 0; t < dag.vertices.size(); ++t) {
+                            kimix::Guid const from = dag.vertices[s]->guid();
+                            kimix::Guid const to = dag.vertices[t]->guid();
+                            kimix::vector<PathStep> actual;
+                            expect(eq(graph.shortest_path(from, to, constraint, orientation,
+                                                          depth, actual),
+                                      GdiStatus::ok));
+                            RefPath const expected = ref_filtered_path(
+                                graph, from, to, constraint, orientation, depth);
+                            expect_same_path(actual, expected,
+                                             "edge-filtered path matches the brute force");
+                            if (!actual.empty()) {
+                                expect_path_is_sound(graph, actual, constraint, orientation, from,
+                                                     to, "every reported hop is real");
+                            }
+                            ++compared;
+                        }
+                    }
+                }
+            }
+        }
+        expect(gt(compared, size_t{1000})) << "the matrix really ran";
+    };
+
+    // The same equivalence at scale: a 120-vertex layered DAG with every edge
+    // labeled and costed, and random endpoint / orientation / depth / filter
+    // draws. A DAG is the shape that makes "no matching chain" the common answer,
+    // which is exactly the case a length-only comparison would hide.
+    "edge_filtered_shortest_path_layered"_test = [] {
+        Graph graph;
+        auto vertices = gtest::build_layered_dag(graph, 120, 4242u);
+        // Label by the POSITIONS of the endpoints, not by edge_ids() order: that
+        // order is shard order (a hash of a random guid), so keying off it would
+        // make every run filter a different subset. This keeps the fixture
+        // reproducible while still spreading the labels unevenly over the graph.
+        kimix::unordered_map<kimix::Guid, size_t> rank;
+        rank.reserve(vertices.size());
+        for (size_t i = 0; i < vertices.size(); ++i) {
+            rank.emplace(vertices[i]->guid(), i);
+        }
+        for (auto const &id : graph.edge_ids()) {
+            EdgeRecord record;
+            expect(graph.edge_record(id, record));
+            bool const blocked =
+                ((rank.find(record.origin)->second + rank.find(record.target)->second) % 3u) ==
+                0u;
+            expect(eq(graph.edge_add_label(id, blocked ? kBlockedEdgeLabel : kOpenEdgeLabel),
+                      GdiStatus::ok));
+            expect(eq(graph.edge_put_property(id, kCostName,
+                                              PropertyValue::make_double(blocked ? 9.0 : 1.0)),
+                      GdiStatus::ok));
+        }
+        kimix::vector<Constraint> constraints;
+        constraints.push_back(Constraint{});
+        constraints.push_back(
+            Constraint{}.with(ConstraintCondition::on_label(kOpenEdgeLabel, GdiOp::equal)));
+        constraints.push_back(
+            Constraint{}.with(ConstraintCondition::on_label(kBlockedEdgeLabel, GdiOp::equal)));
+        constraints.push_back(Constraint{}.with(ConstraintCondition::on_property(
+            kCostName, GdiOp::less, PropertyValue::make_double(5.0))));
+        std::mt19937 rng(17u);
+        size_t found = 0;
+        for (int round = 0; round < 160; ++round) {
+            kimix::Guid const from = vertices[rng() % vertices.size()]->guid();
+            kimix::Guid const to = vertices[rng() % vertices.size()]->guid();
+            Constraint const &constraint = constraints[rng() % constraints.size()];
+            EdgeOrientation const orientation =
+                static_cast<EdgeOrientation>(rng() % 3u);
+            uint32_t const depth = 1 + static_cast<uint32_t>(rng() % 6);
+            kimix::vector<PathStep> actual;
+            expect(eq(graph.shortest_path(from, to, constraint, orientation, depth, actual),
+                      GdiStatus::ok));
+            expect_same_path(actual,
+                             ref_filtered_path(graph, from, to, constraint, orientation, depth),
+                             "layered DAG: the edge-filtered path matches the brute force");
+            if (!actual.empty()) {
+                ++found;
+                expect_path_is_sound(graph, actual, constraint, orientation, from, to,
+                                     "every reported hop is real");
+            }
+        }
+        expect(gt(found, size_t{0})) << "the draws did produce reachable pairs";
+    };
+
+    // The contract: which edge a hop reports (parallel edges included), the
+    // zero-length path, the unreachable answer and the error surface.
+    "edge_filtered_shortest_path_contract"_test = [] {
+        Graph graph;
+        auto dag = gtest::small_dag(graph);
+        // a -> b already exists (connect); add a PARALLEL a -> b that only the
+        // filter can pick, which is the case a vertex-only path cannot express.
+        EdgeId const first = [&] {
+            kimix::vector<EdgeId> ids;
+            graph.incident_edges(dag.a->guid(), EdgeOrientation::outgoing, ids);
+            expect(eq(ids.size(), size_t{2})); // a -> b, a -> c
+            return ids[0];
+        }();
+        EdgeId parallel;
+        LabelId const open_labels[]{kOpenEdgeLabel};
+        expect(eq(graph.edge_create(dag.a->guid(), dag.b->guid(),
+                                    graph_db::EdgeDirectionType::directed,
+                                    kimix::span<const LabelId>{open_labels, 1}, nullptr, parallel),
+                  GdiStatus::ok));
+        expect(parallel != first) << "a parallel edge is its own id";
+        expect(eq(graph.edge_add_label(first, kBlockedEdgeLabel), GdiStatus::ok));
+
+        // Unfiltered: the FIRST a -> b edge in link order carries the hop.
+        {
+            kimix::vector<PathStep> path;
+            expect(eq(graph.shortest_path(dag.a->guid(), dag.b->guid(), Constraint{},
+                                          EdgeOrientation::outgoing, 4, path),
+                      GdiStatus::ok));
+            expect(eq(path.size(), size_t{2}));
+            expect(path[1].edge == first) << "the unfiltered walk reports the first parallel edge";
+        }
+        // Refusing that edge reroutes the SAME hop onto the parallel one.
+        {
+            Constraint open_only =
+                Constraint{}.with(ConstraintCondition::on_label(kOpenEdgeLabel, GdiOp::equal));
+            kimix::vector<PathStep> path;
+            expect(eq(graph.shortest_path(dag.a->guid(), dag.b->guid(), open_only,
+                                          EdgeOrientation::outgoing, 4, path),
+                      GdiStatus::ok));
+            expect(eq(path.size(), size_t{2}));
+            expect(path[1].edge == parallel)
+                << "the filter selects WHICH parallel edge carried the hop";
+        }
+        // A zero-length path traverses no edge, so no edge filter can exclude it.
+        {
+            Constraint blocked =
+                Constraint{}.with(ConstraintCondition::on_label(kBlockedEdgeLabel, GdiOp::equal));
+            kimix::vector<PathStep> path;
+            expect(eq(graph.shortest_path(dag.b->guid(), dag.b->guid(), blocked,
+                                          EdgeOrientation::outgoing, 3, path),
+                      GdiStatus::ok));
+            expect(eq(path.size(), size_t{1}));
+            expect(!static_cast<bool>(path[0].edge)) << "the start is reached by no edge";
+        }
+        // Unreachable within the bound, and unreachable over the matched edges:
+        // both are an empty result with status ok (GDI's nullable-list answer).
+        {
+            Constraint blocked =
+                Constraint{}.with(ConstraintCondition::on_label(kBlockedEdgeLabel, GdiOp::equal));
+            kimix::vector<PathStep> path;
+            expect(eq(graph.shortest_path(dag.a->guid(), dag.d->guid(), Constraint{},
+                                          EdgeOrientation::outgoing, 1, path),
+                      GdiStatus::ok));
+            expect(path.empty()) << "a -> d needs two hops, the bound is one";
+            expect(eq(graph.shortest_path(dag.a->guid(), dag.d->guid(), blocked,
+                                          EdgeOrientation::outgoing, 8, path),
+                      GdiStatus::ok));
+            expect(path.empty())
+                << "a -> b is blocked, but b -> d carries no label, so d stays unreachable";
+        }
+        // Error surface: bound, unknown endpoints, and the label-op rule.
+        {
+            kimix::vector<PathStep> path;
+            kimix::Guid const unknown(true);
+            Constraint const none;
+            expect(eq(graph.shortest_path(dag.a->guid(), dag.d->guid(), none,
+                                          EdgeOrientation::outgoing, 0, path),
+                      GdiStatus::error_argument));
+            expect(eq(graph.shortest_path(dag.a->guid(), dag.d->guid(), none,
+                                          EdgeOrientation::outgoing,
+                                          Graph::kMaxNativeHopDepth + 1, path),
+                      GdiStatus::error_argument));
+            expect(eq(graph.shortest_path(unknown, dag.d->guid(), none, EdgeOrientation::outgoing,
+                                          4, path),
+                      GdiStatus::error_vertex));
+            expect(eq(graph.shortest_path(dag.a->guid(), unknown, none, EdgeOrientation::outgoing,
+                                          4, path),
+                      GdiStatus::error_vertex));
+            Constraint ordering =
+                Constraint{}.with(ConstraintCondition::on_label(kOpenEdgeLabel, GdiOp::greater));
+            expect(eq(graph.shortest_path(dag.a->guid(), dag.d->guid(), ordering,
+                                          EdgeOrientation::outgoing, 4, path),
+                      GdiStatus::error_op))
+                << "a label condition can only test membership";
+        }
+        // A self loop is a hop in both orientations but never shortens a path.
+        {
+            Vertex *loop = graph.create_vertex();
+            kimix::vector<EdgeId> ids;
+            graph.incident_edges(loop->guid(), EdgeOrientation::both, ids);
+            expect(ids.empty());
+            EdgeId loop_edge;
+            LabelId const open_labels2[]{kOpenEdgeLabel};
+            expect(eq(graph.edge_create(loop->guid(), loop->guid(),
+                                        graph_db::EdgeDirectionType::directed,
+                                        kimix::span<const LabelId>{open_labels2, 1}, nullptr,
+                                        loop_edge),
+                      GdiStatus::ok));
+            kimix::vector<PathStep> path;
+            Constraint open_only =
+                Constraint{}.with(ConstraintCondition::on_label(kOpenEdgeLabel, GdiOp::equal));
+            expect(eq(graph.shortest_path(loop->guid(), loop->guid(), open_only,
+                                          EdgeOrientation::outgoing, 4, path),
+                      GdiStatus::ok));
+            expect(eq(path.size(), size_t{1})) << "from == to stays the zero-length path";
+        }
+    };
+
+    // The two primitives the walk is built on, plus the edge-filtered
+    // reachability probe.
+    "edge_filtered_primitives"_test = [] {
+        Graph graph;
+        auto dag = gtest::small_dag(graph);
+        // oriented_links: (edge, neighbour) pairs, one shard snapshot per call.
+        kimix::vector<EdgeLink> links;
+        expect(graph.oriented_links(dag.a->guid(), EdgeOrientation::outgoing, links));
+        expect(eq(links.size(), size_t{2}));
+        expect(links[0].neighbour == dag.b->guid()) << "insertion order: a -> b first";
+        expect(links[1].neighbour == dag.c->guid());
+        EdgeRecord record;
+        expect(graph.edge_record(links[0].edge, record));
+        expect(record.origin == dag.a->guid() && record.target == dag.b->guid())
+            << "the link carries the EDGE that makes the hop";
+        expect(graph.oriented_links(dag.a->guid(), EdgeOrientation::incoming, links));
+        expect(links.empty()) << "a has no incoming edge";
+        expect(graph.oriented_links(dag.d->guid(), EdgeOrientation::both, links));
+        expect(eq(links.size(), size_t{3})) << "b -> d, c -> d and f -> d are all incident";
+        kimix::Guid const unknown(true);
+        expect(!graph.oriented_links(unknown, EdgeOrientation::both, links));
+        expect(links.empty()) << "a failed read leaves the buffer empty, not stale";
+        // edge_matches: an empty constraint is "the edge exists", a label filter
+        // reads the EDGE's own payload.
+        kimix::vector<EdgeId> a_out;
+        graph.incident_edges(dag.a->guid(), EdgeOrientation::outgoing, a_out);
+        expect(eq(graph.edge_add_label(a_out[1], kBlockedEdgeLabel), GdiStatus::ok));
+        expect(graph.edge_matches(a_out[0], Constraint{}));
+        expect(!graph.edge_matches(unknown, Constraint{}))
+            << "an unknown edge does not match, not even the empty constraint";
+        Constraint blocked =
+            Constraint{}.with(ConstraintCondition::on_label(kBlockedEdgeLabel, GdiOp::equal));
+        expect(graph.edge_matches(a_out[1], blocked));
+        expect(!graph.edge_matches(a_out[0], blocked));
+        // has_path: the reachability probe honours the same filter.
+        expect(graph.has_path(dag.a->guid(), dag.d->guid(), Constraint{},
+                              EdgeOrientation::outgoing))
+            << "a -> b -> d exists over every edge";
+        expect(!graph.has_path(dag.a->guid(), dag.d->guid(), blocked, EdgeOrientation::outgoing))
+            << "a -> c matches but c -> d does not, so d is unreachable over blocked edges";
+        expect(graph.has_path(dag.a->guid(), dag.c->guid(), blocked, EdgeOrientation::outgoing))
+            << "the blocked edge itself is reachable";
+        expect(!graph.has_path(unknown, dag.d->guid(), Constraint{}, EdgeOrientation::outgoing))
+            << "an unknown endpoint is unreachable, not an error";
+        expect(graph.has_path(dag.b->guid(), dag.b->guid(), blocked, EdgeOrientation::outgoing))
+            << "from == to on an existing vertex is a zero-length path";
+        expect(!graph.has_path(unknown, unknown, Constraint{}, EdgeOrientation::outgoing));
+    };
+
+    // Database facade: the edge filter is a registered constraint like every
+    // other read filter, so the facade must resolve it, forward the same status
+    // codes and agree with the raw Graph API.
+    // Database facade: the edge filter is a registered constraint like every
+    // other read filter, so the facade must resolve it, forward the same status
+    // codes and agree with the raw Graph API.
+    "database_edge_filtered_shortest_path"_test = [] {
+        Database db;
+        auto dag = gtest::small_dag(db.graph());
+        // Every edge gets a label, and the b -> d hinge gets the blocking one, so
+        // the two-hop route a -> c -> d is the only one an open-only filter
+        // leaves (a -> b would be unlabeled and therefore unmatched).
+        for (auto const &id : db.graph().edge_ids()) {
+            EdgeRecord record;
+            expect(db.graph().edge_record(id, record));
+            bool const hinge = record.origin == dag.b->guid() && record.target == dag.d->guid();
+            expect(eq(db.graph().edge_add_label(
+                          id, hinge ? kBlockedEdgeLabel : kOpenEdgeLabel),
+                      GdiStatus::ok));
+        }
+        Constraint const open_only =
+            Constraint{}.with(ConstraintCondition::on_label(kOpenEdgeLabel, GdiOp::equal));
+        kimix::vector<PathStep> via_facade;
+        expect(eq(db.shortest_path(dag.a->guid(), dag.d->guid(), open_only,
+                                   EdgeOrientation::outgoing, 8, via_facade),
+                  GdiStatus::ok));
+        expect(eq(via_facade.size(), size_t{3})) << "a -> c -> d";
+        if (via_facade.size() == 3) {
+            expect(via_facade[1].vertex == dag.c->guid() && via_facade[2].vertex == dag.d->guid())
+                << "the blocked hinge is routed around";
+            expect(via_facade[1].edge != via_facade[2].edge)
+                << "the two hops are two distinct edges";
+        }
+        // The facade agrees with the raw Graph API on the same definition.
+        kimix::vector<PathStep> via_graph;
+        expect(eq(db.graph().shortest_path(dag.a->guid(), dag.d->guid(), open_only,
+                                           EdgeOrientation::outgoing, 8, via_graph),
+                  GdiStatus::ok));
+        expect(eq(via_graph.size(), via_facade.size()));
+        for (size_t i = 0; i < via_graph.size() && i < via_facade.size(); ++i) {
+            expect(via_graph[i].vertex == via_facade[i].vertex &&
+                   via_graph[i].edge == via_facade[i].edge)
+                << "the facade forwards the Graph result verbatim";
+        }
+        // A registered HANDLE resolves to the same definition (the C ABI shape).
+        graph_db::ConstraintHandle handle{};
+        expect(eq(db.create_constraint(open_only, handle), GdiStatus::ok));
+        Constraint resolved;
+        expect(db.schema().constraint(handle, resolved));
+        kimix::vector<PathStep> via_handle;
+        expect(eq(db.shortest_path(dag.a->guid(), dag.d->guid(), resolved,
+                                   EdgeOrientation::outgoing, 8, via_handle),
+                  GdiStatus::ok));
+        expect(eq(via_handle.size(), via_facade.size()));
+        // The facade validates the definition BEFORE walking (_resolve_constraint).
+        Constraint const ordering =
+            Constraint{}.with(ConstraintCondition::on_label(kOpenEdgeLabel, GdiOp::less));
+        kimix::vector<PathStep> rejected;
+        expect(eq(db.shortest_path(dag.a->guid(), dag.d->guid(), ordering,
+                                   EdgeOrientation::outgoing, 8, rejected),
+                  GdiStatus::error_op));
+        expect(rejected.empty());
+        // Reachability through the facade, over matching edges only.
+        bool reachable = true;
+        expect(eq(db.has_path(dag.a->guid(), dag.d->guid(), open_only,
+                              EdgeOrientation::outgoing, reachable),
+                  GdiStatus::ok));
+        expect(reachable);
+        Constraint const blocked =
+            Constraint{}.with(ConstraintCondition::on_label(kBlockedEdgeLabel, GdiOp::equal));
+        expect(eq(db.has_path(dag.a->guid(), dag.d->guid(), blocked,
+                              EdgeOrientation::outgoing, reachable),
+                  GdiStatus::ok));
+        expect(!reachable) << "a -> b is open, so the blocked-only walk leaves a and dies at b";
+        expect(eq(db.has_path(dag.a->guid(), dag.d->guid(), ordering,
+                              EdgeOrientation::outgoing, reachable),
+                  GdiStatus::error_op))
+            << "the reachability probe validates the definition too";
     };
 
     // 4 readers traverse (filtered and unfiltered) while one writer mutates a

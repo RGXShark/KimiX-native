@@ -1455,6 +1455,182 @@ GdiStatus Graph::shortest_path(kimix::Guid const &from, kimix::Guid const &to,
 }
 
 // ---------------------------------------------------------------------------
+// EDGE-filtered traversals (the EDGE half of the §5.10 filter story)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// One node of the edge-filtered BFS. The predecessor is an INDEX into `nodes`,
+// not a guid: the walk already stores every discovered vertex in discovery
+// order, so a second map from guid to predecessor would be a redundant structure
+// (the vertex-only BFS above needs one because it keeps no node array at all).
+// `edge` is the edge that discovered this node, i.e. the hop to report in the
+// PathStep — with parallel edges between one ordered pair, that is the only place
+// the choice is observable.
+struct FilteredNode {
+    kimix::Guid vertex;
+    EdgeId edge;
+    size_t parent; // index of the discovering node; 0 for the start (itself)
+    uint32_t depth;
+};
+
+constexpr size_t kNoNode = static_cast<size_t>(-1);
+
+} // namespace
+
+bool Graph::edge_matches(EdgeId const &edge, Constraint const &constraint) const {
+    if (constraint.conditions.empty()) {
+        // An empty constraint matches everything — including "does this edge
+        // still exist", which is the only thing left to answer.
+        return _edges.contains(edge);
+    }
+    size_t const shard = EdgeTable::shard_of(edge);
+    std::shared_lock<std::shared_mutex> lock(_edges.shard_mutex(shard));
+    Edge *record = _edges._find_locked(shard, edge);
+    if (record == nullptr) {
+        return false;
+    }
+    // §2.6: an EDGE filter reads the edge's own labels and properties, through
+    // the same zero-copy probe the filtered vertex paths use (no payload copy:
+    // this runs once per candidate link of a filtered walk).
+    auto probe = [record](PropNameId name) -> PropertyValue const * {
+        auto it = record->_properties.find(name);
+        return it == record->_properties.end() ? nullptr : &it->second;
+    };
+    return matches_probe(
+        constraint,
+        kimix::span<const LabelId>{record->_labels.data(), record->_labels.size()}, probe);
+}
+
+bool Graph::oriented_links(kimix::Guid const &guid, EdgeOrientation orientation,
+                           kimix::vector<EdgeLink> &out) const {
+    out.clear();
+    Shard const &shard = _shards[_shard_of(guid)];
+    std::shared_lock<std::shared_mutex> lock(shard.mutex);
+    Vertex *vertex = shard._find(guid);
+    if (vertex == nullptr) {
+        return false;
+    }
+    // ONE lock, ONE snapshot: the `both` orientation copies the two halves
+    // together (like _read_oriented_adjacency), so a link is never paired with a
+    // neighbour from a different instant of the vertex.
+    switch (orientation) {
+    case EdgeOrientation::outgoing:
+        out.insert(out.end(), vertex->_out_links.begin(), vertex->_out_links.end());
+        break;
+    case EdgeOrientation::incoming:
+        out.insert(out.end(), vertex->_in_links.begin(), vertex->_in_links.end());
+        break;
+    case EdgeOrientation::both:
+        out.insert(out.end(), vertex->_out_links.begin(), vertex->_out_links.end());
+        out.insert(out.end(), vertex->_in_links.begin(), vertex->_in_links.end());
+        break;
+    }
+    return true;
+}
+
+GdiStatus Graph::shortest_path(kimix::Guid const &from, kimix::Guid const &to,
+                               Constraint const &edge_constraint, EdgeOrientation orientation,
+                               uint32_t max_depth, kimix::vector<PathStep> &out) const {
+    out.clear();
+    if (max_depth < 1 || max_depth > kMaxNativeHopDepth) {
+        return GdiStatus::error_argument;
+    }
+    // The _resolve_constraint rule, validated here so the container API refuses a
+    // label ordering op exactly like traverse_bfs and the Database facade do.
+    for (auto const &condition : edge_constraint.conditions) {
+        if (condition.is_label() && condition.op != GdiOp::equal &&
+            condition.op != GdiOp::not_equal) {
+            return GdiStatus::error_op;
+        }
+    }
+    if (!contains(from) || !contains(to)) {
+        return GdiStatus::error_vertex;
+    }
+    if (from == to) {
+        // Zero-length path: it traverses no edge, so no edge constraint can
+        // exclude it (the same rule the vertex-only bounded form follows).
+        out.push_back(PathStep{from, EdgeId{}, 0});
+        return GdiStatus::ok;
+    }
+    bool const filtered = !edge_constraint.conditions.empty();
+    kimix::vector<FilteredNode> nodes; // discovery order == BFS order
+    nodes.reserve(64);
+    nodes.push_back(FilteredNode{from, EdgeId{}, 0, 0});
+    // The has_path discipline: `discovery` (every guid ever enqueued, in order)
+    // doubles as the small-BFS visited set, so a 2-hop search pays for no hash
+    // table; past kLinearVisitedLimit the set primes itself from this list.
+    kimix::vector<kimix::Guid> discovery;
+    discovery.reserve(64);
+    discovery.push_back(from);
+    VisitedSet visited;
+    visited.reserve(32);
+    kimix::vector<size_t> frontier; // node indices at the current depth
+    frontier.push_back(0);
+    kimix::vector<size_t> next_frontier;
+    kimix::vector<EdgeLink> links; // reused across visits: allocates on degree growth only
+    size_t hit = kNoNode;
+    uint32_t depth = 0;
+    while (!frontier.empty() && hit == kNoNode && depth < max_depth) {
+        ++depth;
+        next_frontier.clear();
+        for (size_t const index : frontier) {
+            if (!oriented_links(nodes[index].vertex, orientation, links)) {
+                continue; // removed between the enqueue and the visit
+            }
+            for (auto const &link : links) {
+                if (filtered && !edge_matches(link.edge, edge_constraint)) {
+                    continue; // a refused EDGE is not a hop, so its target is undiscovered
+                }
+                if (visited.contains(discovery, link.neighbour)) {
+                    continue;
+                }
+                discovery.push_back(link.neighbour);
+                visited.insert(discovery, link.neighbour);
+                nodes.push_back(FilteredNode{link.neighbour, link.edge, index, depth});
+                if (link.neighbour == to) {
+                    hit = nodes.size() - 1;
+                    break;
+                }
+                next_frontier.push_back(nodes.size() - 1);
+            }
+            if (hit != kNoNode) {
+                break;
+            }
+        }
+        frontier.swap(next_frontier);
+    }
+    if (hit == kNoNode) {
+        return GdiStatus::ok; // unreachable within the bound over matching edges
+    }
+    kimix::vector<PathStep> path;
+    for (size_t cursor = hit;; cursor = nodes[cursor].parent) {
+        path.push_back(
+            PathStep{nodes[cursor].vertex, nodes[cursor].edge, nodes[cursor].depth});
+        if (cursor == 0) {
+            break;
+        }
+    }
+    std::reverse(path.begin(), path.end());
+    out = std::move(path);
+    return GdiStatus::ok;
+}
+
+bool Graph::has_path(kimix::Guid const &from, kimix::Guid const &to,
+                     Constraint const &edge_constraint, EdgeOrientation orientation) const {
+    // The filtered walk above IS the reachability answer (it stops at the first
+    // hit), so this probe shares it instead of growing a second BFS: the vertex
+    // only has_path above stays the cheap adjacency walk for the unfiltered case,
+    // which is the one the benchmarks cover. The predecessor bookkeeping is the
+    // price of one implementation — a filtered reachability probe reads and tests
+    // every hop anyway, and that dominates.
+    kimix::vector<PathStep> path;
+    GdiStatus const status = shortest_path(from, to, edge_constraint, orientation,
+                                           kMaxNativeHopDepth, path);
+    return !is_error(status) && !path.empty();
+}
+
+// ---------------------------------------------------------------------------
 // Dirty bookkeeping
 // ---------------------------------------------------------------------------
 

@@ -311,6 +311,25 @@ public:
       [[nodiscard]] GdiStatus shortest_path(kimix::Guid const &from, kimix::Guid const &to,
                                             uint32_t max_depth,
                                             kimix::vector<kimix::Guid> &out) const;
+      // EDGE-filtered forms of the two above (the EDGE half of §5.10: the walk
+      // keeps a hop only when the EDGE it steps over satisfies `edge_constraint`,
+      // §2.6 semantics — the edge's own labels AND-ed with its properties).
+      // `edge_constraint` is an empty Constraint (every edge) or a registered
+      // handle, resolved and validated exactly like the read commands (a label
+      // condition with an ordering op is error_op). `orientation` is the direction
+      // the walk follows; `out[i].edge` names the edge each hop traversed, which
+      // is what a vertex-only path cannot report. Same status/result contract as
+      // the vertex-only bounded form.
+      [[nodiscard]] GdiStatus shortest_path(kimix::Guid const &from, kimix::Guid const &to,
+                                            Constraint const &edge_constraint,
+                                            EdgeOrientation orientation, uint32_t max_depth,
+                                            kimix::vector<Graph::PathStep> &out) const;
+      // Edge-filtered reachability, bounded by Graph::kMaxNativeHopDepth. `out` is
+      // false for an unknown endpoint (never an error) and for a walk that finds
+      // no matching chain of edges.
+      [[nodiscard]] GdiStatus has_path(kimix::Guid const &from, kimix::Guid const &to,
+                                       Constraint const &edge_constraint,
+                                       EdgeOrientation orientation, bool &out) const;
 
       // --- global scan (the G1 capability) ------------------------------------
       // One native pass over EVERY vertex (Graph::for_each_vertex: shard 0..63

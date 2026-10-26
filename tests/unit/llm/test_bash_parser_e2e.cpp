@@ -18,6 +18,13 @@
 // Host-state-changing cases (clipboard roundtrip, process killing, network
 // downloads, service mutation) are deliberately NOT executed here — they stay
 // transformation/golden tests (see the module README exclusions).
+//
+// Windows-only by contract: the rewrite the cases execute is gated on
+// `sys.platform == "win32"` in the reference (bash_fix.py) and in the native
+// shim that wraps the kernel, so off Windows every command would arrive
+// unchanged and the suite would only re-test plain POSIX shell behaviour. The
+// suite therefore registers ONE explicit skip elsewhere (see main) instead of
+// failing on commands Git Bash alone provides (gtimeout, gsed, cmd.exe, ...).
 
 #include "ut/ut.hpp"
 
@@ -48,18 +55,39 @@ kimix::string probe_bash() { return bash::Bash::detect_bash_path(); }
 // A per-run isolated temp directory (POSIX spelling) so tests never touch
 // host state outside their own scratch dir.  Created under the system temp.
 struct TempDir {
-    kimix::string win_path;   // Windows spelling (backslashes)
+    kimix::string win_path;   // native spelling (backslashes on Windows)
     kimix::string posix_path; // forward-slash spelling for Bash
 
     TempDir() {
         static int counter = 0;
         counter += 1;
+#ifdef KIMIX_PLATFORM_WINDOWS
         const char *base = std::getenv("TEMP");
         if (base == nullptr || *base == '\0') {
             base = std::getenv("TMP");
         }
-        kimix::string dir = (base != nullptr && *base != '\0') ? base : "C:\\Temp";
-        dir += "\\kimix_bp_e2e_";
+        const char *const fallback = "C:\\Temp";
+        const char sep = '\\';
+#else
+        // POSIX has no TEMP/TMP convention: TMPDIR first (bash, Python and the
+        // core temp helpers all agree on it), then /tmp. The Windows fallback
+        // must not be reached here - it would create a directory literally
+        // named "C:\Temp" inside the working directory and every cd in the
+        // spawned bash would fail.
+        const char *base = std::getenv("TMPDIR");
+        if (base == nullptr || *base == '\0') {
+            base = std::getenv("TMP");
+        }
+        const char *const fallback = "/tmp";
+        const char sep = '/';
+#endif
+        kimix::string dir = (base != nullptr && *base != '\0') ? base : fallback;
+        // Drop a trailing separator so the join below never doubles it.
+        while (dir.size() > 1 && (dir.back() == '\\' || dir.back() == '/')) {
+            dir.pop_back();
+        }
+        dir += sep;
+        dir += "kimix_bp_e2e_";
         dir += kimix::format("{}_{}", (uint64_t)std::hash<std::thread::id>{}(std::this_thread::get_id()), counter);
         win_path = dir;
         std::error_code ec;
@@ -76,7 +104,15 @@ struct TempDir {
         std::filesystem::remove_all(win_path, ec);
     }
     kimix::string file(const kimix::string &name) const { return posix_path + "/" + name; }
-    kimix::string win_file(const kimix::string &name) const { return win_path + "\\" + name; }
+    // Native-spelling path: backslash separated on Windows, '/' elsewhere
+    // (where both spellings agree).
+    kimix::string win_file(const kimix::string &name) const {
+#ifdef KIMIX_PLATFORM_WINDOWS
+        return win_path + "\\" + name;
+#else
+        return win_path + "/" + name;
+#endif
+    }
     // std::ofstream needs a std::string path (kimix::string has a custom
     // allocator).
     std::string std_file(const kimix::string &name) const { return std::string(win_file(name)); }
@@ -130,6 +166,23 @@ bool contains(const kimix::string &haystack, kimix::string_view needle) {
 int main(int argc, char *argv[]) {
     boost::ut::detail::cfg::parse_arg_with_fallback(argc, const_cast<const char **>(argv));
     using namespace boost::ut;
+
+#ifndef KIMIX_PLATFORM_WINDOWS
+    // Every case below executes what the Windows Git Bash rewrite PRODUCES:
+    // git-bash-only fallback names (gtimeout, gsed), cmd.exe control flow
+    // (`if exist`), the `/tmp` -> %TEMP% mapping and Windows path spellings.
+    // The reference applies that rewrite only on Windows - bash_fix.py's
+    // fix_bash_command returns non-Windows input byte-for-byte unchanged, and
+    // the Python shim keeps the same `sys.platform == "win32"` gate in front of
+    // the (deliberately ungated) native kernel. With no rewrite there is
+    // nothing to end-to-end-test here, and running the raw commands instead
+    // would only re-test plain POSIX shell behaviour; the kernel's Windows
+    // behaviour is covered by the golden transform suites.
+    "e2e_windows_git_bash_rewrite_inactive"_test = [] {
+        printf("[skip] the Windows Git Bash rewrite is inactive on this platform\n");
+    };
+    return 0;
+#else
 
     // ── fallback definitions actually run ──────────────────────────────────
 
@@ -337,4 +390,5 @@ int main(int argc, char *argv[]) {
         expect(eq(r.exit_code, int64_t(0))) << r.output;
         expect(eq(r.output, kimix::string("cba\n"))) << r.output;
     };
+#endif // KIMIX_PLATFORM_WINDOWS
 }

@@ -38,7 +38,7 @@ requirement it implements is `graph_db.md`.
 | `graph_db.h` | Umbrella include (`graph.h`, `utils.h`, `vertex.h`) + `KIMIX_GRAPH_DB_VERSION` (generated from `version.txt`). |
 | `utils.h` / `utils.cpp` | Key scheme (`"v/"` + 16 binary guid bytes, `meta/root` reserved), the byte-exact `VertexRecord` codec (`encode_vertex_record` / `decode_vertex_record`, all little-endian), `guid_key` / `guid_from_key` / `md5_of`, filesystem helpers, and `ColdStorage` — a thin RAII front end over `kimix::LMDB` with batched transactional writes, a full scan and `copy_to()`. |
 | `vertex.h` / `vertex.cpp` | One vertex: guid, opaque content blob + cached MD5, dependency links in **both** forms (guid vectors = the serialized source of truth; `Vertex*` sets = the resolved in-memory form), an `alignas(64)` `kimix::shared_atomic_mutex` and the atomic dirty flag. Also the `VertexUniqueLock` / `VertexSharedLock` RAII adapters. |
-| graph.h / graph.cpp | The vertex container: a 64-way SHARDED vertex map (kGraphShardCount, one std::shared_mutex + one bucketed kimix::HashMap per shard), structural CRUD with a cascading remove_vertex (one shard lock at a time), connect / disconnect (endpoint shards, ascending order), connect_bulk (epoch 3: one endpoint resolution, one ascending lock set and one writer check for a whole edge batch), reserve_links, a version-keyed cached roots(), neighbors / dependencies / dependents plus the non-allocating AdjacencyBuffer / caller-span forms, cycle-safe BFS has_path / shortest_path (one shard lock per visit), dirty bookkeeping (mark_dirty / clear_dirty / dirty_vertices), the single-writer contract check. graph.h carries the full concurrency contract, the deadlock-freedom argument and the epoch-1/2/3 results. |
+| graph.h / graph.cpp | The vertex container: a 64-way SHARDED vertex map (kGraphShardCount, one std::shared_mutex + one bucketed kimix::HashMap per shard), structural CRUD with a cascading remove_vertex (one shard lock at a time), connect / disconnect (endpoint shards, ascending order), connect_bulk (epoch 3: one endpoint resolution, one ascending lock set and one writer check for a whole edge batch), reserve_links, a version-keyed cached roots(), neighbors / dependencies / dependents plus the non-allocating AdjacencyBuffer / caller-span forms, cycle-safe BFS has_path / shortest_path (one shard lock per visit), the EDGE-filtered forms of both (oriented_links / edge_matches, plus a bounded shortest_path that keeps only hops whose EDGE satisfies a constraint and reports each hop's edge as a PathStep), dirty bookkeeping (mark_dirty / clear_dirty / dirty_vertices), the single-writer contract check. graph.h carries the full concurrency contract, the deadlock-freedom argument and the epoch-1/2/3 results. |
 | `serialize.h` / `serialize.cpp` | `GraphSerializer` (full + incremental save, `copy_to` checkpoint) and `GraphDeserializer` (dual-stage load), plus `GraphSerializeStats`. Details in §4 and §5. |
 | cold_store.h | INTERNAL storage-backend seam (not in the umbrella, RTTI-free, non-virtual): `ColdStore`, a non-owning handle over exactly one of `ColdStorage` (LMDB) or `FileColdStore` (flat file), dispatching `valid` / `path` / `read_meta` / `save_batch` / `load_all_records` / `copy_to` through a `kimix::variant` of pointers. That is what lets the backend be selected without touching the serializer or the deserializer; `open()`/`close()` stay an owner concern (`Database`). |
 | file_cold_store.h / file_cold_store.cpp | The opt-in flat-file backend: ONE append-only `<dir>\graph.xdb` (magic "KXDB0001" + 20-byte header + frames of length-prefixed records), one sync per save batch, one open + positioned sequential reads per scan, duplicate keys collapsed last-wins, tombstones as empty values, a full save is a truncating `rebuild()`, and a Windows 2 GiB guard on the *projected* file size. Reads use `kimix::DeferredBinaryFileStream` / `BinaryFileWriter` (cpp skill §11). |
@@ -931,7 +931,7 @@ that announces a format NEWER than `KIMIX_GRAPH_DB_FORMAT_VERSION` is refused wi
 | `supports_global_scan` | **true** | G1 landed (plan v3 step 2): `Graph::for_each_vertex` (shard-ascending, one SHARED lock at a time) + `Database::scan_vertices`, exposed through the C ABI (`kimix_gdb_scan_vertices`, ABI 3) |
 | `supports_edge_by_stable_uid` | **true** | edge uids are records and survive save/load |
 | `supports_edge_property_read` | **true** | edges carry labels and properties |
-| `supports_native_multi_hop` | **true** (depth 32) | G3 landed (plan v3 step 1): `Graph::traverse_bfs` + the bounded `shortest_path`, exposed through `Database`, the C ABI (`kimix_gdb_traverse_bfs` / `_shortest_path`, ABI 2) and the `kimix_graphdb_*` re-exports |
+| `supports_native_multi_hop` | **true** (depth 32) | G3 landed (plan v3 step 1): `Graph::traverse_bfs` + the bounded `shortest_path`, exposed through `Database`, the C ABI (`kimix_gdb_traverse_bfs` / `_shortest_path`, ABI 2) and the `kimix_graphdb_*` re-exports. The same family also answers the EDGE half of the section 5.10 filter (`kimix_gdb_shortest_path_edges`, section 5h) |
 | `supports_global_aggregates` | **true** | G4 landed (plan v3 step 2): `Database::aggregate_vertices` (count/min/max/sum/avg, per-shard partials merged in shard order over a fiber fan-out), exposed through the C ABI (`kimix_gdb_aggregate`, ABI 3) |
 | `supports_collective_transactions` | **true** | read-only scope; **no snapshot isolation** (single-writer store), documented in `transaction.h` |
 | `enforces_unique_external_ids` | **true** | the `KeyIndex` refuses a duplicate (`KeyMode::report_warning` is the warning path) |
@@ -966,6 +966,58 @@ inline path); the native rows call the C ABI directly.
 |---|---:|---:|---|
 | `read_scan_page` (ScanVerticesCommand cap=100) | **2,065 ops/s** (484 us/op) | 942 ops/s | a full 50k-vertex shard walk per op, page capped at 100 |
 | `read_aggregate_avg` (AggregateNeighborsCommand Avg(age)) | 183 ops/s (5.5 ms/op) | 745 ops/s | O(vertices) serial walk; the in-memory store's plain dictionary pass is cheaper per vertex — the fiber fan-out needs a bound scheduler (the test suite's determinism suite runs it with 4 workers). No acceptance target exists for this new row; recorded as the phase-2 baseline |
+
+## 5h. Edge filtering — the EDGE half of the traversal filter (edge searching)
+
+GDI section 5.10 filters VERTICES: a traversal constraint gates the discovered
+vertex, which is what `traverse_bfs` and the neighbour reads implement. Nothing in
+that family could express the other half — "walk only over relations of this
+kind" — because every walk enumerates a vertex's neighbour-guid projection and
+never looks at the edge it steps over. Since the edge epoch the container, the
+facade and the C ABI all answer it:
+
+| level | entry point | shape |
+|---|---|---|
+| container | `Graph::oriented_links(guid, orientation, vector<EdgeLink>&)` | the oriented (edge uid, neighbour uid) link list from ONE shard SHARED lock |
+| container | `Graph::edge_matches(edge, constraint)` | does THIS edge's own payload satisfy a constraint (ONE edge-shard SHARED lock, zero-copy probe — no labels/properties copy) |
+| container | `Graph::shortest_path(from, to, constraint, orientation, max_depth, vector<PathStep>&)` | bounded, oriented, EDGE-filtered shortest path; `PathStep{vertex, edge, depth}` reports which edge carried each hop (zeroed at the start) |
+| container | `Graph::has_path(from, to, constraint, orientation)` | the reachability probe over matching edges (bounded by `kMaxNativeHopDepth`) |
+| facade | `Database::shortest_path(..., constraint, orientation, ...)` / `Database::has_path(..., bool&)` | the same two after `_resolve_constraint`, so a registered handle and the label-op rule behave exactly like the read commands |
+| C ABI | `kimix_gdb_shortest_path_edges` (`kimix_gdb_path_step`) | two-phase buffer protocol, `0` = every edge, `ORIENTATION_*` = which way the walk goes |
+
+Semantics, all inherited from the read commands rather than invented:
+
+- an EDGE filter is the section 2.6 rule (the edge's labels AND-ed with its
+  properties), evaluated by the same `matches`/`matches_probe` code, so a
+  constraint means the same thing whether it filters a read or a hop;
+- a refused edge is not a hop: its target is not discovered, so the walk routes
+  around it (a refused VERTEX is never expanded — the vertex-only mirror);
+- parallel edges: the link list holds one entry per edge and the first matching
+  one wins, so `PathStep::edge` is the only place the choice is observable;
+- `from == to` is the zero-length path and traverses no edge, so no edge
+  constraint can exclude it;
+- unknown endpoints / bounds / label ordering ops keep the vertex-only
+  contract (`error_vertex` / `error_argument` / `error_op`); unreachable within
+  the bound over matching edges is an EMPTY path with status ok;
+- read atomicity is per visit, exactly as before: one vertex shard SHARED lock
+  copies the link list, then one edge-shard SHARED lock per candidate hop, with
+  no lock held between visits, so a concurrent writer may be observed on one
+  visit and not the next.
+
+Cost: the filtered walk pays one edge-shard shared lock per CANDIDATE link (the
+unfiltered `has_path`/`shortest_path` forms keep their guid-projection fast path
+and are untouched), and the BFS keeps its discovered nodes in one vector with
+parent INDICES instead of a guid-to-predecessor map, so a walk allocates on
+growth only. The C ABI addition is purely additive: no existing struct changed,
+so `KIMIX_GDB_ABI_VERSION` stays 6 and a binder may treat a missing symbol as a
+pre-edge-epoch image.
+
+Coverage: `test_graph_db_traverse.cpp` (equivalence against a brute force over
+the constraint x orientation x depth x endpoint matrix, the parallel-edge choice,
+`oriented_links` / `edge_matches`, the facade and its handle path),
+`test_graph_db_c_api.cpp` (`cabi_shortest_path_edges`: two-phase, the reroute a
+label filter causes, the orientation knob, the error surface) and
+`tests/unit/api/test_kimix_api.cpp` (the re-export exists).
 
 ## 5e. Epoch 4 — first-class edges + the GDI layer
 

@@ -8,8 +8,9 @@
  *                 properties, the sharded EdgeTable and the edge-record codec.
  *   key.h       — ExternalId, VertexKey and the (label, external_id) KeyIndex.
  *   graph.h     — Graph: the sharded vertex container + edge table + key index,
- *                 traversal (BFS has_path / shortest_path), roots, and the
- *                 lock-hierarchy contract (read it before calling anything).
+ *                 traversal (BFS has_path / shortest_path, plus the EDGE-filtered
+ *                 shortest_path over edges that match a constraint), roots, and
+ *                 the lock-hierarchy contract (read it before calling anything).
  *   utils.h     — key spaces, the record codecs (v1 + v2) and ColdStorage (LMDB).
  *   serialize.h — GraphSerializer (parallel incremental save) and
  *                 GraphDeserializer (dual-stage, cycle/corruption-proof load).

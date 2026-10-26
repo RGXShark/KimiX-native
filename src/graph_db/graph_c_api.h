@@ -202,6 +202,19 @@ typedef struct kimix_gdb_traversal_vertex {
     uint32_t reserved;
 } kimix_gdb_traversal_vertex;
 
+/* One hop of an EDGE-FILTERED shortest path (kimix_gdb_shortest_path_edges):
+ * the vertex the walk reached, the EDGE it traversed to get there (zeroed at
+ * index 0 -- the start is reached by no edge) and the hop count from the start,
+ * which is also the step's index in the returned path.  Carrying the edge is
+ * what a vertex-only path cannot express: with parallel edges between the same
+ * ordered pair, this says WHICH one carried the hop. */
+typedef struct kimix_gdb_path_step {
+    kimix_gdb_guid vertex;
+    kimix_gdb_guid edge;
+    uint32_t depth;
+    uint32_t reserved;
+} kimix_gdb_path_step;
+
   /* The deepest native traversal this build honours (the advertised
    * max_native_hop_depth); larger max_depth requests are ERR_ARGUMENT. */
   #define KIMIX_GDB_MAX_HOP_DEPTH 32u
@@ -533,6 +546,31 @@ int32_t kimix_gdb_traverse_bfs(kimix_gdb_session *session, kimix_gdb_guid start,
   int32_t kimix_gdb_shortest_path(kimix_gdb_session *session, kimix_gdb_guid from,
                                   kimix_gdb_guid to, uint32_t max_depth, kimix_gdb_guid *items,
                                   size_t capacity, size_t *out_count);
+  /* EDGE-FILTERED shortest path: exactly kimix_gdb_shortest_path, except the
+   * walk keeps a hop only when the EDGE it steps over satisfies `edge_constraint`
+   * (0 = every edge; §2.6 semantics -- the edge's own labels AND-ed with its
+   * properties, NOT the neighbour vertex's), it follows `orientation` edges
+   * (OUTGOING / INCOMING / BOTH) instead of outgoing only, and each returned
+   * record reports the edge that carried the hop.  That is the edge-searching
+   * form the vertex-only call cannot express (a traversal filter in GDI §5.10
+   * gates vertices; this gates relations).
+   * Two-phase like traverse_bfs: items == NULL reports *out_count only, then
+   * caller-owned storage of *out_count kimix_gdb_path_step records.  OK with
+   * *out_count == 0 means `to` is unreachable within `max_depth` over MATCHING
+   * edges (GDI's nullable-list answer, not an error); an unknown endpoint is
+   * ERR_VERTEX; a bound outside 1..KIMIX_GDB_MAX_HOP_DEPTH is ERR_ARGUMENT; an
+   * unknown constraint id is ERR_CONSTRAINT.  A too-small capacity is
+   * ERR_BUFFER with *out_count still reported.  A label condition carrying an
+   * ordering op never reaches this call: kimix_gdb_constraint_add_label refuses
+   * it with ERR_OP at creation time, which is the same rule.
+   * ADDED AFTER ABI 6: a new entry point changes no existing struct or code, so
+   * KIMIX_GDB_ABI_VERSION stays 6 (a binder may treat a missing symbol as "this
+   * image predates the edge-filtered path" and fall back to the composite). */
+  int32_t kimix_gdb_shortest_path_edges(kimix_gdb_session *session, kimix_gdb_guid from,
+                                        kimix_gdb_guid to, uint32_t edge_constraint,
+                                        uint8_t orientation, uint32_t max_depth,
+                                        kimix_gdb_path_step *items, size_t capacity,
+                                        size_t *out_count);
   /* Global scan (the G1 capability): ONE native pass over EVERY vertex matching
    * `constraint` (0 = none), in the deterministic shard-then-map order.
    * Two-phase like the reads: items == NULL runs the count probe and reports

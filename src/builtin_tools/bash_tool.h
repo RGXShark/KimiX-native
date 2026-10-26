@@ -444,9 +444,13 @@ public:
     // Access the serialized result populated by operator().
     const kimix::vector<char> &serialized_result() const;
 
-    // Resolve the bash executable for this platform. Windows: Git Bash
-    // (Program Files/Git) or MSYS2 candidates; POSIX: "/bin/bash" then $PATH.
-    // Empty string when nothing usable was found.
+    // Resolve the bash executable for this platform. Windows, in order:
+    // $KIMIX_GIT_BASH_PATH, the Git install root of every git.exe on $PATH
+    // (the reference's `where.exe git` step), %USERPROFILE%\.kimi\git (the
+    // kimix installer's portable Git), the well-known Program Files / MSYS2 /
+    // Cygwin locations, then bash.exe on $PATH with the WindowsApps Store stub
+    // skipped. POSIX: "/bin/bash" then $PATH. Empty string when nothing usable
+    // was found. Existence checks only - no process is spawned.
     static kimix::string detect_bash_path();
 
 private:

@@ -1732,6 +1732,11 @@ int main() {
                                                  &count) == KIMIX_GDB_ERR_ARGUMENT);
           expect(kimix_graphdb_edges_of_vertex(nullptr, guid, 0, 0, 0, nullptr, 0, &count,
                                                &count) == KIMIX_GDB_ERR_ARGUMENT);
+          // The edge-filtered path entry point is re-exported too (an additive
+          // surface after ABI 6: the symbol exists in this image even if a caller
+          // never uses it).
+          expect(kimix_graphdb_shortest_path_edges(nullptr, guid, guid, 0, 0, 1, nullptr, 0,
+                                                   &count) == KIMIX_GDB_ERR_ARGUMENT);
           expect(kimix_graphdb_vertices_create_bulk(nullptr, &vspec, 1, 1, nullptr, nullptr,
                                                     nullptr) == KIMIX_GDB_ERR_ARGUMENT);
           expect(kimix_graphdb_persist(nullptr, 0) == KIMIX_GDB_ERR_ARGUMENT);

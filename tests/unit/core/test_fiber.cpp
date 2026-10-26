@@ -65,6 +65,25 @@ void busy_wait_ms(double ms) noexcept {
 /// True when the pool can actually run two fibers at once.
 bool pool_is_parallel() noexcept { return kimix::fiber::worker_thread_count() > 1u; }
 
+/// Peak number of simultaneously running jobs of one parallel() call over
+/// `jobs` half-millisecond jobs, capped at `task_limit` (0 == uncapped).
+uint32_t measure_peak(uint32_t task_limit, uint32_t jobs) noexcept {
+    std::atomic<uint32_t> active{0u};
+    std::atomic<uint32_t> peak{0u};
+    kimix::fiber::parallel(
+        jobs,
+        [&active, &peak](uint32_t) noexcept {
+            auto const now = active.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+            auto best = peak.load(std::memory_order_relaxed);
+            while (now > best &&
+                   !peak.compare_exchange_weak(best, now, std::memory_order_acq_rel)) {}
+            busy_wait_ms(0.5);
+            active.fetch_sub(1u, std::memory_order_acq_rel);
+        },
+        1u, task_limit);
+    return peak.load(std::memory_order_relaxed);
+}
+
 }// namespace
 
 int main(int argc, char *argv[]) {
@@ -523,26 +542,26 @@ int main(int argc, char *argv[]) {
     };
 
     "task_limit_caps_concurrency"_test = [] {
-        // The ambient pool has 4 workers; a task_limit of 2 must hold the peak
-        // number of simultaneously running jobs at 2, whatever the job count.
-        auto const measure_peak = [](uint32_t task_limit) noexcept {
-            std::atomic<uint32_t> active{0u};
-            std::atomic<uint32_t> peak{0u};
-            kimix::fiber::parallel(
-                48u,
-                [&active, &peak](uint32_t) noexcept {
-                    auto const now = active.fetch_add(1u, std::memory_order_acq_rel) + 1u;
-                    auto best = peak.load(std::memory_order_relaxed);
-                    while (now > best &&
-                           !peak.compare_exchange_weak(best, now, std::memory_order_acq_rel)) {}
-                    busy_wait_ms(0.5);
-                    active.fetch_sub(1u, std::memory_order_acq_rel);
-                },
-                1u, task_limit);
-            return peak.load(std::memory_order_relaxed);
-        };
-        auto const capped = measure_peak(2u);
-        auto const uncapped = measure_peak(0u);
+        // A task_limit of 2 must hold the peak number of simultaneously running
+        // jobs at 2, whatever the job count; without a limit the same call may
+        // use the whole pool.
+        //
+        // Both runs use a FRESH private 4-worker pool (created on a helper
+        // thread), not the ambient one: marl spreads tasks by work-stealing, so
+        // the ambient pool's *effective* width is not stable - earlier tests in
+        // this suite observe 2-3 of its 4 workers - and measuring "the uncapped
+        // run is wider than the capped one" on it flaked roughly 1 run in 12 on
+        // a 24-core Linux host. The uncapped run also samples 2,000 short jobs
+        // rather than a handful: it needs ONE instant with three in flight, and
+        // a short window of 48 jobs can genuinely retire in lockstep.
+        uint32_t capped = 0u;
+        uint32_t uncapped = 0u;
+        std::thread foreign{[&capped, &uncapped] {
+            kimix::fiber::scheduler sched{4u};
+            capped = measure_peak(2u, 2000u);
+            uncapped = measure_peak(0u, 2000u);
+        }};
+        foreign.join();
         expect(eq(capped, 2u)) << "task_limit must be the exact fan-out width";
         expect(uncapped > capped) << "without a limit the same call uses the whole pool";
     };

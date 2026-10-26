@@ -431,6 +431,22 @@ KIMIX_OUT KIMIX_NULLABLE kimix_gdb_guid *items,
 KIMIX_IN size_t capacity,
 KIMIX_OUT size_t *out_count);
 
+/* EDGE-FILTERED shortest path (the edge-searching form): same contract as
+ * kimix_graphdb_shortest_path, but the walk keeps a hop only when the EDGE it
+ * steps over satisfies `edge_constraint` (0 = every edge), follows
+ * `orientation` edges, and each returned step reports the edge that carried the
+ * hop (zeroed on the first step).  Two-phase like traverse_bfs.  OK with
+ * *out_count == 0 is "unreachable within max_depth over matching edges". */
+KIMIX_FFI int32_t kimix_graphdb_shortest_path_edges(KIMIX_IN kimix_gdb_session *session,
+KIMIX_IN kimix_gdb_guid from,
+KIMIX_IN kimix_gdb_guid to,
+KIMIX_IN uint32_t edge_constraint,
+KIMIX_IN uint8_t orientation,
+KIMIX_IN uint32_t max_depth,
+KIMIX_OUT KIMIX_NULLABLE kimix_gdb_path_step *items,
+KIMIX_IN size_t capacity,
+KIMIX_OUT size_t *out_count);
+
 /* Global scan (the G1 capability): ONE native pass over EVERY vertex matching
 * `constraint` (0 = none), in the deterministic shard-then-map order.
 * Two-phase like the reads: items == NULL reports *out_count and *out_total,

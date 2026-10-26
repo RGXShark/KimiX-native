@@ -1416,6 +1416,32 @@ GdiStatus Database::traverse_bfs(kimix::Guid const &start, Constraint const &con
       return _graph.shortest_path(from, to, max_depth, out);
   }
 
+  GdiStatus Database::shortest_path(kimix::Guid const &from, kimix::Guid const &to,
+                                    Constraint const &edge_constraint,
+                                    EdgeOrientation orientation, uint32_t max_depth,
+                                    kimix::vector<Graph::PathStep> &out) const {
+      out.clear();
+      Constraint resolved;
+      GdiStatus const status = _resolve_constraint(edge_constraint, resolved);
+      if (is_error(status)) {
+          return status;
+      }
+      return _graph.shortest_path(from, to, resolved, orientation, max_depth, out);
+  }
+
+  GdiStatus Database::has_path(kimix::Guid const &from, kimix::Guid const &to,
+                               Constraint const &edge_constraint, EdgeOrientation orientation,
+                               bool &out) const {
+      out = false;
+      Constraint resolved;
+      GdiStatus const status = _resolve_constraint(edge_constraint, resolved);
+      if (is_error(status)) {
+          return status;
+      }
+      out = _graph.has_path(from, to, resolved, orientation);
+      return GdiStatus::ok;
+  }
+
   // ---------------------------------------------------------------------------
   // Global scan (the G1 capability)
   GdiStatus Database::scan_vertices(Constraint const &constraint, int64_t cap,

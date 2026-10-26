@@ -1352,6 +1352,49 @@ int32_t kimix_gdb_shortest_path(kimix_gdb_session *session, kimix_gdb_guid from,
     return KIMIX_GDB_OK;
 }
 
+int32_t kimix_gdb_shortest_path_edges(kimix_gdb_session *session, kimix_gdb_guid from,
+                                      kimix_gdb_guid to, uint32_t edge_constraint,
+                                      uint8_t orientation, uint32_t max_depth,
+                                      kimix_gdb_path_step *items, size_t capacity,
+                                      size_t *out_count) {
+    if (session == nullptr || out_count == nullptr) {
+        return KIMIX_GDB_ERR_ARGUMENT;
+    }
+    if (max_depth < 1 || max_depth > kimix::graph_db::Graph::kMaxNativeHopDepth) {
+        return KIMIX_GDB_ERR_ARGUMENT;
+    }
+    Constraint resolved;
+    GdiStatus status = resolve_constraint(session, edge_constraint, resolved);
+    if (is_error(status)) {
+        return code_of(status);
+    }
+    EdgeOrientation const direction = orientation == KIMIX_GDB_ORIENTATION_OUTGOING
+                                          ? EdgeOrientation::outgoing
+                                      : orientation == KIMIX_GDB_ORIENTATION_INCOMING
+                                          ? EdgeOrientation::incoming
+                                          : EdgeOrientation::both;
+    kimix::vector<kimix::graph_db::Graph::PathStep> path;
+    status = session->database.shortest_path(to_guid(from), to_guid(to), resolved, direction,
+                                             max_depth, path);
+    if (is_error(status)) {
+        return code_of(status);
+    }
+    *out_count = path.size();
+    if (items == nullptr) {
+        return KIMIX_GDB_OK;
+    }
+    if (path.size() > capacity) {
+        return KIMIX_GDB_ERR_BUFFER;
+    }
+    for (size_t i = 0; i < path.size(); ++i) {
+        items[i].vertex = from_guid(path[i].vertex);
+        items[i].edge = from_guid(path[i].edge);
+        items[i].depth = path[i].depth;
+        items[i].reserved = 0;
+    }
+    return KIMIX_GDB_OK;
+}
+
 int32_t kimix_gdb_scan_vertices(kimix_gdb_session *session, uint32_t constraint, int64_t cap,
                                 kimix_gdb_guid *items, size_t capacity, size_t *out_count,
                                 size_t *out_total) {

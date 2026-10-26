@@ -893,6 +893,20 @@ public:
         uint32_t depth{0};
     };
 
+    // One hop of an EDGE-FILTERED shortest path (the result shape of the
+    // constrained shortest_path below): the vertex the walk reached, the EDGE it
+    // traversed to get there, and the hop count from the start. `edge` is zeroed
+    // on the first step — the start vertex is reached by no edge — and `depth` is
+    // also the step's index in the returned path, because a BFS path is a simple
+    // one-vertex-per-hop chain. Reporting the edge is what an edge SEARCH needs
+    // and what a vertex-only path cannot express: with parallel edges between the
+    // same ordered pair, the pair says which edge carried the hop.
+    struct KIMIX_GRAPH_DB_API PathStep {
+        kimix::Guid vertex;
+        EdgeId edge;
+        uint32_t depth{0};
+    };
+
     // Breadth-first traversal from `start` over `orientation` edges, `max_depth`
     // levels deep, keeping at most `cap_per_level` vertices per level (level 0,
     // the start, is always exactly one vertex). A non-empty `constraint`
@@ -938,6 +952,78 @@ public:
     [[nodiscard]] GdiStatus shortest_path(kimix::Guid const &from, kimix::Guid const &to,
                                         uint32_t max_depth,
                                         kimix::vector<kimix::Guid> &out) const;
+
+    // --- EDGE-filtered traversals (the EDGE half of the §5.10 filter story) --
+    // §5.10 filters VERTICES: a traversal constraint gates the discovered vertex,
+    // which is what traverse_bfs and the reads above implement. Nothing above can
+    // express the other half — "walk only over relations of this kind" — because
+    // every walk there enumerates the neighbour-guid projection of a vertex and
+    // never looks at the edge it steps over. The three entry points below are that
+    // half: the walk enumerates (edge, neighbour) LINK entries and keeps a hop
+    // only when the EDGE's own labels and properties satisfy `edge_constraint`
+    // (the §2.6 edge-read rule, evaluated by the same matches() semantics).
+    //
+    // A refused edge is not a hop: its target is not discovered, so the walk
+    // routes around it exactly like a refused vertex is never expanded. The walk
+    // follows `orientation` edges (a filtered "incoming" path answers "which
+    // relations point at me", which the outgoing-only forms cannot), so the
+    // orientation is a parameter here and not a fixed outgoing read.
+    //
+    // READ ATOMICITY: the same per-visit contract as every traversal above — one
+    // vertex shard SHARED lock copies the oriented LINK list, then the candidate
+    // edges are tested one at a time (one edge-shard SHARED lock each, no lock
+    // held between visits), so a concurrent structural writer may be observed on
+    // one visit and not the next while memory safety holds by the header's
+    // cascade argument. A link whose edge or neighbour vanished between the
+    // snapshot and the test simply is not a hop.
+    //
+    // Parallel edges: the link list holds one entry per edge, and the first
+    // matching one wins (the target vertex is discovered once — a BFS visits a
+    // vertex once by definition); the reported PathStep::edge names WHICH of them
+    // carried the hop.
+    //
+    // Does ONE edge's own payload satisfy `constraint`? ONE edge-shard SHARED lock
+    // and a zero-copy probe (no labels/properties copy: a filtered walk tests a
+    // candidate edge per link and must not deep-copy its payload). False when the
+    // edge is unknown — a vanished edge is skipped, not an error, exactly like the
+    // read commands' post-collection resolution.
+    [[nodiscard]] bool edge_matches(EdgeId const &edge, Constraint const &constraint) const;
+
+    // The oriented LINK view of one vertex's adjacency: (edge uid, neighbour uid)
+    // pairs from ONE shard SHARED lock, the outgoing half first when orientation
+    // == both (duplicates between the halves are the caller's dedup problem, like
+    // oriented_adjacency). `out` is replaced, not appended, so a traversal reuses
+    // ONE vector across visits and allocates on degree growth only. False when
+    // `guid` is unknown.
+    [[nodiscard]] bool oriented_links(kimix::Guid const &guid, EdgeOrientation orientation,
+                                      kimix::vector<EdgeLink> &out) const;
+
+    // Edge-filtered reachability: is `to` reachable from `from` over edges that
+    // satisfy `edge_constraint` in `orientation`? Bounded by kMaxNativeHopDepth
+    // (the native ceiling — an "unbounded" filtered search is not offered, because
+    // the answer is a walk, not a composite). A zero-length path (from == to on an
+    // existing vertex) is true without testing any edge: it traverses none.
+    // Unknown endpoints are simply unreachable (false), the unbounded has_path
+    // convention above.
+    [[nodiscard]] bool has_path(kimix::Guid const &from, kimix::Guid const &to,
+                                Constraint const &edge_constraint,
+                                EdgeOrientation orientation) const;
+
+    // Edge-filtered, oriented, bounded shortest path. `out` holds one PathStep per
+    // vertex of the path, endpoints INCLUDED and in order from `from`; the status
+    // and result contract is exactly the vertex-only bounded form's — empty `out`
+    // with ok means `to` is unreachable within `max_depth` over MATCHING edges,
+    // {from} when from == to on an existing vertex.
+    //
+    //   error_argument   max_depth < 1 or > kMaxNativeHopDepth
+    //   error_op         a label condition carries an ordering op (the
+    //                    _resolve_constraint rule, validated up front)
+    //   error_vertex     `from` or `to` is unknown
+    //   ok               otherwise
+    [[nodiscard]] GdiStatus shortest_path(kimix::Guid const &from, kimix::Guid const &to,
+                                          Constraint const &edge_constraint,
+                                          EdgeOrientation orientation, uint32_t max_depth,
+                                          kimix::vector<PathStep> &out) const;
       // --- GDI global scan (the G1 capability) -----------------------------
       // Calls `visit(vertex)` for EVERY vertex in the graph: shard 0..
       // kGraphShardCount-1 in ascending order, each shard's map order within a
