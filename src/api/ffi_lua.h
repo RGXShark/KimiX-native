@@ -13,7 +13,15 @@
  * and comes back here as `status == KIMIX_LUA_DENIED` plus a message of the
  * documented shape
  *
- *     <chunk>:<line>: DENIED: <api> -- <why>
+ *     <chunk>:<line>: DENIED: <api> <EM DASH> <why>
+ *
+ * where <EM DASH> is U+2014 (the three UTF-8 bytes E2 80 94, the separator
+ * src/script/script_error.cpp emits via SB_DASH), e.g.
+ *
+ *     script.lua:7: DENIED: io.open \xE2\x80\x94 file I/O is not available in the sandbox
+ *
+ * It is NOT the ASCII "--": a foreign caller matches on the "DENIED: " prefix or
+ * on the api name, never on the separator, and treats every message as UTF-8.
  *
  * even when the script wrapped the call in its own pcall/xpcall/coroutine.resume.
  * The full model (five layers, capability matrix, residual risks) is
@@ -193,6 +201,7 @@ KIMIX_FFI kimix_status kimix_lua_cancel(KIMIX_IN kimix_lua_sandbox *sb);
  *            on KIMIX_ERR_OUT_OF_RANGE, so a two-phase caller always learns the
  *            required message length)
  *   msg_buf  caller storage for the message, or NULL to only learn its length
+ *            (kimix_lua_last_message then copies it out without re-running)
  *   msg_cap  its capacity in bytes (NUL terminator included)
  *
  * Returns KIMIX_OK when the call itself succeeded (INSPECT res->status for the
@@ -223,6 +232,17 @@ KIMIX_FFI kimix_status kimix_lua_run_named(KIMIX_IN kimix_lua_sandbox *sb,
 /* ===========================================================================
  * 5. Reading the last run (two-phase, caller-owned buffers)
  * ======================================================================== */
+
+/* The message of the last run -- the documented "<chunk>:<line>: <PREFIX>: ..."
+ * text that kimix_lua_run copies into its `msg_buf`, kept here so a caller that
+ * ran with msg_buf == NULL (phase one) can read it WITHOUT running the chunk a
+ * second time.  Empty after a clean run (a successful run has no message).
+ * KIMIX_ERR_OUT_OF_RANGE when `buf` is too small (with `*out_len` still filled);
+ * KIMIX_OK with `buf == NULL` reports the length only. */
+KIMIX_FFI kimix_status kimix_lua_last_message(KIMIX_IN kimix_lua_sandbox *sb,
+                                              KIMIX_OUT KIMIX_NULLABLE char *buf,
+                                              KIMIX_IN size_t cap,
+                                              KIMIX_OUT size_t *out_len);
 
 /* The captured print()/warn() text of the last run.  KIMIX_ERR_OUT_OF_RANGE when
  * `buf` is too small (with `*out_len` still filled); KIMIX_OK with `buf == NULL`

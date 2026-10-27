@@ -2807,6 +2807,12 @@ The same run with an explicit chunk name, which then appears in every message
 is truncated *inside the message* (the full name is available through
 `kimix_lua_last_violation`). A `NULL`/empty name means `"script.lua"`.
 
+#### `kimix_status kimix_lua_last_message(KIMIX_IN kimix_lua_sandbox *sb, KIMIX_OUT char *buf, KIMIX_IN size_t cap, KIMIX_OUT size_t *out_len)`
+The message of the last run — the same `"<chunk>:<line>: <PREFIX>: <api> — <detail>"`
+text `kimix_lua_run` copies into `msg_buf`. It exists so a caller that ran with
+`msg_buf == NULL` (phase one) can read the message without running the chunk a
+second time; empty after a clean run. Two-phase like every other accessor:
+`KIMIX_ERR_OUT_OF_RANGE` when `buf` is too small (with `*out_len` still filled).
 #### `kimix_status kimix_lua_last_output(KIMIX_IN kimix_lua_sandbox *sb, KIMIX_OUT char *buf, KIMIX_IN size_t cap, KIMIX_OUT size_t *out_len)`
 
 The text the last run captured from `print()`/`warn()` — the sandbox never writes
@@ -3163,6 +3169,7 @@ sub-section) the declaration lives in.
 | `kimix_lua_abi_version` | lua §0 | `KIMIX_API_ABI_VERSION` of the running image; assert on it at load time. |
 | `kimix_lua_cancel` | lua §3 | Asks the in-flight run to abort (the only cross-thread call); the hook raises `KIMIX_LUA_CANCELLED`. |
 | `kimix_lua_default_limits` | lua §2 | The library's default resource contract as an editable value. |
+| `kimix_lua_last_message` | lua §5 | The message of the last run, readable without re-running the chunk (two-phase). |
 | `kimix_lua_last_output` | lua §5 | The `print()`/`warn()` text the last run captured (two-phase). |
 | `kimix_lua_last_traceback` | lua §5 | The bounded traceback of the last failure (two-phase). |
 | `kimix_lua_last_value` | lua §5 | One marshalled return value of the last run (string/JSON payload two-phase). |

@@ -207,6 +207,13 @@ kimix_status kimix_lua_run_named(kimix_lua_sandbox *sb, const char *src, size_t 
 /* 5. Reading the last run                                                   */
 /* ------------------------------------------------------------------------- */
 
+kimix_status kimix_lua_last_message(kimix_lua_sandbox *sb, char *buf, size_t cap, size_t *out_len) {
+    if (sb == nullptr) {
+        return KIMIX_ERR_INVALID_ARG;
+    }
+    return copy_out(sb->last.message, buf, cap, out_len);
+}
+
 kimix_status kimix_lua_last_output(kimix_lua_sandbox *sb, char *buf, size_t cap, size_t *out_len) {
     if (sb == nullptr) {
         return KIMIX_ERR_INVALID_ARG;

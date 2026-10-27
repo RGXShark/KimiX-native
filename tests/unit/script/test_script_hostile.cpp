@@ -3,7 +3,8 @@
 // - The 17 forbidden APIs of the plan, each in 7 wrappers: a direct call, pcall,
 //   xpcall(f, h), pcall(xpcall, f, h), pcall(pcall, f), coroutine.resume, and a
 //   coroutine that yields BEFORE it calls the API.  Every one of them must answer
-//   status == denied with "<chunk>:<line>: DENIED: <api> -- <why>".
+// status == denied with "<chunk>:<line>: DENIED: <api> <EM DASH> <why>"
+// (U+2014, the separator SB_DASH emits -- not the ASCII "--").
 // - The denial is not swallowable: `while true do pcall(...) end` aborts.
 // - Bytecode: load(string.dump(f)), a raw "\27Lua" chunk and load(s,'n','b') are
 //   all refused.
