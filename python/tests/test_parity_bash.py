@@ -144,7 +144,7 @@ KIMI_SHELL_COMPAT = _load_by_path(
     "_parity_bash_shell_compat",
 )
 
-_BASH_DIR = KIMIX_SRC / "kimix" / "tools" / "file" / "bash"
+_BASH_DIR = KIMI_CLI_SRC / "kimi_cli" / "tools" / "file" / "bash"
 for _path in (str(KIMIX_SRC), str(KIMI_CLI_SRC)):
     if os.path.isdir(_path) and _path not in sys.path:
         sys.path.insert(0, _path)
@@ -156,7 +156,7 @@ for _path in (str(KIMIX_SRC), str(KIMI_CLI_SRC)):
 # re-exports rtk installation helpers.  A session that already imported the shim
 # (several test modules do) would otherwise hand this file the wrong module and
 # every comparison here would compare against nothing.
-_common_path = KIMIX_SRC / "kimix" / "tools" / "common.py"
+_common_path = KIMI_CLI_SRC / "kimi_cli" / "tools" / "common.py"
 common = _load_by_path(_common_path, "_parity_bash_common")
 for _required in ("_split_shell_segments", "_rewrite_shell_segment",
                   "_is_known_rtk_command", "_maybe_rewrite_shell_command_with_rtk",
@@ -528,14 +528,14 @@ def test_reference_public_api_delegates_to_the_compat_bodies():
     import ast
 
     pairs = {
-        KIMIX_SRC / "kimix" / "tools" / "file" / "bash" / "safety.py": [
+        KIMI_CLI_SRC / "kimi_cli" / "tools" / "file" / "bash" / "safety.py": [
             ("command_detection_variants", "_compat_command_detection_variants"),
             ("detect_hardline_command", "_compat_detect_hardline_command"),
             ("check_hardline_blocked", "_compat_check_hardline_blocked"),
             ("foreground_background_guidance",
              "_compat_foreground_background_guidance"),
         ],
-        KIMIX_SRC / "kimix" / "tools" / "file" / "bash" / "output_enhance.py": [
+        KIMI_CLI_SRC / "kimi_cli" / "tools" / "file" / "bash" / "output_enhance.py": [
             ("interpret_exit_code", "_compat_interpret_exit_code"),
             ("is_expected_exit", "_compat_is_expected_exit"),
             ("annotate_failure", "_compat_annotate_failure"),
@@ -562,8 +562,8 @@ def test_reference_public_bodies_are_the_compat_bodies():
     always compare against the by-path ``_compat_*`` bodies.
     """
     try:
-        safety = ref("kimix.tools.file.bash.safety")
-        output_enhance = ref("kimix.tools.file.bash.output_enhance")
+        safety = ref("kimi_cli.tools.file.bash.safety")
+        output_enhance = ref("kimi_cli.tools.file.bash.output_enhance")
     except Exception:  # pragma: no cover - environment dependent
         pytest.skip("kimi-agent package not importable in this session")
     with mock.patch.object(safety, "_native_use_native", lambda *a, **k: False), \

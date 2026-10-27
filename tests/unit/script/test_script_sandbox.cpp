@@ -46,6 +46,23 @@ int native_twice(lua_State *L) {
     return 1;
 }
 
+/* Wait until the sandbox reports an in-flight run (busy() is atomic, so this is
+ * a legal cross-thread read, like cancel()).  A fixed sleep is NOT enough: on a
+ * loaded box (xmake test runs every suite in parallel) the worker thread may not
+ * be scheduled within any small fixed delay, and the two thread tests below would
+ * then assert against the wrong state.  Measured: with 120 competing CPU-bound
+ * processes a 60 ms sleep was not enough to see the run in flight. */
+bool wait_until_busy(const Sandbox &sb, double max_seconds = 10.0) {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(static_cast<long long>(max_seconds * 1000.0));
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (sb.busy()) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return sb.busy();
+}
 } // namespace
 
 int main(int argc, char *argv[]) {
@@ -337,36 +354,45 @@ int main(int argc, char *argv[]) {
 
     "cancel_from_another_thread"_test = [] {
         Limits limits;
-        limits.max_seconds = 10.0;
+        /* No deadline (0 = none): the ONLY thing that can end this run is
+         * cancel(), which is exactly what the test measures.  With a deadline
+         * configured, a starved machine can expire it before the cancel lands and
+         * the assertion below would then be testing the timeout path instead. */
+        limits.max_seconds = 0.0;
         limits.hook_instruction_granularity = 1000;
         Sandbox sb(limits);
         kimix::script::Result result;
         std::thread worker([&] { result = sb.run("while true do end"); });
-        std::this_thread::sleep_for(std::chrono::milliseconds(60));
-        expect(sb.busy()) << "the run should still be in flight";
+        expect(wait_until_busy(sb)) << "the run should still be in flight";
         sb.cancel();
         const auto started = std::chrono::steady_clock::now();
         worker.join();
         const double elapsed =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         expect(result.status == Status::cancelled) << result.message.c_str();
-        expect(elapsed < 2.0) << "cancel() must abort in bounded time";
+        /* The hook strikes every 1000 instructions, so the abort is immediate in
+         * practice; the bound is only a net for a pathologically starved host. */
+        expect(elapsed < 10.0) << "cancel() must abort in bounded time";
         expect(!sb.busy()) << "busy() must be clear after the run";
     };
 
     "concurrent_run_is_internal"_test = [] {
         Limits limits;
-        limits.max_seconds = 0.30;
+        /* Same reasoning: a deadline would let the long run finish on its own
+         * before the second run starts on a loaded machine. */
+        limits.max_seconds = 0.0;
         limits.hook_instruction_granularity = 1000;
         Sandbox sb(limits);
         kimix::script::Result long_run;
         std::thread worker([&] { long_run = sb.run("while true do end"); });
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        expect(wait_until_busy(sb)) << "the long run should be in flight";
         auto second = sb.run("return 1");
-        worker.join();
         expect(second.status == Status::internal) << second.message.c_str();
         expect(contains(second.message, "concurrent")) << second.message.c_str();
-        expect(long_run.status == Status::timeout) << long_run.message.c_str();
+        /* End the long run: cancel(), not a deadline, is what stops it now. */
+        sb.cancel();
+        worker.join();
+        expect(long_run.status == Status::cancelled) << long_run.message.c_str();
     };
 
     "native_function_is_available"_test = [] {

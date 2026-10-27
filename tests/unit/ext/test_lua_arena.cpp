@@ -40,6 +40,7 @@ extern "C" {
 }
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -162,7 +163,11 @@ int main(int argc, char *argv[]) {
         if (!st.L) return;
         lua_ArenaStats s = st.stats();
         expect(eq(s.enabled, 1));
-        expect(eq(s.dry_run, 0));
+        // KIMIX_LUA_ARENA_DRYRUN=1 replays the whole suite through the decision
+        // logic (M-V1), so the mode is the environment's, not a constant.
+        const int expected_dry = std::getenv("KIMIX_LUA_ARENA_DRYRUN") != nullptr ? 1 : 0;
+        expect(eq(s.dry_run, expected_dry))
+            << "dry_run must follow KIMIX_LUA_ARENA_DRYRUN";
         expect(s.segment_bytes >= 4096u) << "segment size must be the 64 KiB default";
         expect(lua_gc(st.L, LUA_GCISRUNNING, 0) == 1) << "the GC must be running";
         expect(lua_gc(st.L, LUA_GCTRIM, 0) >= 0) << "LUA_GCTRIM must be wired";
@@ -266,6 +271,12 @@ int main(int argc, char *argv[]) {
     "free_list_is_lifo_and_single_handout"_test = [] {
         arena_state st;
         if (!st.L) return;
+        if (st.stats().dry_run) {
+            // A dry run allocates from mimalloc: there is no slot to hand out
+            // twice, so the LIFO discipline is unobservable (M-V1 replay).
+            std::printf("[dry run] free-list discipline skipped: no carved slot\n");
+            return;
+        }
         void *ud = nullptr;
         lua_Alloc f = st.alloc(&ud);
         expect(f != nullptr);
@@ -294,6 +305,10 @@ int main(int argc, char *argv[]) {
     "free_list_grow_in_place_keeps_the_slot"_test = [] {
         arena_state st;
         if (!st.L) return;
+        if (st.stats().dry_run) {
+            std::printf("[dry run] in-place realloc skipped: no carved slot\n");
+            return;
+        }
         void *ud = nullptr;
         lua_Alloc f = st.alloc(&ud);
         // 200 and 205 share the 208-byte granule: the slot is reused in place
@@ -468,6 +483,46 @@ int main(int argc, char *argv[]) {
         expect(s.slots_used >= dry_slots / 2 && s.slots_used <= dry_slots * 2)
             << "the dry run must predict the live slot count within a factor of 2";
         (void)dry_segs;
+    };
+
+    "compaction_dry_run_reports_only"_test = [] {
+        // M-V1, fourth dry run: in a dry run the packer has no carved segment
+        // to inspect, so it must report the plan it would follow -- the same
+        // arithmetic as the planner (slots_free / nslots_per_seg segments can
+        // be emptied, one segment always stays as the target) -- and move
+        // nothing.
+        lua_ArenaConfig cfg;
+        lua_ArenaConfigDefault(&cfg);
+        cfg.dry_run = 1;
+        cfg.enable_compaction = 1;  // even enabled, a dry run may not move a block
+        const char *build =
+            "T = {} "
+            "for i = 1, 300 do T[i] = table.new(64) "
+            "  for k = 1, 64 do T[i][k] = i * 1000 + k end end "
+            "for i = 1, 300 do if i % 3 ~= 0 then T[i] = nil end end "
+            "collectgarbage('collect') ";
+        arena_state st(&cfg);
+        if (!st.L) return;
+        luaL_openlibs(st.L);
+        expect(st.dostring(build) == LUA_OK);
+        const lua_ArenaStats before = st.stats();
+        expect(eq(before.dry_run, 1));
+        const int moved = lua_gc(st.L, LUA_GCCOMPACT, 0);
+        const lua_ArenaStats after = st.stats();
+        expect(eq(moved, 0)) << "a dry run must not move a block";
+        expect(eq(after.compacted_bytes, (size_t)0)) << "nothing may be packed";
+        expect(after.would_compact_bytes > 0u)
+            << "the planner must report the sparse segment it would empty";
+        expect(eq(after.commit_bytes, before.commit_bytes))
+            << "a dry run must not change the committed bytes";
+        expect(eq(lua_ArenaInteriorHolders(st.arena), 0u))
+            << "no call may hold an interior pointer across a compaction";
+        // the plan is the class arithmetic, not a guess: 300 slots of the
+        // 580-byte array class fit 112 per segment, two thirds go away, so one
+        // whole segment's worth of slots is free.
+        const lua_ArenaStats s = st.stats();
+        expect(s.would_compact_bytes >= 580u * 112u)
+            << "the plan must be at least one segment of the array class";
     };
 
     "logical_live_tracks_gc_count"_test = [] {

@@ -674,6 +674,22 @@ void sb_env_build(lua_State *L, SandboxState *s, const kimix::vector<SandboxNati
     sbx_wrap_lib(L, env, "string", "format", &sbx_format, kTagFormat);
     /* string.dump is a tripwire: bytecode may never leave the state. */
     sbx_tripwire_lib_fn(L, env, "string", "dump", "string.dump", kCatBytecode, kDetailBytecode);
+    /* The vendored interpreter can add build-dependent helpers to its
+     * libraries: KIMIX_LUA_ARENA adds table.new / table.shrink (see
+     * docs/lua_memory_arena.md). A sandbox surface must not vary with a
+     * compile-time switch, and a script gains nothing from two memory-shaping
+     * hints while the budgeted allocator is the layer that decides footprint,
+     * so they are dropped here. The capability matrix, the golden surface and
+     * every hostile test then read the same whether the arena is built in or
+     * not. */
+    lua_getfield(L, env, "table");
+    if (lua_istable(L, -1)) {
+        lua_pushnil(L);
+        lua_setfield(L, -2, "new");
+        lua_pushnil(L);
+        lua_setfield(L, -2, "shrink");
+    }
+    lua_pop(L, 1);
     lua_pop(L, 1); /* globals */
 
     if (s->coroutines) {

@@ -104,9 +104,9 @@ pytestmark = pytest.mark.skipif(
 PY = runtime_py.builtin_tools.python
 
 # Reference modules (imported from the kimi-agent checkout only).
-PY_REF = ref("kimix.tools.py")
-COMMON_REF = ref("kimix.tools.common")
-SECURITY_REF = ref("kimix.tools.security")
+PY_REF = ref("kimi_cli.tools.py")
+COMMON_REF = ref("kimi_cli.tools.common")
+SECURITY_REF = ref("kimi_cli.tools.security")
 
 
 # ---------------------------------------------------------------------------

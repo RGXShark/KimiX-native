@@ -6,6 +6,15 @@
 // tools are ordinary registered classes (ToolRegistry), not importable
 // modules.  See src/cli/PLAN.md §4.
 //
+// The Python package renamed its tool modules from `kimix.tools.*` to
+// `kimi_cli.tools.*` (and `note:WritePlan` -> `note:write_plan`,
+// `agent:*` -> `subagent:*`, `web.fetch_url:*` -> `web.kimix_fetch:*`), so
+// k_clit_agent_tools holds the CURRENT reference spellings and
+// k_clit_agent_tool_aliases keeps the pre-rename spellings resolvable for
+// manifests and configs written against the older reference.  Only the
+// canonical table feeds default_agent_tools(), so the alias rows can never
+// duplicate a registry name in the built-in default tool list.
+//
 // Unity build: the only TU-local data lives in an anonymous namespace with the
 // `clit_` prefix (never at namespace scope with a bare name), so concatenating
 // this file with the other cli/*.cpp units cannot collide.
@@ -15,18 +24,18 @@
 #include <utility>
 
 namespace kimix::cli {
-
 namespace {
 
-  // The 22 (manifest tool path, registry name) pairs of the agent_*.json union.
-// This is the production copy of the table in
-// tests/unit/builtin_tools/test_tool.cpp ("registry_covers_every_agent_json_tool");
-// keep the two in sync.  Order == PLAN.md §4 (the union, most-specific role
-// first), which is also the order default_agent_tools() reports.
-struct clit_agent_tool_entry {
-    const char *path;          // "<module.path>:<attr>" as written in the JSON
-    const char *registry_name; // ToolRegistry key (lowercase canonical name)
-};
+    // The 21 (manifest tool path, registry name) pairs of the agent_*.json union,
+    // in the CURRENT reference spelling.  This is the production copy of the
+    // table in tests/unit/builtin_tools/test_tool.cpp
+    // ("registry_covers_every_agent_json_tool"); keep the two in sync.  Order ==
+    // PLAN.md §4 (the union, most-specific role first), which is also the order
+    // default_agent_tools() reports.
+    struct clit_agent_tool_entry {
+        const char *path; // "<module.path>:<attr>" as written in the JSON
+        const char *registry_name; // ToolRegistry key (lowercase canonical name)
+    };
 
     const clit_agent_tool_entry k_clit_agent_tools[] = {
         {"kimi_cli.tools.file:read", "read"},
@@ -35,23 +44,56 @@ struct clit_agent_tool_entry {
         {"kimi_cli.tools.file:grep", "grep"},
         {"kimi_cli.tools.file:edit", "edit"},
         {"kimi_cli.tools.file:write", "write"},
-        {"kimix.tools.web.fetch_url:fetch_url", "fetch_url"},
+        {"kimi_cli.tools.web.kimix_fetch:fetch_url", "fetch_url"},
         {"kimi_cli.tools.web:web_search", "web_search"},
+        {"kimi_cli.tools.note:write_plan", "writeplan"},
+        {"kimi_cli.tools.note:read_plan", "readplan"},
+        {"kimi_cli.tools.note:edit_plan", "editplan"},
+        {"kimi_cli.tools.subagent:subagent", "subagent"},
+        {"kimi_cli.tools.subagent:list_agents", "list_agents"},
+        {"kimi_cli.tools.subagent:interrupt_agent", "interrupt_agent"},
+        {"kimi_cli.tools.swarm:workflow", "workflow"},
+        {"kimi_cli.tools.todo:todo_list", "todo_list"},
+        {"kimi_cli.tools.context:compact", "compact"},
+        {"kimi_cli.tools.file.bash:bash", "bash"},
+        {"kimi_cli.tools.file.bash:pwsh", "pwsh"},
+        {"kimi_cli.tools.py:python", "python"},
+        {"kimi_cli.tools.background:job_output", "job_output"},
+    };
+
+    // Pre-rename spellings the older reference manifests/configs still carry.
+    // Resolve-only: these paths never appear in default_agent_tools().
+    const clit_agent_tool_entry k_clit_agent_tool_aliases[] = {
+        // The reference dropped memory:retrieve from every role manifest (the
+        // memory is injected by auto_retrieve instead), so it is no longer part
+        // of the union; the tool itself stays registered and an older manifest
+        // that still names it keeps working.
+        {"kimi_cli.tools.memory:retrieve", "retrieve"},
+        {"kimix.tools.web.fetch_url:fetch_url", "fetch_url"},
         {"kimix.tools.note:WritePlan", "writeplan"},
         {"kimix.tools.note:ReadPlan", "readplan"},
         {"kimix.tools.note:EditPlan", "editplan"},
-      {"kimix.tools.agent:subagent", "subagent"},
-      {"kimix.tools.agent:list_agents", "list_agents"},
+        {"kimix.tools.agent:subagent", "subagent"},
+        {"kimix.tools.agent:list_agents", "list_agents"},
         {"kimix.tools.agent:interrupt_agent", "interrupt_agent"},
         {"kimix.tools.swarm:workflow", "workflow"},
-        {"kimi_cli.tools.todo:todo_list", "todo_list"},
-        {"kimi_cli.tools.memory:retrieve", "retrieve"},
         {"kimix.tools.context:compact", "compact"},
         {"kimix.tools.file.bash:bash", "bash"},
         {"kimix.tools.file.bash:pwsh", "pwsh"},
         {"kimix.tools.py:python", "python"},
         {"kimix.tools.background:job_output", "job_output"},
     };
+
+    // Linear scan over one table; "" when the exact path is absent.
+    kimix::string clit_lookup(const clit_agent_tool_entry *entries, size_t count,
+                              kimix::string_view tool_path) {
+        for (size_t i = 0; i < count; ++i) {
+            if (kimix::string_view(entries[i].path) == tool_path) {
+                return kimix::string(entries[i].registry_name);
+            }
+        }
+        return {};
+    }
 
 } // namespace
 
@@ -76,12 +118,19 @@ kimix::string resolve_tool_path(kimix::string_view tool_path) {
     if (pos == kimix::string_view::npos || pos == 0 || pos + 1 >= tool_path.size()) {
         return {};
     }
-    for (const std::pair<kimix::string, kimix::string> &entry : agent_tool_table()) {
-        if (entry.first == tool_path) {
-            return entry.second;
-        }
+    // Canonical (current reference) spellings first, then the pre-rename
+    // aliases so an older manifest keeps working.
+    kimix::string registry = clit_lookup(k_clit_agent_tools,
+                                         sizeof(k_clit_agent_tools) /
+                                             sizeof(k_clit_agent_tools[0]),
+                                         tool_path);
+    if (!registry.empty()) {
+        return registry;
     }
-    return {};
+    return clit_lookup(k_clit_agent_tool_aliases,
+                       sizeof(k_clit_agent_tool_aliases) /
+                           sizeof(k_clit_agent_tool_aliases[0]),
+                       tool_path);
 }
 
 const kimix::vector<kimix::string> &default_agent_tools() {

@@ -167,6 +167,13 @@ int main(int argc, char *argv[]) {
     "shrink_releases_capacity_and_keeps_contents"_test = [] {
         arena_state st;
         if (!st.L) return;
+        if (st.stats().dry_run) {
+            // A dry run only reports the shrink (see the next test):
+            // KIMIX_LUA_ARENA_DRYRUN=1 replays the suite through the decision
+            // logic, so the observed-effect half is skipped (M-V1).
+            std::printf("[dry run] shrink effects skipped: nothing is resized\n");
+            return;
+        }
         expect(st.dostring(
                    "collectgarbage('stop') "
                    "T = table.new(1024) "
@@ -243,6 +250,12 @@ int main(int argc, char *argv[]) {
         move_cfg.enable_compaction = 1;
         arena_state st(&move_cfg);
         if (!st.L) return;
+        if (st.stats().dry_run) {
+            // KIMIX_LUA_ARENA_DRYRUN=1: the plan half above is the real
+            // assertion, the mover cannot run without carved segments (M-V1).
+            std::printf("[dry run] compaction move skipped: no carved segment\n");
+            return;
+        }
         expect(st.dostring(build) == LUA_OK);
         expect(st.dostring("CHECK = 1 for i = 1, 300 do local t = T[i] "
                            " if t then for k = 1, 64 do "
@@ -258,6 +271,8 @@ int main(int argc, char *argv[]) {
         expect(after.commit_bytes < before.commit_bytes)
             << "compaction must lower the committed bytes";
         expect(after.compaction_skips == 0u) << "the preconditions must hold in this test";
+      expect(eq(lua_ArenaInteriorHolders(st.arena), 0u))
+          << "no call may hold an interior pointer across a compaction";
         // contents intact after the move
         expect(st.dostring("CHECK = 1 for i = 1, 300 do local t = T[i] "
                            " if t then for k = 1, 64 do "

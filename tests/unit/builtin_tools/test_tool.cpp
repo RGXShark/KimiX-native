@@ -1243,10 +1243,14 @@ int main(int argc, char *argv[]) {
                               const char *registry_name; // ToolRegistry key (lowercase canonical name)
           };
               // Union of agent_boss.json / agent_planner.json / agent_readonly.json /
-              // agent_subagent.json / agent_worker.json - 24 distinct tools.
-              // (The reference manifests renamed kimi_cli.tools.todo:todo_write and
-              // :todo_update to the single todo_list; the registry is todo_list
-              // canonical, and context_prune joined the registry.)
+              // agent_subagent.json / agent_worker.json - 24 registered tools, in the
+              // reference's current module spelling.  Three rows are registry-only (no
+              // current manifest names them): send_message, context_prune and
+              // memory:retrieve - the reference dropped them from the role manifests, so
+              // they are listed here only to prove they stay registered.  The two
+              // reference paths the native port does not implement (file.run:Run and
+              // skill:skill) are absent, as is memory:retrieve in cli_tools.cpp's
+              // canonical table.
             static const agent_tool_entry k_agent_tools[] = {
               {"kimi_cli.tools.file:read", "read"},
               {"kimi_cli.tools.file:read_image", "read_image"},
@@ -1254,24 +1258,24 @@ int main(int argc, char *argv[]) {
               {"kimi_cli.tools.file:grep", "grep"},
               {"kimi_cli.tools.file:edit", "edit"},
               {"kimi_cli.tools.file:write", "write"},
-              {"kimix.tools.web.fetch_url:fetch_url", "fetch_url"},
+              {"kimi_cli.tools.web.kimix_fetch:fetch_url", "fetch_url"},
               {"kimi_cli.tools.web:web_search", "web_search"},
-              {"kimix.tools.note:WritePlan", "writeplan"},
-              {"kimix.tools.note:ReadPlan", "readplan"},
-              {"kimix.tools.note:EditPlan", "editplan"},
-              {"kimix.tools.agent:subagent", "subagent"},
+              {"kimi_cli.tools.note:write_plan", "writeplan"},
+              {"kimi_cli.tools.note:read_plan", "readplan"},
+              {"kimi_cli.tools.note:edit_plan", "editplan"},
+              {"kimi_cli.tools.subagent:subagent", "subagent"},
               {"kimix.tools.agent:send_message", "send_message"},
-              {"kimix.tools.agent:list_agents", "list_agents"},
-              {"kimix.tools.agent:interrupt_agent", "interrupt_agent"},
-              {"kimix.tools.swarm:workflow", "workflow"},
+              {"kimi_cli.tools.subagent:list_agents", "list_agents"},
+              {"kimi_cli.tools.subagent:interrupt_agent", "interrupt_agent"},
+              {"kimi_cli.tools.swarm:workflow", "workflow"},
                   {"kimi_cli.tools.todo:todo_list", "todo_list"},
                 {"kimi_cli.tools.context_prune:context_prune", "context_prune"},
               {"kimi_cli.tools.memory:retrieve", "retrieve"},
-              {"kimix.tools.context:compact", "compact"},
-              {"kimix.tools.file.bash:bash", "bash"},
-              {"kimix.tools.file.bash:pwsh", "pwsh"},
-              {"kimix.tools.py:python", "python"},
-              {"kimix.tools.background:job_output", "job_output"},
+              {"kimi_cli.tools.context:compact", "compact"},
+              {"kimi_cli.tools.file.bash:bash", "bash"},
+              {"kimi_cli.tools.file.bash:pwsh", "pwsh"},
+              {"kimi_cli.tools.py:python", "python"},
+              {"kimi_cli.tools.background:job_output", "job_output"},
           };
             const size_t expected = sizeof(k_agent_tools) / sizeof(k_agent_tools[0]);
             expect(eq(expected, size_t(24))) << "the agent JSON union has 24 tools";

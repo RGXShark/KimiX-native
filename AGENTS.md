@@ -336,7 +336,7 @@ Use this index to find the files for a feature change. Layout: **feature → pri
 | Core utilities (strings, memory, STL, json) | `src/core/` (umbrella `kimix_core.h`, STL aliases in `core/stl/`) |
 | Runtime kernels exposed to Python | `src/runtime/<area>/` + pybind layer `src/runtime/py/` |
 | The C FFI surface (foreign-language callers) | `src/api/` (one `ffi_<area>.h/.cpp` pair per area) + `docs/ffi.md` |
-| Lua interpreter memory (arena, trim, table presize/shrink) | `src/ext/lua/larena.c` (the arena) + `docs/lua_memory_arena.md`; build switch `--lua_arena`, exported diff `src/ext/lua.kimix.patch`, gates `test_lua_arena` / `test_lua_table_mem` / `bench_lua_mem` / `lua-tests` |
+| Lua interpreter memory (arena, trim, table presize/shrink) | `src/ext/lua/larena.c` (the arena) + `docs/lua_memory_arena.md`; build switch `--lua_arena`, exported diff `src/ext/lua.kimix.patch`, gates `test_lua_arena` / `test_lua_table_mem` (both also under `KIMIX_LUA_ARENA_DRYRUN=1`) / `bench_lua_mem` / `lua-tests` + `tests/unit/ext/lua_e2e/run_testes.py` |
 | What a script may do (sandbox capabilities, tripwires, budgets) | `src/script/script_env.cpp` (allow/replace/deny), `script_alloc.cpp` + `script_hook.cpp` (budgets), `script_sticky.cpp` (abort semantics) + `src/script/README.md` |
 | Python-side shim / parity fallback | `python/kimix_native/` |
 | Build wiring of any of the above | `src/xmake.lua` (targets), `tests/xmake.lua` (test targets) |

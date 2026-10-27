@@ -64,10 +64,28 @@ What is **not** in scope, stated so nobody oversells the result:
   process compromise.
 - Uninterruptible C work (a pathological `string.find`/`gsub` pattern burns CPU
   with zero hook strikes) is *bounded* by the memory budget, not eliminated.
-- Process separation (`fork` a helper, JSON over pipes) is the real answer for
+- Process separation (fork a helper, JSON over pipes) is the real answer for
   untrusted third-party scripts and is deliberately deferred.
 
-## 3. Message format
+The interpreter memory arena (not wired in yet). The vendored interpreter can be
+built with a per-state size-class arena (`KIMIX_LUA_ARENA`, see
+`docs/lua_memory_arena.md`): `luaL_newstate_arena()` serves the state from
+64 KiB segments with exact-size classes for table array/node blocks, and
+`lua_ArenaTrim()`/`lua_gc(LUA_GCTRIM)` give the capacity back. The sandbox does
+not use it: `script_alloc.cpp`'s budgeted `lua_Alloc` is the outermost layer and
+must stay that way (it is what enforces `Limits::max_memory_bytes` and reports
+logical bytes in the `MEMORY:` message), and `script_state.cpp` builds its state
+with `lua_newstate` + that allocator. Nesting the arena *underneath* the budget
+— budget counts logical bytes, the arena serves them — plus a
+`lua_ArenaTrim(1)` at the end of every run and the arena counters inside
+`Result` is the plan's `[needs src/script]` follow-up, not a capability change:
+`luaL_newstate` and the whole capability matrix above stay exactly as they are.
+An arena build adds `table.new`/`table.shrink` to the interpreter's `table`
+library; `script_env.cpp` drops both for every run, so the reachable surface
+(the golden list in `test_script_surface`) is the same with the arena built in or
+out.
+
+3. Message format
 
 One format, composed in exactly one place (`script_error.cpp`), so what a
 script's own error handler sees and what the host receives cannot diverge:

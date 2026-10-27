@@ -262,6 +262,22 @@ class Arena:
                     for cid in range(len(self.used)))
         return total + sum(self.huge_live) + sum(self.huge_cached)
 
+    def compaction_plan(self) -> int:
+        """The compaction plan a dry run can compute (mirrors
+        'lua_arena_dry_plan' in src/ext/lua/larena.c): a source segment is
+        emptied only when all of its slots are live table array blocks, so
+        packing 'm' of them needs 'm * nslots <= free slots', and one segment
+        always stays as the target. Exact when every live block of the class
+        is a table array block, an upper bound otherwise."""
+        would = 0
+        for cid in range(len(self.used)):
+            per_seg = self.table.nslots(cid)
+            if self.segments[cid] < 2 or per_seg == 0:
+                continue
+            spares = min(self.free[cid] // per_seg, self.segments[cid] - 1)
+            would += spares * self.table.payload(cid)
+        return would
+
     def internal_waste(self) -> int:
         slotted = sum(self.used[cid] * self.table.slot_size(cid)
                       for cid in range(len(self.used)))
@@ -346,12 +362,15 @@ def main() -> int:
         print("internal waste     %8.2f MB (%.1f %% of live)"
               % (arena.internal_waste() / 1048576.0,
                  100.0 * arena.internal_waste() / arena.logical if arena.logical else 0.0))
-        print("segments           %d (%.2f MB)"
-              % (sum(arena.segments), sum(arena.segments) / 1048576.0 * 0 +
-                 0))
+        print("segments           %d (%.2f MB of slots)"
+              % (sum(arena.segments),
+                 sum(arena.segments[cid] * table.payload(cid)
+                     for cid in range(len(arena.segments))) / 1048576.0))
         print("segment bytes      %8.2f MB"
               % (sum(arena.segments[cid] * table.payload(cid)
                      for cid in range(len(arena.segments))) / 1048576.0))
+        print("compaction plan    %8.2f MB (segments the packer could empty)"
+              % (arena.compaction_plan() / 1048576.0))
         print("slots used/free    %d / %d"
               % (sum(arena.used), sum(arena.free)))
         print("would_segments     %d, reuse %d, huge reuse %d"

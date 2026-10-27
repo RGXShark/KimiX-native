@@ -119,10 +119,26 @@ struct manifest_stats {
 // reference checkout still names them, so a present manifest lists them; the
 // checker reports them as skipped (neither resolved nor unresolved) instead of
 // failing the acceptance check.
+//
+// Keyed on the attr (the half after the LAST ':'), because the reference renames
+// its modules without renaming the tool class: `kimix.tools.file.run:Run` became
+// `kimi_cli.tools.file.run:Run` and `kimi_cli.tools.skill:skill` is new.
 bool tool_entry_not_ported(kimix::string_view tool_entry) {
+    const size_t colon = tool_entry.rfind(':');
+    const kimix::string_view attr =
+        colon == kimix::string_view::npos ? tool_entry : tool_entry.substr(colon + 1);
     // The native port has no `run` tool (direct process execution without a
     // shell): bash/pwsh cover that job.
-    return tool_entry == "kimix.tools.file.run:Run";
+    if (attr == "Run") {
+        return true;
+    }
+    // The native port has no `skill` tool yet: skill discovery exists for the
+    // system prompt (src/cli/cli_skills.cpp) but there is no tool that loads a
+    // SKILL.md on demand, so the CLI drops the path with a warning.
+    if (attr == "skill") {
+        return true;
+    }
+    return false;
 }
 
 // Core checker: parse one manifest text and resolve every tool entry through

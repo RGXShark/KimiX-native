@@ -44,10 +44,10 @@ index 8bc2ddd1..2fb787ab 100644
    G(L)->ud = ud;
 diff --git a/larena.c b/larena.c
 new file mode 100644
-index 00000000..485db907
+index 00000000..cd87879c
 --- /dev/null
 +++ b/larena.c
-@@ -0,0 +1,1025 @@
+@@ -0,0 +1,1096 @@
 +/*
 +** $Id: larena.c $
 +** kimix extension: per-lua_State memory arena (KIMIX_LUA_ARENA)
@@ -636,7 +636,10 @@ index 00000000..485db907
 +      if (v > 0)
 +        mb = v;
 +    }
-+    a->trace = fopen(path, "wb");
++          /* append: a process may create several arena states (a corpus run, the
++         unit suite), and one cumulative trace is what a replay wants. The
++         driver deletes the file when it wants a fresh one. */
++      a->trace = fopen(path, "ab");
 +    a->trace_limit = cast_sizet(mb) * 1024u * 1024u;
 +    if (a->trace == NULL) {
 +      a->trace_done = 1;
@@ -903,6 +906,62 @@ index 00000000..485db907
 +  G(L)->arena = a;
 +}
 +
++void lua_arena_interior_enter (lua_State *L) {
++  lua_Arena *a = (L != NULL) ? G(L)->arena : NULL;
++  if (a != NULL) {
++#if defined(KIMIX_LUA_MEMCHECK)
++    a->interior_holders++;
++#endif
++  }
++}
++
++void lua_arena_interior_leave (lua_State *L) {
++  lua_Arena *a = (L != NULL) ? G(L)->arena : NULL;
++  if (a != NULL) {
++#if defined(KIMIX_LUA_MEMCHECK)
++    lua_arena_check(a->interior_holders > 0);
++    if (a->interior_holders > 0)
++      a->interior_holders--;
++#endif
++  }
++}
++
++void lua_arena_interior_reset (lua_State *L) {
++  lua_Arena *a = (L != NULL) ? G(L)->arena : NULL;
++  if (a != NULL) {
++#if defined(KIMIX_LUA_MEMCHECK)
++    a->interior_holders = 0;
++#endif
++  }
++}
++
++/*
++** The plan a dry run can produce for 'lua_gc(LUA_GCCOMPACT)'. A source
++** segment is emptied only when every slot it holds is a live table array
++** block and its blocks fit into the free slots of the segments that stay,
++** i.e. 'm' sources need 'm * nslots_per_seg <= slots_free' and one segment
++** always remains as the target. On the counters alone that is exact when
++** every live block of the class is a table array block and an upper bound
++** otherwise -- which is what a dry run can know without carved segments.
++*/
++size_t lua_arena_dry_plan (lua_Arena *a) {
++  size_t would = 0;
++  int i;
++  if (a == NULL)
++    return 0;
++  for (i = 0; i < a->nclasses; i++) {
++    ArenaClass *c = &a->classes[i];
++    unsigned spares;
++    if (c->seg_count < 2 || c->nslots_per_seg == 0)
++      continue;				/* nothing to pack into */
++    spares = c->slots_free / c->nslots_per_seg;
++    if (spares >= c->seg_count)
++      spares = c->seg_count - 1;	/* one segment stays as the target */
++    would += cast_sizet(spares) * c->seg_payload;
++  }
++  return would;
++}
++
 +
 +void lua_arena_stats (lua_Arena *a, lua_ArenaStats *st) {
 +  int i;
@@ -1011,6 +1070,18 @@ index 00000000..485db907
 +  lua_ArenaStatsOf(a, st);
 +}
 +
++/* how many calls are holding an interior pointer right now (0 when the
++   KIMIX_LUA_MEMCHECK net is not part of this build) */
++unsigned lua_ArenaInteriorHolders (void *arena) {
++  lua_Arena *a = cast(lua_Arena *, arena);
++#if defined(KIMIX_LUA_MEMCHECK)
++  return (a != NULL) ? a->interior_holders : 0u;
++#else
++  (void)a;
++  return 0u;
++#endif
++}
++
 +
 +size_t lua_ArenaTrimHandle (void *arena, int level) {
 +  if (arena == NULL)
@@ -1075,10 +1146,10 @@ index 00000000..485db907
 +#endif					/* } */
 diff --git a/larena.h b/larena.h
 new file mode 100644
-index 00000000..09dd7680
+index 00000000..656696c4
 --- /dev/null
 +++ b/larena.h
-@@ -0,0 +1,199 @@
+@@ -0,0 +1,223 @@
 +/*
 +** $Id: larena.h $
 +** kimix extension: per-lua_State memory arena (KIMIX_LUA_ARENA)
@@ -1224,8 +1295,11 @@ index 00000000..09dd7680
 +  size_t would_compact_bytes;
 +  size_t compacted_bytes;
 +  unsigned long compactions;
-+  unsigned long compaction_skips;
-+  int in_compaction;
++    unsigned long compaction_skips;
++    int in_compaction;
++#if defined(KIMIX_LUA_MEMCHECK)
++    unsigned interior_holders;  /* luaH_* calls holding a pointer into a vector */
++#endif
 +  /* the huge tier */
 +  ArenaHuge huge[ARENA_MAX_HUGE];
 +  unsigned nhuge;
@@ -1256,7 +1330,28 @@ index 00000000..09dd7680
 +** huge cache and purge free mimalloc pages; returns bytes released */
 +LUAI_FUNC size_t lua_arena_trim (lua_Arena *a, int level);
 +
-+LUAI_FUNC void lua_arena_stats (lua_Arena *a, lua_ArenaStats *st);
++  LUAI_FUNC void lua_arena_stats (lua_Arena *a, lua_ArenaStats *st);
++  /*
++  ** Debug net for the compaction pass. The only functions that form an
++  ** interior pointer (a 'Value *' / 'Node *' into an array or node vector)
++  ** and can be entered from outside a Lua/C call bump 'interior_holders'
++  ** around their body, so a move that would invalidate such a pointer is an
++  ** assert instead of silent corruption. 'luaH_get*' and 'luaH_pset*' carry
++  ** no 'lua_State *' in upstream's API, so they cannot reach the arena; a
++  ** compaction only runs at a quiescent point anyway (nCcalls == 0).
++  */
++  LUAI_FUNC void lua_arena_interior_enter (lua_State *L);
++  LUAI_FUNC void lua_arena_interior_leave (lua_State *L);
++  /* an error unwinds out of a holder body without running its 'leave', so
++     'luaD_throw' clears the counter: a leaked increment must not turn into a
++     false assert on the next compaction */
++  LUAI_FUNC void lua_arena_interior_reset (lua_State *L);
++  /*
++  ** The compaction plan a dry run can compute: the same arithmetic as the
++  ** planner in lgc.c, on the class counters alone (a dry run carves no
++  ** segment, so it has no segment to inspect).
++  */
++  LUAI_FUNC size_t lua_arena_dry_plan (lua_Arena *a);
 +LUAI_FUNC void lua_arena_defaults (lua_ArenaConfig *cfg);
 +
 +/* attach the arena to a state created with 'lua_arena_alloc' and this
@@ -1303,8 +1398,37 @@ index 2d015362..3d9a9800 100644
  
  LUALIB_API unsigned (luaL_makeseed) (lua_State *L);
  
+diff --git a/ldo.c b/ldo.c
+index fe8bf20f..35c37beb 100644
+--- a/ldo.c
++++ b/ldo.c
+@@ -33,7 +33,11 @@
+ #include "lvm.h"
+ #include "lzio.h"
+ 
++#include "lzio.h"
+ 
++#if defined(KIMIX_LUA_ARENA)		/* { */
++#include "larena.h"
++#endif					/* } */
+ 
+ #define errorstatus(s)	((s) > LUA_YIELD)
+ 
+@@ -123,6 +127,12 @@ void luaD_seterrorobj (lua_State *L, TStatus errcode, StkId oldtop) {
+ 
+ 
+ l_noret luaD_throw (lua_State *L, TStatus errcode) {
++#if defined(KIMIX_LUA_ARENA)		/* { */
++  /* an error unwinds out of a body that counted itself as an interior-pointer
++     holder without running its 'leave'; clear the net so the next compaction
++     does not assert on a stale count */
++  lua_arena_interior_reset(L);
++#endif					/* } */
+   if (L->errorJmp) {  /* thread has an error handler? */
+     L->errorJmp->status = errcode;  /* set status */
+     LUAI_THROW(L, L->errorJmp);  /* jump to it */
 diff --git a/lgc.c b/lgc.c
-index cf4160c1..f2fc5c73 100644
+index cf4160c1..67212964 100644
 --- a/lgc.c
 +++ b/lgc.c
 @@ -24,7 +24,10 @@
@@ -1331,7 +1455,7 @@ index cf4160c1..f2fc5c73 100644
    GCObject *o = cast(GCObject *, p + offset);
    o->marked = luaC_white(g);
    o->tt = tt;
-@@ -1803,3 +1810,210 @@ void luaC_fullgc (lua_State *L, int isemergency) {
+@@ -1803,3 +1810,219 @@ void luaC_fullgc (lua_State *L, int isemergency) {
  /* }====================================================== */
  
  
@@ -1381,6 +1505,15 @@ index cf4160c1..f2fc5c73 100644
 +    /* 'getCcalls' is the C-call nesting depth: the high half of nCcalls
 +       only marks the main thread as non-yieldable */
 +    a->compaction_skips++;
++    return 0;
++  }
++#if defined(KIMIX_LUA_MEMCHECK)
++  /* a body that formed a 'Value *' / 'Node *' into a vector is still running:
++     moving a block now would leave that pointer dangling */
++  lua_arena_check(a->interior_holders == 0);
++#endif
++  if (a->cfg.dry_run) {  /* no carved segment: report the plan, move nothing */
++    a->would_compact_bytes = lua_arena_dry_plan(a);
 +    return 0;
 +  }
 +  for (i = 0; i < cast_uint(a->nclasses); i++) {
@@ -1435,8 +1568,8 @@ index cf4160c1..f2fc5c73 100644
 +      ArenaClass *c = &a->classes[i];
 +      unsigned target_free = 0;	/* free slots in the segments left alone */
 +      unsigned to_move = 0;	/* blocks the chosen sources contribute */
-+      if (c->seg_count < 2)
-+        continue;			/* nothing to move into */
++        if (c->seg_count < 2 || c->segs == NULL)
++          continue;			/* nothing to move into */
 +      for (j = 0; j < c->seg_count; j++)
 +        target_free += c->segs[j]->nfree;
 +      for (;;) {
@@ -1649,6 +1782,22 @@ index dc714fb2..b8f59ba5 100644
  LUAI_FUNC l_noret luaM_toobig (lua_State *L);
  
  /* not to be called directly */
+diff --git a/lstate.c b/lstate.c
+index 08179357..b26ae324 100644
+--- a/lstate.c
++++ b/lstate.c
+@@ -372,6 +372,11 @@ LUA_API lua_State *lua_newstate (lua_Alloc f, void *ud, unsigned seed) {
+   incnny(L);  /* main thread is always non yieldable */
+   g->frealloc = f;
+   g->ud = ud;
++#if defined(KIMIX_LUA_ARENA)		/* { */
++  /* a plain state (luaL_newstate / luaL_alloc) has no arena: everything that
++     asks 'G(L)->arena' must see NULL, never an uninitialized field */
++  g->arena = NULL;
++#endif					/* } */
+   g->warnf = NULL;
+   g->ud_warn = NULL;
+   g->seed = seed;
 diff --git a/lstate.h b/lstate.h
 index 30a560a7..efa3bbaf 100644
 --- a/lstate.h
@@ -1667,10 +1816,10 @@ index 30a560a7..efa3bbaf 100644
    l_mem GCdebt;  /* bytes counted but not yet allocated */
    l_mem GCmarked;  /* number of objects marked in a GC cycle */
 diff --git a/ltable.c b/ltable.c
-index 2f2b5c1f..8b7ee875 100644
+index 2f2b5c1f..c718f0e7 100644
 --- a/ltable.c
 +++ b/ltable.c
-@@ -35,6 +35,9 @@
+@@ -35,10 +35,26 @@
  #include "lmem.h"
  #include "lobject.h"
  #include "lstate.h"
@@ -1680,7 +1829,52 @@ index 2f2b5c1f..8b7ee875 100644
  #include "lstring.h"
  #include "ltable.h"
  #include "lvm.h"
-@@ -393,8 +396,12 @@ static size_t sizehash (Table *t) {
+ 
++#if defined(KIMIX_LUA_ARENA)		/* { */
++/*
++** Interior-pointer net for the compaction pass (see larena.h). The two
++** functions below both form a 'Value *' / 'Node *' into a vector and can be
++** entered from outside a Lua/C call, so they bump the arena's holder count
++** around their body: a compaction that would invalidate that pointer then
++** trips an assert in a KIMIX_LUA_MEMCHECK build instead of corrupting the
++** table. The counter is a no-op in a release build.
++*/
++#define luaH_interior_enter(L)	lua_arena_interior_enter(L)
++#define luaH_interior_leave(L)	lua_arena_interior_leave(L)
++#endif					/* } */
++
+ 
+ /*
+ ** Only hash parts with at least 2^LIMFORLAST have a 'lastfree' field
+@@ -358,7 +374,27 @@ static unsigned findindex (lua_State *L, Table *t, TValue *key,
+ }
+ 
+ 
++static int luaH_nextbody (lua_State *L, Table *t, StkId key);
++
++/*
++** 'next' walks the array tags or the node vector and hands out a pointer
++** into it, so it counts as an interior-pointer holder while it runs: a
++** compaction that moved the block underneath it is an assert, not corruption.
++*/
+ int luaH_next (lua_State *L, Table *t, StkId key) {
++#if defined(KIMIX_LUA_ARENA)
++  int res;
++  luaH_interior_enter(L);
++  res = luaH_nextbody(L, t, key);
++  luaH_interior_leave(L);
++  return res;
++#else
++  return luaH_nextbody(L, t, key);
++#endif
++}
++
++
++static int luaH_nextbody (lua_State *L, Table *t, StkId key) {
+   unsigned int asize = t->asize;
+   unsigned int i = findindex(L, t, s2v(key), asize);  /* find original key */
+   for (; i < asize; i++) {  /* try first array part */
+@@ -393,8 +429,12 @@ static size_t sizehash (Table *t) {
  static void freehash (lua_State *L, Table *t) {
    if (!isdummy(t)) {
      /* get pointer to the beginning of Node array */
@@ -1695,7 +1889,7 @@ index 2f2b5c1f..8b7ee875 100644
    }
  }
  
-@@ -566,14 +573,22 @@ static Value *resizearray (lua_State *L , Table *t,
+@@ -566,14 +606,31 @@ static Value *resizearray (lua_State *L , Table *t,
    if (oldasize == newasize)
      return t->array;  /* nothing to be done */
    else if (newasize == 0) {  /* erasing array? */
@@ -1709,21 +1903,31 @@ index 2f2b5c1f..8b7ee875 100644
 +      #endif					/* } */
      return NULL;
    }
-   else {
+-  else {
 -    size_t newasizeb = concretesize(newasize);
 -    Value *np = cast(Value *,
 -                  luaM_reallocvector(L, NULL, 0, newasizeb, lu_byte));
-+          size_t newasizeb = concretesize(newasize);
-+      #if defined(KIMIX_LUA_ARENA)		/* { */
-+      Value *np = cast(Value *, luaM_newblockx(L, newasizeb, LUA_MEMCLS_ARR));
-+      #else					/* }{ */
-+      Value *np = cast(Value *,
-+                    luaM_reallocvector(L, NULL, 0, newasizeb, lu_byte));
-+      #endif					/* } */
++    else {
++            size_t newasizeb = concretesize(newasize);
++        #if defined(KIMIX_LUA_ARENA)		/* { */
++        /*
++        ** 'luaH_resize' builds the new hash part before this call and frees
++        ** it only when the array allocation reports failure ('NULL'). A
++        ** raising allocation here (luaM_newblockx -> luaM_malloc_ ->
++        ** luaM_error) would therefore leak that hash block on every out-of-
++        ** memory retry, so the guarded path keeps upstream's non-raising
++        ** contract and only adds the class hint.
++        */
++        Value *np = cast(Value *, luaM_reallocx_(L, NULL, 0, newasizeb,
++                                                 LUA_MEMCLS_ARR));
++        #else					/* }{ */
++        Value *np = cast(Value *,
++                      luaM_reallocvector(L, NULL, 0, newasizeb, lu_byte));
++        #endif					/* } */
      if (np == NULL)  /* allocation error? */
        return NULL;
      np += newasize;  /* shift pointer to the end of value segment */
-@@ -611,11 +626,19 @@ static void setnodevector (lua_State *L, Table *t, unsigned size) {
+@@ -611,11 +668,19 @@ static void setnodevector (lua_State *L, Table *t, unsigned size) {
      if (lsize > MAXHBITS || (1 << lsize) > MAXHSIZE)
        luaG_runerror(L, "table overflow");
      size = twoto(lsize);
@@ -1748,7 +1952,35 @@ index 2f2b5c1f..8b7ee875 100644
        t->node = cast(Node *, node + sizeof(Limbox));
        getlastfree(t) = gnode(t, size);  /* all positions are free */
      }
-@@ -747,6 +770,51 @@ void luaH_resize (lua_State *L, Table *t, unsigned newasize,
+@@ -712,8 +777,27 @@ static void clearNewSlice (Table *t, unsigned oldasize, unsigned newasize) {
+ ** the old one ('oldasize'), this function will do nothing with that
+ ** part.
+ */
++static void luaH_resizebody (lua_State *L, Table *t, unsigned newasize,
++                             unsigned nhsize);
++
++/*
++** A resize allocates (and can raise) while 't->array' / 't->node' are still
++** the old blocks, so it runs as an interior-pointer holder.
++*/
+ void luaH_resize (lua_State *L, Table *t, unsigned newasize,
+                                           unsigned nhsize) {
++#if defined(KIMIX_LUA_ARENA)
++  luaH_interior_enter(L);
++  luaH_resizebody(L, t, newasize, nhsize);
++  luaH_interior_leave(L);
++#else
++  luaH_resizebody(L, t, newasize, nhsize);
++#endif
++}
++
++
++static void luaH_resizebody (lua_State *L, Table *t, unsigned newasize,
++                                            unsigned nhsize) {
+   Table newt;  /* to keep the new hash part */
+   unsigned oldasize = t->asize;
+   Value *newarray;
+@@ -747,6 +831,51 @@ void luaH_resize (lua_State *L, Table *t, unsigned newasize,
  }
  
  
@@ -1872,10 +2104,10 @@ index 15c3c09f..a3cd9bb7 100644
  };
  
 diff --git a/lua.h b/lua.h
-index 6deaed49..d5972d75 100644
+index 6deaed49..54b0d665 100644
 --- a/lua.h
 +++ b/lua.h
-@@ -355,6 +355,111 @@ LUA_API void (lua_warning)  (lua_State *L, const char *msg, int tocont);
+@@ -355,6 +355,115 @@ LUA_API void (lua_warning)  (lua_State *L, const char *msg, int tocont);
  
  /* number of parameters */
  #define LUA_GCPN		6
@@ -1979,9 +2211,13 @@ index 6deaed49..d5972d75 100644
 +LUA_API size_t (lua_ArenaTrim) (lua_State *L, int level);
 +/* handle-based entry points, usable after lua_close ('arena' is the
 +** handle borrowed through luaL_arena, see lauxlib.h) */
-+LUA_API void (lua_ArenaStatsOf) (void *arena, lua_ArenaStats *st);
-+LUA_API size_t (lua_ArenaTrimHandle) (void *arena, int level);
-+LUA_API void (lua_ArenaFree) (void *arena);
++  LUA_API void (lua_ArenaStatsOf) (void *arena, lua_ArenaStats *st);
++  LUA_API size_t (lua_ArenaTrimHandle) (void *arena, int level);
++  LUA_API void (lua_ArenaFree) (void *arena);
++  /* how many calls hold an interior pointer right now; 0 when the
++     KIMIX_LUA_MEMCHECK net is not compiled in (it never is in a release
++     build). A compaction pass asserts this is 0. */
++  LUA_API unsigned (lua_ArenaInteriorHolders) (void *arena);
 +/* }================================================================== */
 +#endif						/* } */
  

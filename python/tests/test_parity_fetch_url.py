@@ -85,7 +85,7 @@ assert _BIN_DIR.resolve() in _NATIVE_PATH.parents, (
     f"runtime_py came from {_NATIVE_PATH}, not the kimix-base build "
     f"{_BIN_DIR} -- a staged copy shadowed it; parity results would be bogus")
 
-from _parity_ref import KIMIX_SRC, ref, ref_available  # noqa: E402
+from _parity_ref import KIMI_CLI_SRC, KIMIX_SRC, ref, ref_available  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     not ref_available(), reason="kimi-agent checkout not available"
@@ -110,7 +110,7 @@ def _load_by_path(path: Path, name: str):
 URL_SAFETY = ref("kimi_cli.tools.web.url_safety")
 CONTENT = ref("kimi_cli.tools.web.content")
 FETCHER = _load_by_path(
-    KIMIX_SRC / "kimix" / "tools" / "web" / "web_fetcher" / "fetcher.py",
+    KIMI_CLI_SRC / "kimi_cli" / "tools" / "web" / "web_fetcher" / "fetcher.py",
     "_parity_fetch_url_fetcher")
 
 

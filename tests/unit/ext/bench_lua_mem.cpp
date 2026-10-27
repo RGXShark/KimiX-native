@@ -17,7 +17,16 @@
 // from the ratio, exactly like the plan's harness. The arena's own
 // commit_bytes is printed next to it, so an accounting bug cannot hide: the two
 // numbers have to agree within a band.
+//
+// Two gates beyond the footprint bands ride along:
+//  - the M-V6 hot path: the chunk is timed per mode (best of five) and the arena
+//    may not cost more than 5 % on it;
+//  - the M3 gate: a sparse-slab workload (many small array tables, two thirds of
+//    them dropped) is compacted with the pass off and on, and the arena's own
+//    committed bytes before/after the pass are the metric -- the process commit
+//    cannot follow a segment handed back to mimalloc.
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -70,13 +79,14 @@ const char *k_churn =
     "  t = nil "
     "end";
 
-struct measurement {
-    size_t commit_delta = 0;   // mimalloc process commit over the baseline
-    size_t arena_commit = 0;   // the arena's own accounting (0 for plain)
-    size_t logical_live = 0;   // lua_gc(LUA_GCCOUNT) in bytes
-    bool ok = false;
-    const char *error = "";
-};
+  struct measurement {
+      size_t commit_delta = 0; // mimalloc process commit over the baseline
+      size_t arena_commit = 0; // the arena's own accounting (0 for plain)
+      size_t logical_live = 0; // lua_gc(LUA_GCCOUNT) in bytes
+      double seconds = 0.0; // wall time of the run itself (M-V6)
+      bool ok = false;
+      const char *error = "";
+  };
 
 // mimalloc's public process-info entry point (the one heap of the process).
 size_t process_commit() {
@@ -118,6 +128,9 @@ measurement run(const workload &w, bool arena, int trim_level) {
         return m;
     }
     luaL_openlibs(L);
+    // M-V6: the hot path is the run itself (allocation + GC), so the clock
+    // starts after the state exists and stops before the final collection.
+    const auto started = std::chrono::steady_clock::now();
     if (run_chunk(L, w.chunk) != LUA_OK) {
         m.error = lua_tostring(L, -1);
         lua_close(L);
@@ -126,6 +139,7 @@ measurement run(const workload &w, bool arena, int trim_level) {
     // Collect first: a run ends with garbage still on the heap, and neither
     // mode should be credited for blocks the collector has not swept yet.
     lua_gc(L, LUA_GCCOLLECT, 0);
+    m.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     // Bring both modes to the same state before measuring: the arena returns
     // its empty segments and purges (level 1 also drops the huge cache), the
     // plain state just purges -- which is what the plan's harness did too
@@ -149,6 +163,58 @@ measurement run(const workload &w, bool arena, int trim_level) {
 
 double ratio(size_t commit, size_t live) {
     return live ? double(commit) / double(live) : 0.0;
+}
+
+// ---------------------------------------------------------------------------
+// The sparse-slab workload (the M3 gate). Many small array tables land in the
+// exact 9*64+4 = 580-byte class -- 112 slots per 64 KiB segment -- and then two
+// thirds of them are dropped, so the surviving blocks sit sparsely in
+// partially empty segments. That is the only shape a compaction pass can pack,
+// and the only honest measure of it is the arena's own committed bytes
+// before/after: a segment handed back to mimalloc does not show up in the
+// process commit (mimalloc purges on its own schedule).
+// ---------------------------------------------------------------------------
+const char *k_sparse_slabs =
+    "T = {} "
+    "for i = 1, 600 do T[i] = table.new(64) "
+    "  for k = 1, 64 do T[i][k] = i * 1000 + k end end "
+    "for i = 1, 600 do if i % 3 ~= 0 then T[i] = nil end end "
+    "collectgarbage('collect')";
+
+struct slab_result {
+    bool ok = false;
+    size_t before = 0; // arena commit_bytes before the pass
+    size_t after = 0; // arena commit_bytes after it
+    size_t would = 0; // the plan the pass reported
+    int moved = 0; // bytes the pass actually returned
+};
+
+slab_result run_sparse_slabs(bool compaction) {
+    slab_result r;
+    lua_ArenaConfig cfg;
+    lua_ArenaConfigDefault(&cfg);
+    cfg.enable_compaction = compaction ? 1 : 0;
+    lua_State *L = luaL_newstate_arena(&cfg);
+    if (L == nullptr) return r;
+    void *handle = luaL_arena(L);
+    luaL_openlibs(L);
+    if (run_chunk(L, k_sparse_slabs) != LUA_OK) {
+        lua_close(L);
+        lua_ArenaFree(handle);
+        return r;
+    }
+    lua_ArenaStats st;
+    lua_ArenaStatsOf(handle, &st);
+    r.before = st.commit_bytes;
+    r.moved = lua_gc(L, LUA_GCCOMPACT, 0);
+    lua_ArenaStatsOf(handle, &st);
+    r.after = st.commit_bytes;
+    r.would = st.would_compact_bytes;
+    lua_close(L); // also proves the state still accounted for every slot
+    lua_ArenaStatsOf(handle, &st);
+    r.ok = (st.slots_used == 0);
+    lua_ArenaFree(handle);
+    return r;
 }
 
 } // namespace
@@ -180,7 +246,16 @@ int main(int argc, char *argv[]) {
         const char *modes[2] = {"mimalloc", "arena"};
         for (int k = 0; k < 2; k++) {
             mi_collect(true);  // start each run from a clean heap
-            const measurement m = run(w, k == 1, trim);
+            measurement m = run(w, k == 1, trim);
+            // best-of-five for the timing comparison: one sample of a
+            // sub-second run on a busy host is noise, the footprint numbers
+            // are stable either way.
+            for (int rep = 1; rep < 5 && m.ok; rep++) {
+                mi_collect(true);
+                const measurement again = run(w, k == 1, trim);
+                if (!again.ok) break;
+                if (again.seconds < m.seconds) m.seconds = again.seconds;
+            }
             sizes[k] = m;
             if (!m.ok) {
                 std::printf("%-20s %-10s ERROR: %s\n", w.name, modes[k], m.error);
@@ -225,6 +300,53 @@ int main(int argc, char *argv[]) {
             std::printf("    ratio change: mimalloc %.2f -> arena %.2f\n",
                         ratio(sizes[0].commit_delta, sizes[0].logical_live),
                         ratio(sizes[1].commit_delta, sizes[1].logical_live));
+        }
+        // M-V6: the hot path may not get more than 5 % slower than mimalloc.
+        if (sizes[0].ok && sizes[1].ok && sizes[0].seconds > 0.0) {
+            const double rel = sizes[1].seconds / sizes[0].seconds;
+            std::printf("    hot path: mimalloc %.3f s, arena %.3f s -> %+.1f %% (bar +5 %%)\n",
+                        sizes[0].seconds, sizes[1].seconds, (rel - 1.0) * 100.0);
+            if (rel > 1.05) {
+                std::printf("    MISS: the arena is %+.1f %% slower on the hot path\n",
+                            (rel - 1.0) * 100.0);
+                failed++;
+            }
+        }
+    }
+    // The M3 gate: a sparse-slab workload, compacted. 'plan' runs with the pass
+    // disabled (it must report the same plan and move nothing), 'pack' runs with
+    // it enabled. The plan accepts the feature only if packing clears 10 %.
+    std::printf("--- sparse_slabs (M3 gate) ----------------------------------------\n");
+    {
+        const slab_result plan = run_sparse_slabs(false);
+        const slab_result pack = run_sparse_slabs(true);
+        if (!plan.ok || !pack.ok) {
+            std::printf("%-20s ERROR: a sparse-slab state did not close cleanly%s\n",
+                        "sparse_slabs",
+                        plan.ok ? "" : " (plan)");
+            failed++;
+        }
+        else {
+            const double gain = pack.before
+                                    ? 100.0 * double(pack.before - pack.after) / double(pack.before)
+                                    : 0.0;
+            std::printf("%-20s %-10s %10s %10s\n", "workload", "mode", "arena_MB", "gain");
+            std::printf("%-20s %-10s %10.2f %9.2f %%  plan %.2f MB (moved %d B)\n",
+                        "sparse_slabs", "plan", plan.before / 1048576.0, 0.0,
+                        plan.would / 1048576.0, plan.moved);
+            std::printf("%-20s %-10s %10.2f %9.2f %%  of %.2f MB (moved %d B)\n",
+                        "sparse_slabs", "pack", pack.after / 1048576.0, gain,
+                        pack.before / 1048576.0, pack.moved);
+            std::printf("    would_compact_bytes %.2f MB, bar 10 %%\n", pack.would / 1048576.0);
+            if (gain < 10.0) {
+                std::printf("    NOTE: packing clears %.1f %% (< 10 %%): the pass stays off by "
+                            "default (an accepted negative result, see docs/lua_memory_arena.md)\n",
+                            gain);
+            }
+            if (plan.moved != 0) {
+                std::printf("    MISS: a plan without enable_compaction moved %d B\n", plan.moved);
+                failed++;
+            }
         }
     }
     std::printf("=====================================================\n");

@@ -148,7 +148,7 @@ for _path in (str(KIMIX_SRC), str(KIMI_CLI_SRC)):
 #: ``safety.py`` holds the real ``detect_self_kill`` body; its ``_compat_*``
 #: helpers are pinned to the kimi-agent shim, and the native gate is disabled.
 SAFETY = _load_by_path(
-    KIMIX_SRC / "kimix" / "tools" / "file" / "bash" / "safety.py",
+    KIMI_CLI_SRC / "kimi_cli" / "tools" / "file" / "bash" / "safety.py",
     "_parity_pwsh_safety")
 SAFETY._COMPAT_TOOLS = KIMI_NATIVE_TOOLS
 SAFETY._NATIVE_TOOLS = None
@@ -197,7 +197,7 @@ def cpp_transform(code):
 # kimix.tools.common`` resolves the ``kimix`` package from whatever is first on
 # ``sys.path``/``sys.modules`` and the kimi-agent workspace has two candidates
 # (``src/kimix`` and the ``kimi-cli/src/kimix`` shim).
-COMMON = _load_by_path(KIMIX_SRC / "kimix" / "tools" / "common.py",
+COMMON = _load_by_path(KIMI_CLI_SRC / "kimi_cli" / "tools" / "common.py",
                        "_parity_pwsh_common")
 if hasattr(COMMON, "_COMPAT_SHELL"):
     COMMON._COMPAT_SHELL = KIMI_SHELL_COMPAT
@@ -588,7 +588,7 @@ def test_reference_provenance():
     # ``pwsh_fix.py`` / ``process_pwsh.py`` only re-export the canonical scanner
     # body from ``_shell_compat.py`` (checked on the source so the claim holds
     # regardless of which ``kimix_native`` a session already imported).
-    bash_dir = KIMIX_SRC / "kimix" / "tools" / "file" / "bash"
+    bash_dir = KIMI_CLI_SRC / "kimi_cli" / "tools" / "file" / "bash"
     fix_src = (bash_dir / "pwsh_fix.py").read_text(encoding="utf-8")
     assert "_shell.fix_pwsh_command(cmd)" in fix_src
     assert "PwshFix = _shell.PwshFix" in fix_src
@@ -689,7 +689,7 @@ def test_image_name_tie_break_is_nondeterministic_in_the_reference():
         "expected the unordered-set tie-break to flip between hash seeds; "
         f"got {seen}")
     # ... and the reference really does route the tie through that set.
-    src = (KIMIX_SRC / "kimix" / "tools" / "file" / "bash" / "safety.py")
+    src = (KIMI_CLI_SRC / "kimi_cli" / "tools" / "file" / "bash" / "safety.py")
     assert "for name in image_names:" in src.read_text(encoding="utf-8")
     # The goldens must carry the deterministic (ascending) spelling instead.
     assert '"kills by image name `python` via `taskkill /IM`' in \
