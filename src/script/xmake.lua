@@ -34,6 +34,11 @@
 -- Build: xmake build kimix-script -> bin/<mode>/kimix-script.lib (libkimix-script.a)
 target("kimix-script")
     set_kind("static")
+    -- Project-wide flags: C++ standard, RTTI/exceptions off, SIMD, LTO
+    -- (scripts/xmake_func.lua).  Declared explicitly like every other target;
+    -- _config_project() below adds the same rule, and xmake keeps target rules
+    -- in a name-keyed set, so this is not applied twice.
+    add_rules("kimix_basic_settings")
     add_files("*.cpp")
     add_headerfiles("*.h")
     -- `src/` on the (public) include path: this module's own sources include its

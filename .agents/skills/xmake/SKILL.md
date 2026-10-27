@@ -165,6 +165,7 @@ target_end()
 
 ### Key rules:
 
+- **Every target MUST `add_rules("kimix_basic_settings")`** — always, in every `xmake.lua`, right after `set_kind()` (see §11). It carries this project's whole flag set (C++ standard, RTTI/exceptions off, SIMD, LTO) and is declared explicitly even when `_config_project()` is called further down; xmake keeps target rules in a name-keyed set, so listing it twice stays one rule and is never applied twice.
 - **`add_rules()` must be outside `on_load`** — they are target-level; cannot be set from inside `on_load`.
 - **`add_deps()` outside = `target:add("deps", ...)` inside** — they are equivalent.
 - **Simple globs** (`add_files`, `add_headerfiles`) can go outside; conditional additions go inside `on_load`.
@@ -639,11 +640,14 @@ end)
 
 ## 10. Common Target Patterns
 
+Every pattern below (binary, static, shared, object, test) starts with the project rule `add_rules("kimix_basic_settings")` right after `set_kind()` — see §11. It is only omitted for a target that compiles nothing (`headeronly`, `phony`).
+
 ### 10.1 Shared Library
 
 ```lua
 target("mylib")
 set_kind("shared")
+add_rules("kimix_basic_settings")   -- REQUIRED on every target
 set_basename("mylib")
 add_deps("core")
 add_headerfiles("include/**.h")
@@ -677,6 +681,7 @@ target_end()
 ```lua
 target("mystatic")
 set_kind("static")
+add_rules("kimix_basic_settings")   -- REQUIRED on every target
 set_basename("mystatic")
 add_deps("core")
 add_headerfiles("include/**.h")
@@ -690,6 +695,7 @@ target_end()
 ```lua
 target("my-tool")
 set_kind("binary")
+add_rules("kimix_basic_settings")   -- REQUIRED on every target
 add_deps("runtime", "dsl")
 add_files("main.cpp")
 add_includedirs("include")
@@ -735,6 +741,7 @@ target_end()
 local function test_proj(name, source, extra)
     target(name)
     set_kind("binary")
+    add_rules("kimix_basic_settings")   -- REQUIRED on every target
     add_deps("runtime", "dsl")
     add_files(source)
     add_includedirs("common")
@@ -762,13 +769,15 @@ target_end()
 
 ## 11. Custom Rules
 
+**Always `add_rules("kimix_basic_settings")` on every target** — new target, test target, tool target, phony target: every `xmake.lua` in this repo declares it right after `set_kind()`. It is the one place the project-wide flags live (`scripts/xmake_func.lua`, `rule("kimix_basic_settings")`): C++ standard, RTTI/exceptions off (`KIMIX_NO_EXCEPTIONS`, `_HAS_EXCEPTIONS=0`), SIMD (`-mfma` …), LTO, warnings and the per-target `kimix_enable_*` overrides read via `target:extraconf("rules", "kimix_basic_settings", name)`. A target without it is built with a different (default) toolchain configuration than the rest of the project, which shows up as ABI mismatches at link time — not as a build error. `_config_project(config)` at the end of a target also adds `kimix_feature_gate` + `kimix_basic_settings`, but that does not replace the explicit declaration: write it out (a duplicate is deduped by rule name, see `xmake show -t <target>`, which lists exactly one entry).
+
 `add_rules()` must be **outside** `on_load`:
 
 ```lua
 target("my-target")
+add_rules("kimix_basic_settings")               -- REQUIRED on every target: project-wide flags (standards, RTTI/exceptions off, SIMD, LTO)
 add_rules("c.unity_build", {batchsize = 8})    -- Unity build
 add_rules("c++.unity_build", {batchsize = 8})
-add_rules("kimix_basic_settings") -- project-wide flags: standards, RTTI/exceptions off, SIMD, LTO (scripts/xmake_func.lua)
 add_rules("c++.build", "c.build") -- per-language build rules (used by kimix-reproc)
 add_rules("kimix_feature_gate") -- sets enabled=false when the target's own feature/dep option is off
 add_rules("kimix_run_target")   -- `xmake run` from the output dir (used by kimix_cli)
@@ -986,11 +995,12 @@ target_end()
 
 1. **Use `on_load` for conditional logic** — platform checks, feature flags, dynamic file lists.
 2. **`add_rules()` stays outside** — cannot be set from inside `on_load`.
-3. **Simple globs outside, conditional additions inside** — keep `add_files`/`add_headerfiles` outside for simple cases.
-4. **Prefer `target:set()` / `target:add()` inside `on_load`** for most configuration — it's equivalent to outside calls.
-5. **Visibility** — `{public = true}` propagates to dependents, `{interface = true}` propagates only to dependents, `{private = true}` (default) is local-only.
-6. **`add_deps()` outside = `target:add("deps", ...)` inside** — choose whichever fits your style.
-7. **All APIs listed here work at the target scope level** — use them outside `on_load` as `set_kind(...)` or inside as `target:set("kind", ...)`.---
+3. **`add_rules("kimix_basic_settings")` on every target, always** — declared explicitly right after `set_kind()`, even when `_config_project()` also adds it (§11).
+4. **Simple globs outside, conditional additions inside** — keep `add_files`/`add_headerfiles` outside for simple cases.
+5. **Prefer `target:set()` / `target:add()` inside `on_load`** for most configuration — it's equivalent to outside calls.
+6. **Visibility** — `{public = true}` propagates to dependents, `{interface = true}` propagates only to dependents, `{private = true}` (default) is local-only.
+7. **`add_deps()` outside = `target:add("deps", ...)` inside** — choose whichever fits your style.
+8. **All APIs listed here work at the target scope level** — use them outside `on_load` as `set_kind(...)` or inside as `target:set("kind", ...)`.---
 
 # Lua Scripting in xmake
 
